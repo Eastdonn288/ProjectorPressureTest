@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PPTP · 投影仪压测平台</title>
+  <link rel="stylesheet" href="/static/style.css?v=2.0.1" />
+  <!-- 每次代码更新后 bump ?v= 强制浏览器重新加载,避免缓存问题 -->
+</head>
+<body>
+  <header class="topbar">
+    <h1>PPTP <span class="sub">Projector Pressure Test Platform</span></h1>
+    <div class="status">
+      <span id="server-info" class="server-info" title="PPTP 服务进程信息">加载中…</span>
+      <button id="btn-reset" class="btn" title="硬重置:杀掉所有任务 + 重启 ADB server + 清空状态">重置</button>
+      <button id="btn-shutdown" class="btn btn-danger" title="关闭 PPTP 服务,所有正在运行的任务会被中断">关机</button>
+      <span id="backend-pill" class="pill">●</span>
+      <span id="clock"></span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- 设备列表 -->
+    <section class="panel" id="panel-devices">
+      <div class="panel-header">
+        <h2>设备 <span id="device-hint" class="muted"></span></h2>
+        <button id="btn-refresh-devices" class="btn">刷新</button>
+      </div>
+      <div class="panel-body">
+        <div id="device-list" class="list">加载中…</div>
+      </div>
+    </section>
+
+    <!-- 脚本列表 -->
+    <section class="panel" id="panel-scripts">
+      <div class="panel-header">
+        <h2>脚本 <span id="script-hint" class="muted">点击选择</span></h2>
+        <button id="btn-refresh-scripts" class="btn">刷新</button>
+      </div>
+      <div class="panel-body">
+        <div id="script-list" class="list">加载中…</div>
+      </div>
+    </section>
+
+    <!-- 日志控制台 -->
+    <section class="panel" id="panel-logs">
+      <div class="panel-header">
+        <h2>日志</h2>
+        <div>
+          <button id="btn-export-log" class="btn" disabled>导出</button>
+          <button id="btn-clear-log" class="btn">清空</button>
+          <button id="btn-hard-stop" class="btn btn-danger" disabled
+                  title="设备临时离线时启用,直接 SIGKILL 子进程">硬停</button>
+          <button id="btn-stop-task" class="btn btn-danger" disabled>中断</button>
+        </div>
+      </div>
+      <div class="log-info" id="log-info">
+        <span class="muted">未选择任务</span>
+      </div>
+      <div class="panel-body">
+        <pre id="log-console" class="console">点击设备卡查看日志,或在脚本区选脚本后点设备卡上的"▶ 跑 XXX"</pre>
+      </div>
+    </section>
+
+    <!-- 任务状态 -->
+    <section class="panel" id="panel-tasks">
+      <div class="panel-header">
+        <h2>任务 <span id="task-hint" class="muted">点击查看日志</span></h2>
+        <div>
+          <button id="btn-cleanup-tasks" class="btn" title="删除所有已结束的任务(finished / failed / interrupted)">清空已完成</button>
+          <button id="btn-refresh-tasks" class="btn">刷新</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="task-list" class="list">加载中…</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=2.0.1"></script>
+</body>
+
+<!-- ===== Sequence picker modal =====
+     Lists all .ini sequence files in ir_sequences/. User can:
+     - Click an existing sequence to select it (per-device, stored in state)
+     - Type a new name and click + 新建 to create a fresh template
+     Frontend does NOT edit step content - that's a file-level concern.
+-->
+<div class="modal-backdrop" id="modal-seq" hidden>
+  <div class="modal" role="dialog" aria-labelledby="modal-seq-title">
+    <div class="modal-header">
+      <h3 id="modal-seq-title">选择 IR 序列</h3>
+      <button class="modal-close" data-close>×</button>
+    </div>
+    <div class="modal-body">
+      <div class="seq-target muted" id="seq-target">未选设备</div>
+      <h4>可用序列 <span class="muted" id="seq-count"></span></h4>
+      <div class="seq-list" id="seq-list">
+        <div class="muted">加载中…</div>
+      </div>
+      <div class="seq-hint muted">
+        序列文件存放在 <code>ir_sequences/</code> 目录(直接编辑 .ini 添加步骤后点击此处刷新)
+      </div>
+    </div>
+    <div class="modal-footer">
+      <span class="seq-status muted" id="seq-status"></span>
+      <button class="btn" data-close>取消</button>
+    </div>
+  </div>
+</div>
+</html>

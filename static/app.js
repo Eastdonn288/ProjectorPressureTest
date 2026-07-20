@@ -1,0 +1,1273 @@
+// PPTP frontend - vanilla JS, no framework.
+// Interaction model:
+//   1. Each device card has its own script dropdown (per-device state)
+//   2. Selecting a script in one device's dropdown does NOT affect other devices
+//   3. Clicking "Run" runs that device's selected script
+//   4. Clicking a task card opens its log in the console panel
+//   5. Clicking a device card body opens its current/last task log
+//   6. The scripts panel is a read-only reference (no click action)
+
+(() => {
+  "use strict";
+
+  // ---------------- State ----------------
+  const state = {
+    devices: [],
+    scripts: [],
+    tasks: [],
+    // Per-device remembered script: { [serial]: filename }.
+    // Each device is strictly independent - selecting a script for A
+    // does not affect B, C, D, ...
+    deviceScripts: {},
+    // Per-device in-memory sequence content (ini text). Pre-filled when the
+    // sequence editor modal is opened from a device card. Not persisted to
+    // disk; cleared on full page reload.
+    deviceSequences: {},
+    // The currently selected device (last device card clicked). The script
+    // panel shows the script for THIS device (highlighted + pinned to top).
+    // Other devices' selections are stored in state.deviceScripts but not
+    // surfaced in the UI - they're per-device, surfaced on demand.
+    selectedDeviceSerial: null,
+    currentDeviceSerial: null,
+    currentTaskId: null,
+    currentWs: null,
+    backendOnline: false,
+    userScrolledUp: false,
+    server: null,
+    shuttingDown: false,
+    // Modal context: { source: "file" | "device", file?: "default", device?: serial }
+    seqContext: null,
+  };
+
+  // Cache last render keys to skip unnecessary re-renders
+  const _lastKey = { devices: "", scripts: "", tasks: "" };
+
+  // ---------------- DOM helpers ----------------
+  const $ = (id) => document.getElementById(id);
+  const fmtTime = (s) => s ? new Date(s).toLocaleTimeString() : "—";
+  const fmtDuration = (start, end) => {
+    if (!start) return "—";
+    const s = new Date(start).getTime();
+    const e = end ? new Date(end).getTime() : Date.now();
+    const ms = Math.max(0, e - s);
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`;
+  };
+  const esc = (s) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+
+  function setHint(elId, text) {
+    const el = $(elId);
+    if (el) el.textContent = text;
+  }
+
+  // ---------------- REST helpers ----------------
+  async function api(path, opts = {}) {
+    const res = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...opts,
+    });
+    if (!res.ok) {
+      // Try to extract FastAPI's `detail` field for a friendly message
+      let msg = `${res.status} ${res.statusText}`;
+      try {
+        const data = await res.json();
+        if (data && data.detail) msg = data.detail;
+      } catch (_) {
+        // not JSON, fall back to raw text
+        try {
+          const text = await res.text();
+          if (text) msg += `: ${text}`;
+        } catch (_) {}
+      }
+      throw new Error(msg);
+    }
+    return res.json();
+  }
+
+  // ---------------- Data diff ----------------
+  function stableKey(obj) {
+    return JSON.stringify(obj);
+  }
+
+  function devicesRenderKey() {
+    return stableKey({
+      devices: state.devices,
+      tasks: state.tasks.map((t) => ({
+        device: t.device, status: t.status, task_id: t.task_id, script: t.script,
+      })),
+      deviceScripts: state.deviceScripts,
+      current: state.currentDeviceSerial,
+      scriptMap: Object.fromEntries(state.scripts.map((s) => [s.filename, s.name])),
+    });
+  }
+  function scriptsRenderKey() {
+    return stableKey({
+      scripts: state.scripts,
+    });
+  }
+  function tasksRenderKey() {
+    return stableKey({ tasks: state.tasks, current: state.currentTaskId });
+  }
+
+  // ---------------- Render: Scripts (read-only reference) ----------------
+  // The script panel is a "view" of the currently selected device's script.
+  // - Highlighting is per-device: only state.selectedDeviceSerial's script
+  //   gets pinned + highlighted. Other devices' selections exist in state
+  //   but are not surfaced in the UI here.
+  // - Clicking a card opens its config UI (currently: ir_runner only).
+  function renderScripts() {
+    const el = $("script-list");
+    if (!state.scripts.length) {
+      el.innerHTML = `<div class="empty">
+        scripts/ 目录无脚本<br>
+        <small>把 *.py 放到 scripts/ 即可</small>
+      </div>`;
+      setHint("script-hint", "暂无脚本");
+      return;
+    }
+
+    const selectedDevice = state.selectedDeviceSerial;
+    const selectedScriptName = selectedDevice
+      ? state.deviceScripts[selectedDevice] || null
+      : null;
+
+    el.innerHTML = state.scripts.map((s) => {
+      // Per-card state: which cards are active (clickable + has Run button)
+      // vs disabled (no device selected, or device's script != this one).
+      const hasConfig = s.filename === "ir_runner.py";
+      const isActive = !!selectedDevice && selectedScriptName === s.filename;
+      const disabled = !selectedDevice || !isActive;
+      const classes = [
+        "script-card",
+        isActive ? "script-card-active" : "script-card-disabled",
+      ].join(" ");
+
+      const iconChar = isActive ? "📌" : "📜";
+
+      // Subtitle hints
+      let subtitle;
+      let cardTitle;
+      if (!selectedDevice) {
+        subtitle = "先在设备卡上选一台设备,再点此卡选择序列";
+        cardTitle = "无设备选中 - 不可点击";
+      } else if (isActive) {
+        // This card is the active one
+        const boundSeq = state.deviceSequences[selectedDevice];
+        if (hasConfig) {
+          subtitle = boundSeq
+            ? `设备 ${selectedDevice} · 序列: ${boundSeq}.ini`
+            : `设备 ${selectedDevice} · 未选序列 (点此卡选择)`;
+        } else {
+          subtitle = `设备 ${selectedDevice} 已选此脚本`;
+        }
+        cardTitle = `设备 ${selectedDevice} 已选 ${s.name}`;
+      } else {
+        // Device is selected, but its script is different
+        const otherDev = selectedDevice;
+        const otherScript = selectedScriptName || "(未选)";
+        subtitle = `设备 ${otherDev} 选了 ${otherScript},不是 ${s.name}`;
+        cardTitle = `设备 ${otherDev} 当前脚本是 ${otherScript},不是此卡`;
+      }
+
+      // Run button on the active card (if conditions allow)
+      let runBtnHtml = "";
+      if (isActive) {
+        const needsSeq = hasConfig && !state.deviceSequences[selectedDevice];
+        const runTitle = needsSeq ? "先选序列(点此卡打开 picker)" : "在此设备上运行此脚本";
+        runBtnHtml = `
+          <div class="script-card-run">
+            <button class="btn btn-primary btn-run-script"
+                    data-script="${esc(s.filename)}"
+                    ${needsSeq ? "disabled" : ""}
+                    title="${esc(runTitle)}">
+              ▶ 跑
+            </button>
+          </div>`;
+      }
+
+      return `
+        <div class="${classes}" data-script="${esc(s.filename)}"
+             data-has-config="${hasConfig}"
+             data-active="${isActive}"
+             title="${esc(cardTitle)}">
+          <div class="script-icon">${iconChar}</div>
+          <div class="script-body">
+            <div class="script-title">${esc(s.name)}</div>
+            <div class="script-sub">${esc(subtitle)}</div>
+          </div>
+          ${runBtnHtml}
+        </div>`;
+    }).join("");
+
+    // Click handler: only ACTIVE cards (matching selected device's script)
+    // are clickable, and they open the sequence picker.
+    el.querySelectorAll(".script-card").forEach((card) => {
+      card.addEventListener("click", (e) => {
+        if (card.dataset.active !== "true") return;  // disabled cards: no-op
+        if (e.target.closest(".btn-run-script")) return;  // Run button has its own handler
+        const filename = card.dataset.script;
+        if (card.dataset.hasConfig === "true" && filename === "ir_runner.py") {
+          openSeqModal({ device: state.selectedDeviceSerial });
+        }
+      });
+    });
+    // Run button: runs the active card's script on the currently-selected device
+    el.querySelectorAll(".btn-run-script").forEach((b) => {
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        onRunClick();
+      });
+    });
+
+    // Hint: tell user which device's selection drives the highlight
+    if (selectedDevice) {
+      const devLabel = selectedScriptName
+        ? `设备 ${selectedDevice} 选中: ${selectedScriptName}`
+        : `设备 ${selectedDevice} 尚未选脚本`;
+      setHint("script-hint", devLabel);
+    } else {
+      setHint("script-hint",
+        `${state.scripts.length} 个可用脚本 · 先点设备卡选中一台`);
+    }
+  }
+
+  // ---------------- Render: Devices ----------------
+  function renderDevices() {
+    const el = $("device-list");
+    if (!state.devices.length && !state.tasks.some((t) => t.status === "running")) {
+      el.innerHTML = `<div class="empty">
+        未检测到 ADB 设备<br>
+        <small>请确认 adb 已安装并连接</small>
+      </div>`;
+      return;
+    }
+
+    // Fix 1: synthesize "temporarily offline" devices for tasks that are running
+    // but whose device is not in the current `adb devices` list. This lets the
+    // user see the device card during planned ADB outages (e.g., reboot stress
+    // tests where the script intentionally waits for the device to come back).
+    const liveSerials = new Set(state.devices.map((d) => d.serial));
+    const tempOffline = state.tasks
+      .filter((t) => t.status === "running" && !liveSerials.has(t.device))
+      .reduce((acc, t) => {
+        if (!acc.find((d) => d.serial === t.device)) {
+          acc.push({
+            serial: t.device,
+            status: "device",
+            model: "(临时离线 · 任务在跑)",
+            product: "",
+            transport: "",
+            _temp_offline: true,
+          });
+        }
+        return acc;
+      }, []);
+    const allDevices = [...state.devices, ...tempOffline];
+
+    el.innerHTML = allDevices.map((d) => {
+      const isTempOffline = !!d._temp_offline;
+      const stClass = isTempOffline ? "online"
+                    : d.status === "device" ? "online"
+                    : d.status === "unauthorized" ? "unauthorized"
+                    : "offline";
+      const stText = isTempOffline ? "临时离线(任务在跑)"
+                  : d.status === "device" ? "在线"
+                   : d.status === "unauthorized" ? "需授权"
+                   : "离线";
+      const running = state.tasks.find(
+        (t) => t.device === d.serial && (t.status === "running" || t.status === "interrupting")
+      );
+      // Treat temp-offline as "not offline" so user can still interact (e.g. force stop)
+      const isOffline = !isTempOffline && d.status !== "device";
+      const isCurrentView = state.currentDeviceSerial === d.serial;
+      const remembered = state.deviceScripts[d.serial] || null;
+
+      // Per-device script dropdown - disabled when:
+      // - device is NOT the currently selected one (user must click to select first)
+      // - device has a running task (script locked during run)
+      // - device is offline
+      const notSelected = !isCurrentView;
+      const dropdownDisabled = notSelected || !!running || isOffline;
+      const optionsHtml = state.scripts.map((s) => {
+        const sel = s.filename === remembered ? " selected" : "";
+        return `<option value="${esc(s.filename)}"${sel}>${esc(s.name)}</option>`;
+      }).join("");
+      const dropdownHtml = `
+        <select class="script-select" data-serial="${esc(d.serial)}"
+                ${dropdownDisabled ? "disabled" : ""}
+                title="${notSelected
+                    ? `先点击设备 ${d.serial} 选中它,再选择脚本`
+                    : `为 ${esc(d.serial)} 选择要运行的脚本`}">
+          <option value="">— 选择脚本 —</option>
+          ${optionsHtml}
+        </select>`;
+
+      let btnHtml = "";
+      // Run button moved to the script card. Device card just shows status:
+      // online/offline/running + (when a script is selected) the chip in
+      // row2 shows the name. Always initialize to "" so we never render
+      // literal "undefined" when no badge applies.
+      if (running) {
+        btnHtml = `<span class="badge-mini badge-running">运行中</span>`;
+      } else if (isOffline) {
+        btnHtml = `<span class="badge-mini" style="background:rgba(248,113,113,0.12);color:var(--err);border-color:var(--err)">离线</span>`;
+      } else if (!remembered) {
+        btnHtml = `<span class="muted" style="font-size:11px">未选脚本</span>`;
+      }
+      // else: empty string (chip in row2 shows the selected script name)
+
+      const seqName = state.deviceSequences[d.serial];
+      // Device card no longer shows the sequence picker - that lives on the
+      // ir_runner script card in the scripts panel. The card itself is for
+      // device-level state only: online/offline, selected script, run button.
+      // Per-device bound sequence is surfaced via the ir_runner script card.
+      return `
+        <div class="device-card ${isCurrentView ? "active" : ""} ${isOffline ? "offline" : ""} ${isTempOffline ? "device-card-temp-offline" : ""}"
+             data-serial="${esc(d.serial)}">
+          <div class="device-row1">
+            <span class="dot ${stClass}"></span>
+            <span class="device-name" title="${esc(d.serial)}">${esc(d.serial)}</span>
+            <span class="muted">${esc(d.model || "")}</span>
+          </div>
+          <div class="device-row2">
+            <span class="device-status">${stText}</span>
+            ${remembered ? `<span class="device-script-chip" title="当前选中的脚本">${esc(remembered.replace(/\.py$/, ""))}</span>` : ""}
+          </div>
+          <div class="device-row3">${dropdownHtml}</div>
+          <div class="device-actions">${btnHtml}</div>
+        </div>`;
+    }).join("");
+
+    // Per-device dropdown change
+    el.querySelectorAll(".script-select").forEach((sel) => {
+      sel.addEventListener("change", (e) => {
+        const serial = sel.dataset.serial;
+        const filename = sel.value || null;
+        state.deviceScripts[serial] = filename;
+        if (filename) {
+          // Track which device is "active" so the script panel highlights
+          // THIS device's selected script. (The script panel is bound to the
+          // currently-selected device, not to all devices' selections.)
+          state.selectedDeviceSerial = serial;
+        }
+        savePersistedState();
+        renderDevices();
+        // Re-render scripts to reflect pin + highlight changes
+        renderScripts();
+      });
+      // Don't bubble up to card click (we already guard, but be safe)
+      sel.addEventListener("click", (e) => e.stopPropagation());
+    });
+
+    el.querySelectorAll(".device-card").forEach((c) => {
+      c.addEventListener("click", (e) => {
+        if (e.target.closest("button") || e.target.closest("select")) return;
+        onSelectDevice(c.dataset.serial);
+      });
+    });
+  }
+
+  // ---------------- Render: Tasks ----------------
+  function renderTasks() {
+    const el = $("task-list");
+    if (!state.tasks.length) {
+      el.innerHTML = `<div class="empty">暂无任务</div>`;
+      return;
+    }
+    const sorted = [...state.tasks].sort((a, b) =>
+      (b.started_at || "").localeCompare(a.started_at || "")
+    );
+    el.innerHTML = sorted.map((t) => {
+      const isTerminal = ["finished", "failed", "interrupted"].includes(t.status);
+      const cls = `status-badge status-${t.status}`;
+      return `
+        <div class="task-card ${isTerminal ? "history" : ""} ${state.currentTaskId === t.task_id ? "active" : ""}"
+             data-task="${esc(t.task_id)}" title="点击查看日志">
+          <div class="task-row1">
+            <span class="device-name" title="${esc(t.device)}">${esc(t.device)}</span>
+            <span class="task-row1-right">
+              ${isTerminal
+                ? `<button class="task-del" data-del="${esc(t.task_id)}" title="删除此任务(同时删除日志文件)">×</button>`
+                : ""}
+              <span class="${cls}">${esc(t.status)}</span>
+            </span>
+          </div>
+          <div class="task-sub" title="${esc(t.script)}">${esc(t.script)}</div>
+          <div class="task-sub">
+            起 ${fmtTime(t.started_at)} ·
+            <span class="task-duration">${fmtDuration(t.started_at, t.ended_at)}</span>
+          </div>
+          ${t.exit_code !== null && t.exit_code !== undefined
+            ? `<div class="task-sub">exit=${t.exit_code}</div>` : ""}
+        </div>`;
+    }).join("");
+
+    el.querySelectorAll(".task-card").forEach((c) => {
+      c.addEventListener("click", () => viewTaskLogs(c.dataset.task));
+    });
+    el.querySelectorAll(".task-del").forEach((b) => {
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        onDeleteTask(b.dataset.del);
+      });
+    });
+  }
+
+  // ---------------- Logs ----------------
+  function setConsoleTarget(taskId, deviceSerial) {
+    state.currentTaskId = taskId;
+    state.currentDeviceSerial = deviceSerial;
+    renderLogInfo();
+  }
+
+  function renderLogInfo() {
+    const el = $("log-info");
+    const tid = state.currentTaskId;
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (!t) {
+      const serial = state.currentDeviceSerial;
+      el.innerHTML = serial
+        ? `<span class="muted">查看设备 ${esc(serial)} 的日志(该设备暂无任务)</span>`
+        : `<span class="muted">未选择任务</span>`;
+      $("btn-stop-task").disabled = true;
+      $("btn-hard-stop").disabled = true;
+      return;
+    }
+    const lineCount = $("log-console").textContent.split("\n").length - 1;
+    el.innerHTML = `
+      <span class="device-name">${esc(t.device)}</span>
+      <span class="muted">·</span>
+      <span class="script-name">${esc(t.script)}</span>
+      <span class="muted">·</span>
+      <span class="status-badge status-${esc(t.status)}">${esc(t.status)}</span>
+      <span class="muted">·</span>
+      <span class="runtime">${fmtDuration(t.started_at, t.ended_at)}</span>
+      <span class="muted">·</span>
+      <span class="line-count">${lineCount} 行</span>
+    `;
+    const isLive = ["running", "interrupting"].includes(t.status);
+    $("btn-stop-task").disabled = !isLive;
+
+    // 硬停 button: only enabled when current task's device is in temp-offline
+    // state (i.e., not in current adb devices list). Normal devices use 中断
+    // which sends CTRL_BREAK.
+    const liveSerials = new Set(state.devices.map((d) => d.serial));
+    const isTempOffline = !liveSerials.has(t.device);
+    $("btn-hard-stop").disabled = !(isLive && isTempOffline);
+  }
+
+  // ----- Log buffer (batches DOM updates via requestAnimationFrame) -----
+  // Without batching, replaying 2000+ lines on every WS reconnect causes a
+  // visible "刷" effect — textContent += on every line + scrollTop update
+  // = O(n²) work and obvious flicker. Batching collapses N appends into a
+  // single DOM update per animation frame.
+  const logBuf = [];
+  let logFlushScheduled = false;
+  // Match VSCode's default terminal scrollback (1000 lines) — keeps the DOM
+  // snappy while preserving enough recent context to read.
+  const LOG_DOM_CAP = 1000;
+
+  function appendLogLine(line) {
+    logBuf.push(line);
+    if (logFlushScheduled) return;
+    logFlushScheduled = true;
+    requestAnimationFrame(flushLogBuffer);
+  }
+
+  function flushLogBuffer() {
+    logFlushScheduled = false;
+    if (logBuf.length === 0) return;
+
+    const con = $("log-console");
+    if (con.textContent.startsWith("点击")) con.textContent = "";
+    const ts = new Date().toLocaleTimeString();
+    // One textContent update for all buffered lines
+    con.textContent += logBuf.map((line) => `[${ts}] ${line}\n`).join("");
+    logBuf.length = 0;
+
+    // Cap DOM size so the browser doesn't choke on huge logs
+    const allLines = con.textContent.split("\n");
+    if (allLines.length > LOG_DOM_CAP + 1) {
+      const dropped = allLines.length - LOG_DOM_CAP - 1;
+      con.textContent = `(已省略前 ${dropped} 行 · 完整日志见 logs/${state.currentTaskId || "task"}.log)\n`
+                    + allLines.slice(-LOG_DOM_CAP).join("\n");
+    }
+
+    if (!state.userScrolledUp) con.scrollTop = con.scrollHeight;
+    // Update line count in info bar (cheap query)
+    const lcEl = $("log-info").querySelector(".line-count");
+    if (lcEl) lcEl.textContent = `${con.textContent.split("\n").length - 1} 行`;
+    $("btn-export-log").disabled = false;
+  }
+
+  function clearConsole() {
+    $("log-console").textContent = "";
+    const lcEl = $("log-info").querySelector(".line-count");
+    if (lcEl) lcEl.textContent = "0 行";
+    $("btn-export-log").disabled = true;
+  }
+
+  async function onExportLog() {
+    const t = state.tasks.find((x) => x.task_id === state.currentTaskId);
+    const tid = state.currentTaskId;
+    if (!t || !tid) {
+      alert("当前未选择任务,无可导出内容");
+      return;
+    }
+
+    // Fetch FULL log from server (not just the capped DOM). The DOM only
+    // shows the last ~1000 lines (VSCode-style scrollback); export should
+    // contain everything ever written to the log file.
+    let fullLines = [];
+    try {
+      const data = await api(`/api/tasks/${tid}/log`);
+      fullLines = data.lines || [];
+    } catch (e) {
+      alert(`读取日志失败: ${e.message}`);
+      return;
+    }
+    if (fullLines.length === 0) {
+      alert("日志为空,无可导出内容");
+      return;
+    }
+
+    let header = "=== PPTP 任务日志导出 ===\n";
+    header += `导出时间: ${new Date().toISOString()}\n`;
+    header += `任务ID:   ${t.task_id}\n`;
+    header += `设备:     ${t.device}\n`;
+    header += `脚本:     ${t.script}\n`;
+    header += `状态:     ${t.status}\n`;
+    if (t.params && Object.keys(t.params).length) {
+      header += `参数:     ${JSON.stringify(t.params)}\n`;
+    }
+    header += `开始:     ${t.started_at || "-"}\n`;
+    if (t.ended_at) header += `结束:     ${t.ended_at}\n`;
+    if (t.exit_code !== null && t.exit_code !== undefined) {
+      header += `退出码:   ${t.exit_code}\n`;
+    }
+    header += `总行数:   ${fullLines.length}\n`;
+    header += "\n=== 日志内容 ===\n";
+
+    const content = header + fullLines.join("\n") + "\n";
+
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `pptp_${tid.slice(0, 8)}_${ts}.txt`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function viewTaskLogs(taskId) {
+    const t = state.tasks.find((x) => x.task_id === taskId);
+    if (!t) return;
+    // Already viewing this task - don't close+reopen WS (would trigger reconnect loop)
+    if (state.currentTaskId === taskId) {
+      renderTasks(); // just refresh active highlight
+      return;
+    }
+    setConsoleTarget(taskId, t.device);
+    state.userScrolledUp = false;
+    clearConsole();
+    // User-initiated switch: reset reconnect backoff so we get fresh attempts
+    state._wsReconnectAttempts = 0;
+    openWs(taskId);
+    renderTasks(); // refresh active highlight
+  }
+
+  function openWs(taskId) {
+    if (state.currentWs) {
+      try { state.currentWs.close(); } catch (_) {}
+      state.currentWs = null;
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}/ws/logs/${taskId}`);
+    ws._taskId = taskId;
+    state.currentWs = ws;
+    ws.onopen = () => {
+      // Successful connection - reset backoff counter
+      state._wsReconnectAttempts = 0;
+    };
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        // Defensive: if user switched away from this task while WS was still
+        // open (e.g. onSelectDevice on a device with no tasks), drop frames
+        // silently instead of dumping them into the (now-empty / another
+        // task's) console. Fix for "切设备时旧设备的日志仍出现".
+        if (state.currentTaskId !== ws._taskId) return;
+        if (msg.type === "log") appendLogLine(msg.line);
+        else if (msg.type === "end") {
+          // Flush any buffered lines BEFORE end so they're all visible
+          flushLogBuffer();
+          refreshTasks();
+        }
+        else if (msg.type === "state" &&
+                 ["finished","failed","interrupted"].includes(msg.status)) {
+          refreshTasks();
+        }
+        else if (msg.type === "error") appendLogLine(`[error] ${msg.message}`);
+        else if (msg.type === "replay_meta") {
+          // Server tells us it truncated the replay. Insert a visible note
+          // at the top of the console so the user knows there are earlier
+          // lines in the log file (not lost, just not loaded).
+          const note = `── 共 ${msg.total_lines} 行 · 本次显示最近 ${msg.shown_lines} 行 · 完整日志见 logs/<task>.log ──`;
+          const con = $("log-console");
+          if (con.textContent.startsWith("点击")) con.textContent = "";
+          con.textContent = note + "\n" + con.textContent;
+        }
+      } catch (_) {}
+    };
+    ws.onclose = () => {
+      if (state.currentWs === ws) state.currentWs = null;
+      // B4 fix: try to reconnect if user is still viewing this task
+      scheduleReconnect(taskId);
+    };
+    ws.onerror = () => appendLogLine("[ws] connection error");
+  }
+
+  // B4 fix: exponential backoff reconnect (1s, 2s, 3s, 4s, 5s, max 5 attempts)
+  function scheduleReconnect(taskId) {
+    if (state.shuttingDown) return;
+    // User switched to a different task - don't reconnect
+    if (state.currentTaskId !== taskId) return;
+    // Task is already in a terminal state - no need to reconnect
+    const task = state.tasks.find((t) => t.task_id === taskId);
+    if (task && ["finished", "failed", "interrupted"].includes(task.status)) return;
+    // Already have a reconnect scheduled
+    if (state._wsReconnectTimer) return;
+
+    state._wsReconnectAttempts = (state._wsReconnectAttempts || 0) + 1;
+    if (state._wsReconnectAttempts > 5) {
+      appendLogLine(`[ws] 重连失败已达上限(5 次),请刷新页面`);
+      state._wsReconnectAttempts = 0;
+      return;
+    }
+    const delay = Math.min(1000 * state._wsReconnectAttempts, 5000);
+    appendLogLine(
+      `[ws] 连接断开,${delay / 1000} 秒后重连(第 ${state._wsReconnectAttempts}/5 次)`
+    );
+    state._wsReconnectTimer = setTimeout(() => {
+      state._wsReconnectTimer = null;
+      openWs(taskId);
+    }, delay);
+  }
+
+  // ---------------- Actions ----------------
+  // Run the active script on the currently-selected device. Driven entirely
+  // by state (no params) - the script card's Run button calls this with
+  // no args. Per-device state.deviceScripts[serial] decides which script runs.
+  async function onRunClick() {
+    const serial = state.selectedDeviceSerial;
+    if (!serial) {
+      alert("请先在设备卡上选一台设备");
+      return;
+    }
+    const script = state.deviceScripts[serial];
+    if (!script) {
+      alert("请先为该设备选择一个脚本");
+      return;
+    }
+    const params = {};
+    if (script === "ir_runner.py") {
+      const seqName = state.deviceSequences[serial];
+      if (!seqName) {
+        alert("ir_runner 需要先选序列(点上方 ir_runner 卡片)");
+        return;
+      }
+      params.sequence = `ir_sequences/${seqName}.ini`;
+    }
+    try {
+      const res = await api("/api/run", {
+        method: "POST",
+        body: JSON.stringify({ device: serial, script, params }),
+      });
+      await refreshTasks();
+      viewTaskLogs(res.task_id);
+    } catch (e) {
+      alert(`运行失败: ${e.message}`);
+    }
+  }
+
+  function onSelectDevice(serial) {
+    state.currentDeviceSerial = serial;
+    state.selectedDeviceSerial = serial;  // drives script panel highlight
+    savePersistedState();
+    const running = state.tasks.find(
+      (t) => t.device === serial && (t.status === "running" || t.status === "interrupting")
+    );
+    if (running) {
+      viewTaskLogs(running.task_id);
+    } else {
+      // try the most recent task for this device (any status)
+      const last = [...state.tasks]
+        .filter((t) => t.device === serial)
+        .sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""))[0];
+      if (last) {
+        viewTaskLogs(last.task_id);
+      } else {
+        // Device has no tasks at all - close any leftover WS from a previous
+        // selection so it doesn't keep pushing lines into this now-empty
+        // console. (Defensive pair: WS onmessage also filters by taskId.)
+        if (state.currentWs) {
+          try { state.currentWs.close(); } catch (_) {}
+          state.currentWs = null;
+        }
+        state.currentTaskId = null;
+        setConsoleTarget(null, serial);
+        clearConsole();
+      }
+    }
+    renderDevices();
+    renderScripts();  // refresh script panel to reflect newly-selected device
+  }
+
+  async function onStopClick() {
+    const tid = state.currentTaskId;
+    if (!tid) return;
+    try {
+      await api(`/api/stop/${tid}`, { method: "POST" });
+    } catch (e) {
+      alert(`中断失败: ${e.message}`);
+    }
+  }
+
+  async function onForceStopClick(serial) {
+    if (!confirm(`设备 ${serial} 临时离线,普通停止可能不响应。\n是否直接杀掉该设备的子进程?\n\n(日志文件会保留)`)) return;
+    try {
+      const r = await api(`/api/tasks/force-stop-by-device/${encodeURIComponent(serial)}`, { method: "POST" });
+      alert(`已硬停 ${r.killed} 个任务`);
+      await refreshTasks();
+    } catch (e) {
+      alert(`硬停失败: ${e.message}`);
+    }
+  }
+
+  async function onDeleteTask(taskId) {
+    const t = state.tasks.find((x) => x.task_id === taskId);
+    if (!t) return;
+    if (!confirm(
+      `删除任务?\n\n设备: ${t.device}\n脚本: ${t.script}\n开始时间: ${fmtTime(t.started_at)}\n\n日志文件会一起删除,无法恢复。`
+    )) return;
+    try {
+      await api(`/api/tasks/${taskId}`, { method: "DELETE" });
+    } catch (e) {
+      alert(`删除失败: ${e.message}`);
+      return;
+    }
+    // If we were viewing this task, reset the console and info bar
+    if (state.currentTaskId === taskId) {
+      if (state.currentWs) { try { state.currentWs.close(); } catch (_) {} }
+      state.currentWs = null;
+      // B3 fix: setConsoleTarget also calls renderLogInfo to clear stale info
+      setConsoleTarget(null, null);
+      clearConsole();
+    }
+    await refreshTasks();
+  }
+
+  async function onCleanupTasks() {
+    const terminal = state.tasks.filter((t) =>
+      ["finished", "failed", "interrupted"].includes(t.status)
+    );
+    if (terminal.length === 0) {
+      alert("没有可清理的已完成任务");
+      return;
+    }
+    if (!confirm(
+      `确认清空 ${terminal.length} 个已结束任务?\n\n(包含 ${state.tasks.length - terminal.length} 个正在运行的任务不会被影响)\n\n所有日志文件会一起删除,无法恢复。`
+    )) return;
+    try {
+      const r = await api("/api/tasks/cleanup", { method: "POST" });
+      // If we were viewing one of the deleted tasks, reset
+      if (state.currentTaskId && r.ids && r.ids.includes(state.currentTaskId)) {
+        if (state.currentWs) { try { state.currentWs.close(); } catch (_) {} }
+        state.currentWs = null;
+        state.currentTaskId = null;
+        clearConsole();
+      }
+      await refreshTasks();
+    } catch (e) {
+      alert(`清空失败: ${e.message}`);
+    }
+  }
+
+  // ---------------- Polling ----------------
+  async function refreshDevices() {
+    try {
+      const r = await api("/api/devices");
+      state.devices = r.devices || [];
+      state.backendOnline = true;
+      $("backend-pill").classList.remove("off");
+    } catch (_) {
+      state.backendOnline = false;
+      $("backend-pill").classList.add("off");
+      return;
+    }
+    // Cleanup: forget remembered scripts AND per-device sequences for devices
+    // that truly disconnected. Don't drop the selection for devices with a
+    // running task — they might be temporarily offline.
+    const validSerials = new Set(state.devices.map((d) => d.serial));
+    const runningSerials = new Set(
+      state.tasks
+        .filter((t) => t.status === "running" || t.status === "interrupting")
+        .map((t) => t.device)
+    );
+    let dirty = false;
+    for (const serial of Object.keys(state.deviceScripts)) {
+      if (!validSerials.has(serial) && !runningSerials.has(serial)) {
+        delete state.deviceScripts[serial];
+        dirty = true;
+      }
+    }
+    for (const serial of Object.keys(state.deviceSequences)) {
+      if (!validSerials.has(serial) && !runningSerials.has(serial)) {
+        delete state.deviceSequences[serial];
+        dirty = true;
+      }
+    }
+    const k = devicesRenderKey();
+    if (k !== _lastKey.devices || dirty) {
+      _lastKey.devices = k;
+      renderDevices();
+    }
+  }
+  async function refreshScripts() {
+    try {
+      const r = await api("/api/scripts");
+      state.scripts = r.scripts || [];
+    } catch (_) { return; }
+    // Cleanup: forget remembered scripts for filenames that no longer exist on disk
+    const validFilenames = new Set(state.scripts.map((s) => s.filename));
+    let dirty = false;
+    for (const serial of Object.keys(state.deviceScripts)) {
+      if (!validFilenames.has(state.deviceScripts[serial])) {
+        delete state.deviceScripts[serial];
+        dirty = true;
+      }
+    }
+    const k = scriptsRenderKey();
+    if (k !== _lastKey.scripts) {
+      _lastKey.scripts = k;
+      renderScripts();
+    }
+    // scripts list change also affects device run-button labels / dropdown options, so re-render devices
+    const dk = devicesRenderKey();
+    if (dk !== _lastKey.devices || dirty) {
+      _lastKey.devices = dk;
+      renderDevices();
+    }
+  }
+  async function refreshTasks() {
+    try {
+      const r = await api("/api/tasks");
+      state.tasks = r.tasks || [];
+    } catch (_) { return; }
+    const tk = tasksRenderKey();
+    if (tk !== _lastKey.tasks) {
+      _lastKey.tasks = tk;
+      renderTasks();
+    }
+    // task changes always affect device cards (running badges)
+    const dk = devicesRenderKey();
+    if (dk !== _lastKey.devices) {
+      _lastKey.devices = dk;
+      renderDevices();
+    }
+    // also re-evaluate stop button enabled state
+    if (state.currentTaskId) {
+      const cur = state.tasks.find((t) => t.task_id === state.currentTaskId);
+      $("btn-stop-task").disabled = !cur || !["running","interrupting"].includes(cur.status);
+    }
+    // B2 fix: refresh log info bar so its status badge / runtime stays in sync
+    // with the underlying task (e.g., running -> finished transition)
+    if (state.currentTaskId) {
+      renderLogInfo();
+    }
+  }
+
+  function tickClock() {
+    $("clock").textContent = new Date().toLocaleTimeString();
+    updateLiveDurations();
+  }
+
+  // B1 fix: live duration ticker.
+  // Direct DOM update - no full re-render, no flicker, no animation reset.
+  function updateLiveDurations() {
+    state.tasks.forEach((t) => {
+      if (!["running", "interrupting"].includes(t.status)) return;
+      const card = document.querySelector(`.task-card[data-task="${t.task_id}"]`);
+      if (!card) return;
+      const durEl = card.querySelector(".task-duration");
+      if (durEl) durEl.textContent = fmtDuration(t.started_at, null);
+    });
+    if (state.currentTaskId) {
+      const t = state.tasks.find((x) => x.task_id === state.currentTaskId);
+      if (t && ["running", "interrupting"].includes(t.status)) {
+        const rtEl = $("log-info").querySelector(".runtime");
+        if (rtEl) rtEl.textContent = fmtDuration(t.started_at, null);
+      }
+    }
+  }
+
+  // ---------------- Server status ----------------
+  function fmtUptime(sec) {
+    if (sec < 60) return `${sec}s`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    return `${h}h${m}m`;
+  }
+
+  async function refreshServerStatus() {
+    if (state.shuttingDown) return;
+    try {
+      const s = await api("/api/server/status");
+      state.server = s;
+      renderServerInfo();
+    } catch (_) {}
+  }
+
+  function renderServerInfo() {
+    const el = $("server-info");
+    if (!state.server) {
+      el.innerHTML = "服务不可达";
+      return;
+    }
+    const s = state.server;
+    const taskBadge = s.running_tasks > 0
+      ? `<span class="warn">${s.running_tasks} 任务运行中</span>`
+      : `<span class="hi">空闲</span>`;
+    el.innerHTML = `PID <span class="hi">${s.pid}</span> · 运行 ${fmtUptime(s.uptime_sec)} · ${taskBadge}`;
+  }
+
+  async function onShutdownClick() {
+    if (state.shuttingDown) return;
+    const running = state.server?.running_tasks || 0;
+    const msg = running > 0
+      ? `确定关闭 PPTP 吗?\n\n当前有 ${running} 个任务正在运行,会被中断。\n关闭后刷新页面会失败。`
+      : `确定关闭 PPTP 服务吗?`;
+    if (!confirm(msg)) return;
+
+    state.shuttingDown = true;
+    const btn = $("btn-shutdown");
+    btn.disabled = true;
+    btn.textContent = "关闭中…";
+
+    // close WS first (otherwise the server will reject new connections after shutdown)
+    if (state.currentWs) {
+      try { state.currentWs.close(); } catch (_) {}
+      state.currentWs = null;
+    }
+    if (state._wsReconnectTimer) {
+      clearTimeout(state._wsReconnectTimer);
+      state._wsReconnectTimer = null;
+    }
+    // disable polling
+    clearInterval(state._pollDevices);
+    clearInterval(state._pollTasks);
+    clearInterval(state._pollServer);
+    clearInterval(state._pollClock);
+
+    try {
+      await api("/api/server/shutdown", { method: "POST" });
+    } catch (_) {
+      // expected - server closes connection during shutdown
+    }
+
+    // show shutdown screen
+    document.body.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                  height:100vh;background:#0f1419;color:#e4e7eb;font-family:sans-serif;">
+        <h2 style="margin:0 0 12px;color:#4ade80;">PPTP 已关闭</h2>
+        <p style="color:#8a93a3;margin:0;">服务进程已退出。可以关闭浏览器窗口。</p>
+        <p style="color:#8a93a3;margin:24px 0 0;font-size:12px;">
+          重新启动:双击 <code style="background:#1a1f29;padding:2px 6px;border-radius:3px;">start.bat</code>
+        </p>
+      </div>`;
+  }
+
+  // ---------------- Init ----------------
+  function bindEvents() {
+    $("btn-refresh-devices").addEventListener("click", refreshDevices);
+    $("btn-refresh-scripts").addEventListener("click", refreshScripts);
+    $("btn-refresh-tasks").addEventListener("click", refreshTasks);
+    $("btn-cleanup-tasks").addEventListener("click", onCleanupTasks);
+    $("btn-clear-log").addEventListener("click", clearConsole);
+    $("btn-export-log").addEventListener("click", onExportLog);
+    $("btn-stop-task").addEventListener("click", onStopClick);
+    $("btn-hard-stop").addEventListener("click", onForceStopCurrent);
+    $("btn-shutdown").addEventListener("click", onShutdownClick);
+    $("btn-reset").addEventListener("click", onResetClick);
+
+    // Modal: IR sequence picker (list + select)
+    document.querySelectorAll("#modal-seq [data-close]").forEach((b) => {
+      b.addEventListener("click", closeSeqModal);
+    });
+    // Click on backdrop (outside modal) closes
+    $("modal-seq").addEventListener("click", (e) => {
+      if (e.target.id === "modal-seq") closeSeqModal();
+    });
+    // ESC to close
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("modal-seq").hidden) closeSeqModal();
+    });
+
+    // console scroll detection: pause auto-scroll when user scrolls up
+    const con = $("log-console");
+    con.addEventListener("scroll", () => {
+      const atBottom = con.scrollHeight - con.scrollTop - con.clientHeight < 20;
+      state.userScrolledUp = !atBottom;
+    });
+  }
+
+  // ---------------- IR sequence picker modal ----------------
+  // Sequences are .ini files in ir_sequences/. The modal is a pure picker:
+  // - Lists existing sequences
+  // - Allows creating a new one (with a minimal template)
+  // - Selecting one binds it to a device (state.deviceSequences[device] = filename)
+  // No content editing - the user edits the .ini file directly.
+  let _seqListCache = null;  // [{name, filename, mtime, size}, ...]
+
+  async function loadSeqList() {
+    if (_seqListCache) return _seqListCache;
+    try {
+      const r = await api("/api/sequences");
+      _seqListCache = r.sequences || [];
+    } catch (_) {
+      _seqListCache = [];
+    }
+    return _seqListCache;
+  }
+
+  function invalidateSeqList() { _seqListCache = null; }
+
+  // State context for the current modal session:
+  //   { target: "device" | "file", device: serial | null, file: "default" }
+  // The picker selects a sequence file (filename stem) and binds it to the
+  // target. For device target, the selection is stored in
+  // state.deviceSequences[device]. For file target, the modal just closes.
+  let _seqPickerContext = null;
+  let _seqSelected = null;  // filename stem currently being picked
+
+  async function openSeqModal(opts) {
+    // Back-compat: openSeqModal("default") or openSeqModal({device})
+    let ctx = { target: "file", device: null, file: "default" };
+    if (typeof opts === "string") {
+      ctx.file = opts || "default";
+    } else if (opts && typeof opts === "object") {
+      if (opts.device) {
+        ctx.target = "device";
+        ctx.device = opts.device;
+      } else if (opts.file) {
+        ctx.file = opts.file;
+      }
+    }
+    _seqPickerContext = ctx;
+    _seqSelected = null;
+
+    // Show the target device in the modal header
+    $("seq-target").textContent = ctx.target === "device"
+      ? `为设备 ${ctx.device} 选择序列`
+      : "选择序列文件";
+
+    $("seq-status").textContent = "";
+    $("modal-seq").hidden = false;
+
+    await renderSeqList();
+  }
+
+  function closeSeqModal() {
+    $("modal-seq").hidden = true;
+  }
+
+  async function renderSeqList() {
+    const list = $("seq-list");
+    const items = await loadSeqList();
+    $("seq-count").textContent = `(${items.length} 个)`;
+    if (!items.length) {
+      list.innerHTML = `<div class="seq-list-empty">暂无序列文件<br>
+        <small>在下方输入名称,点击"+ 新建"创建模板</small></div>`;
+      return;
+    }
+    const target = _seqPickerContext;
+    // Pre-select the device's currently-bound sequence (if device mode)
+    let preselect = null;
+    if (target && target.target === "device" && target.device) {
+      preselect = state.deviceSequences[target.device] || null;
+    } else if (target && target.target === "file") {
+      preselect = target.file || null;
+    }
+    _seqSelected = preselect;
+
+    list.innerHTML = items.map((it) => {
+      const isDefault = it.name === "default";
+      const selected = it.name === _seqSelected;
+      const radio = selected ? "●" : "○";
+      return `
+        <div class="seq-list-item ${selected ? "selected" : ""}" data-name="${esc(it.name)}">
+          <span class="seq-name">${esc(it.name)}.ini</span>
+          ${isDefault ? "" : `<button class="seq-del" data-del="${esc(it.name)}" title="删除此序列(临时)">×</button>`}
+          <span class="seq-radio">${radio}</span>
+        </div>`;
+    }).join("");
+
+    // Click row → select sequence (commit immediately, no Save button)
+    list.querySelectorAll(".seq-list-item").forEach((row) => {
+      row.addEventListener("click", (e) => {
+        if (e.target.closest(".seq-del")) return;
+        selectSequence(row.dataset.name);
+      });
+    });
+    // Click × → delete sequence (with confirm)
+    list.querySelectorAll(".seq-del").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.del;
+        if (!confirm(`删除序列 ${name}.ini?\n\n(不会删除 default.ini)`)) return;
+        try {
+          await api(`/api/sequences/${encodeURIComponent(name)}`, { method: "DELETE" });
+          invalidateSeqList();
+          await renderSeqList();
+        } catch (err) {
+          alert(`删除失败: ${err.message}`);
+        }
+      });
+    });
+  }
+
+  // User picked a sequence. Persist binding to state and close.
+  function selectSequence(name) {
+    const ctx = _seqPickerContext;
+    if (ctx.target === "device" && ctx.device) {
+      state.deviceSequences[ctx.device] = name;
+      savePersistedState();
+      renderDevices();
+      // Also re-render the script panel so the bound sequence shows in
+      // the ir_runner card subtitle (and the Run button becomes enabled).
+      renderScripts();
+      $("seq-status").textContent = `✓ 设备 ${ctx.device} 已绑定 ${name}.ini`;
+    } else {
+      $("seq-status").textContent = `✓ 选中 ${name}.ini(仅查看,未绑定设备)`;
+    }
+    setTimeout(closeSeqModal, 400);
+  }
+
+  // Force-stop the currently-viewed task. Used when device is temp-offline
+  // (normal "中断" sends CTRL_BREAK which may not reach the subprocess).
+  async function onForceStopCurrent() {
+    const tid = state.currentTaskId;
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (!t) return;
+    if (!confirm(`设备 ${t.device} 临时离线,普通停止可能不响应。\n是否直接杀掉子进程?\n\n(日志文件会保留)`)) return;
+    try {
+      const r = await api(`/api/tasks/force-stop-by-device/${encodeURIComponent(t.device)}`, { method: "POST" });
+      alert(`已硬停 ${r.killed} 个任务`);
+      await refreshTasks();
+    } catch (e) {
+      alert(`硬停失败: ${e.message}`);
+    }
+  }
+
+  async function onResetClick() {
+    if (!confirm("硬重置:\n1) 杀掉所有正在运行的任务\n2) 清空任务列表\n3) 重启 ADB server\n\n确定继续?")) return;
+    const btn = $("btn-reset");
+    btn.disabled = true;
+    btn.textContent = "重置中…";
+    try {
+      await api("/api/tasks/force-cleanup", { method: "POST" });
+    } catch (e) {
+      // 继续尝试 reconnect adb
+      console.warn("force-cleanup failed:", e);
+    }
+    try {
+      await api("/api/adb/reconnect", { method: "POST" });
+    } catch (e) {
+      console.warn("adb reconnect failed:", e);
+    }
+    // Reset local view
+    if (state.currentWs) { try { state.currentWs.close(); } catch (_) {} }
+    state.currentWs = null;
+    state.currentTaskId = null;
+    state.currentDeviceSerial = null;
+    setConsoleTarget(null, null);
+    clearConsole();
+    await refreshTasks();
+    await refreshDevices();
+    btn.disabled = false;
+    btn.textContent = "重置";
+  }
+
+  // ===== localStorage persistence =====
+  // What we keep across page refresh / server restart:
+  //   - selectedDeviceSerial  (user preference: which device they're looking at)
+  //   - deviceSequences       (user config: which device runs which IR sequence)
+  //
+  // What we DELIBERATELY discard (2026-07-20 reversal):
+  //   - deviceScripts         (session state: "what do I want to run RIGHT NOW";
+  //                            re-selecting from the dropdown is cheap and the
+  //                            previous design that persisted this confused users
+  //                            on restart - cards showed a script chosen from
+  //                            a previous session that may no longer be valid).
+  //
+  // Server-side data (devices, scripts, tasks, server info) is always
+  // re-fetched from the backend on init, so we only persist user choices.
+  const STORAGE_KEY = "pptp.deviceState.v1";
+
+  function loadPersistedState() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (data.selectedDeviceSerial)
+        state.selectedDeviceSerial = data.selectedDeviceSerial;
+      // deviceScripts intentionally NOT loaded - see comment above.
+      if (data.deviceSequences && typeof data.deviceSequences === "object")
+        state.deviceSequences = data.deviceSequences;
+    } catch (_) {
+      // Ignore corrupt state - just start fresh
+    }
+  }
+
+  let _saveTimer = null;
+  function savePersistedState() {
+    // Debounce: batch rapid state changes into one write
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+      try {
+        const data = {
+          selectedDeviceSerial: state.selectedDeviceSerial,
+          // deviceScripts intentionally NOT saved - see comment above.
+          deviceSequences: state.deviceSequences,
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (_) { /* quota exceeded etc - ignore */ }
+    }, 200);
+  }
+
+  function init() {
+    loadPersistedState();
+    bindEvents();
+    refreshDevices();
+    refreshScripts();
+    refreshTasks();
+    refreshServerStatus();
+    state._pollDevices = setInterval(refreshDevices, 3000);
+    state._pollTasks = setInterval(refreshTasks, 2000);
+    state._pollServer = setInterval(refreshServerStatus, 5000);
+    state._pollClock = setInterval(tickClock, 1000);
+    tickClock();
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();

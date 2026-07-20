@@ -1,0 +1,259 @@
+16 进制码获取指令
+adb shell getevent /dev/input/event1
+可读码获取指令
+adb shell getevent -l /dev/input/event1
+
+
+非工厂遥控器_梯形对焦键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404074
+/dev/input/event1: EV_KEY       KEY_TV2              DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_TV2              UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404074
+0001 017a 00000001
+0000 0000 00000000
+0001 017a 00000000
+0000 0000 00000000
+非工厂遥控器_调焦up键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040401f
+/dev/input/event1: EV_KEY       KEY_CHANNELUP        DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_CHANNELUP        UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040401f
+0001 0192 00000001
+0000 0000 00000000
+0001 0192 00000000
+0000 0000 00000000
+非工厂遥控器_调焦down键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040401e
+/dev/input/event1: EV_KEY       KEY_CHANNELDOWN      DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_CHANNELDOWN      UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040401e
+0001 0193 00000001
+0000 0000 00000000
+0001 0193 00000000
+0000 0000 00000000
+非工厂遥控器_Netflix热键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404049
+/dev/input/event1: EV_KEY       KEY_PAGEUP           DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_PAGEUP           UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404049
+0001 0068 00000001
+0000 0000 00000000
+0001 0068 00000000
+0000 0000 00000000
+非工厂遥控器_Youtube热键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404040
+/dev/input/event1: EV_KEY       KEY_VCR              DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_VCR              UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404040
+0001 017b 00000001
+0000 0000 00000000
+0001 017b 00000000
+0000 0000 00000000
+非工厂遥控器_PrimeVideo热键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404041
+/dev/input/event1: EV_KEY       KEY_VCR2             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_VCR2             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404041
+0001 017c 00000001
+0000 0000 00000000
+0001 017c 00000000
+0000 0000 00000000
+非工厂遥控器_Home键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040401a
+/dev/input/event1: EV_KEY       KEY_HOME             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_HOME             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040401a
+0001 0066 00000001
+0000 0000 00000000
+0001 0066 00000000
+0000 0000 00000000
+非工厂遥控器_OK键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040400d
+/dev/input/event1: EV_KEY       KEY_ENTER            DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_ENTER            UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040400d
+0001 001c 00000001
+0000 0000 00000000
+0001 001c 00000000
+0000 0000 00000000
+非工厂遥控器_信源键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404048
+/dev/input/event1: EV_KEY       KEY_KP1              DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_KP1              UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404048
+0001 004f 00000001
+0000 0000 00000000
+0001 004f 00000000
+0000 0000 00000000
+非工厂遥控器_返回键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404047
+/dev/input/event1: EV_KEY       KEY_BACK             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_BACK             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404047
+0001 009e 00000001
+0000 0000 00000000
+0001 009e 00000000
+0000 0000 00000000
+非工厂遥控器_上键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040400b
+/dev/input/event1: EV_KEY       KEY_UP               DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_UP               UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040400b
+0001 0067 00000001
+0000 0000 00000000
+0001 0067 00000000
+0000 0000 00000000
+非工厂遥控器_下键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040400e
+/dev/input/event1: EV_KEY       KEY_DOWN             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_DOWN             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040400e
+0001 006c 00000001
+0000 0000 00000000
+0001 006c 00000000
+0000 0000 00000000
+非工厂遥控器_左键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404010
+/dev/input/event1: EV_KEY       KEY_LEFT             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_LEFT             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404010
+0001 0069 00000001
+0000 0000 00000000
+0001 0069 00000000
+0000 0000 00000000
+非工厂遥控器_右键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404011
+/dev/input/event1: EV_KEY       KEY_RIGHT            DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_RIGHT            UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404011
+0001 006a 00000001
+0000 0000 00000000
+0001 006a 00000000
+0000 0000 00000000
+非工厂遥控器_Power键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040400a
+/dev/input/event1: EV_KEY       KEY_POWER            DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_POWER            UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040400a
+0001 0074 00000001
+0000 0000 00000000
+0001 0074 00000000
+0000 0000 00000000
+非工厂遥控器_Profile键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404014
+/dev/input/event1: EV_KEY       KEY_BOOKMARKS        DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_BOOKMARKS        UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404014
+0001 009c 00000001
+0000 0000 00000000
+0001 009c 00000000
+0000 0000 00000000
+非工厂遥控器_Voice键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040404b
+/dev/input/event1: EV_KEY       KEY_ASSISTANT        DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_ASSISTANT        UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040404b
+0001 0247 00000001
+0000 0000 00000000
+0001 0247 00000000
+0000 0000 00000000
+非工厂遥控器_Setting键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404012
+/dev/input/event1: EV_KEY       KEY_CALENDAR         DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_CALENDAR         UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404012
+0001 018d 00000001
+0000 0000 00000000
+0001 018d 00000000
+0000 0000 00000000
+非工厂遥控器_Menu键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404042
+/dev/input/event1: EV_KEY       KEY_MENU             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_MENU             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404042
+0001 008b 00000001
+0000 0000 00000000
+0001 008b 00000000
+0000 0000 00000000
+非工厂遥控器_VolumeUp键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404015
+/dev/input/event1: EV_KEY       KEY_VOLUMEUP         DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_VOLUMEUP         UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404015
+0001 0073 00000001
+0000 0000 00000000
+0001 0073 00000000
+0000 0000 00000000
+非工厂遥控器_VolumeDown键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040401c
+/dev/input/event1: EV_KEY       KEY_VOLUMEDOWN       DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_VOLUMEDOWN       UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040401c
+0001 0072 00000001
+0000 0000 00000000
+0001 0072 00000000
+0000 0000 00000000
+非工厂遥控器_Mute键
+/dev/input/event1: EV_MSC       MSC_SCAN             0040400f
+/dev/input/event1: EV_KEY       KEY_MUTE             DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_MUTE             UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 0040400f
+0001 0071 00000001
+0000 0000 00000000
+0001 0071 00000000
+0000 0000 00000000
+非工厂遥控器_YoutubeMusic热键
+/dev/input/event1: EV_MSC       MSC_SCAN             00404070
+/dev/input/event1: EV_KEY       KEY_AB               DOWN
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+/dev/input/event1: EV_KEY       KEY_AB               UP
+/dev/input/event1: EV_SYN       SYN_REPORT           00000000
+0004 0004 00404070
+0001 0196 00000001
+0000 0000 00000000
+0001 0196 00000000
+0000 0000 00000000
