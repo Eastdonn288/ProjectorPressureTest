@@ -177,6 +177,25 @@
 - **建议**: HANDOFF 加 "本文件是真源" 注 + SIMPLE-* 加归档 banner + README 全量更新(脚本名、API 表、目录树、IR 序列章节、localStorage 章节)。
 - **采纳**: 2026-07-18 完成。
 
+### 2.11 ✅ IR 脚本融合 + Long 按键 bug 修复(2026-07-20)
+
+- **背景**: 旧平台 IR 相关代码拆在 3 个文件里:[scripts/ir_runner.py](scripts/ir_runner.py) + [tools/ir/ir_remote.py](tools/ir/ir_remote.py) + [tools/ir/keyevent.txt](tools/ir/keyevent.txt)。更严重的是,Long 按键的实现是"循环发短按"(在 duration_ms 内反复 down+up),跟"按住 duration_ms 再松开"完全不同 — 设备收到的是一堆短按,不是长按。
+- **建议**:
+  1. 把 IRRemote + SequenceConfig + runner 全合到 [scripts/ir_runner.py](scripts/ir_runner.py)(一个 py)
+  2. 删除 [tools/ir/](tools/ir/) 整个文件夹(去掉外部数据文件依赖)
+  3. IR event 路径 hardcode 默认 `/dev/input/event1`(从旧 keyevent.txt 推断),支持 3 种覆盖(CLI `--device-event-path` / env `IR_EVENT_PATH` / 改顶部常量)
+  4. 重写 long_press:`send_key_down` → sleep(duration_ms) → `send_key_up`,真正的"按住"
+  5. 保留 [scripts/wifi_reboot_stress.py](scripts/wifi_reboot_stress.py)(与 IR 无关,合并不合理)
+- **采纳**: 2026-07-20 完成。最终目录:`scripts/` 2 个 py(IR + WiFi)、`ir_sequences/` 1 个 ini + 1 个 md,`tools/` 整个删。
+
+### 2.12 ✅ PPTP 平台 4 个 UI bug 修复(2026-07-20)
+
+- **Bug1**: 运行中脚本卡片未置灰 — [renderScripts](static/app.js#L122) 加 `isLocked` 判定 + 新增 `.script-card-running` CSS 类(opacity 0.55 + not-allowed + dashed border,保留 "▸ 当前选中" ribbon 让用户知道是 active)
+- **Bug2**: 切任务卡不联动脚本面板 — [viewTaskLogs](static/app.js#L571) 同步设 `state.selectedDeviceSerial` + 调 `renderDevices/renderScripts`
+- **Bug3**: 离线设备任务切后脚本高亮残留 — [renderScripts](static/app.js#L151) 加 `selectedDeviceReachable` 判定(设备断开且非运行中 → 不高亮)
+- **额外**: 设备卡左下【undefined】— `btnHtml` 默认 `""` 而非 undefined
+- **采纳**: 2026-07-20 完成。
+
 ---
 
 ## §3. 开放问题 / 待用户拍板(下一会话可以问)

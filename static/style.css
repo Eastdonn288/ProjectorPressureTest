@@ -148,6 +148,24 @@ html, body {
   background: linear-gradient(180deg, rgba(79,158,255,0.08) 0%, var(--panel-2) 100%);
   box-shadow: 0 0 0 1px var(--accent), 0 4px 12px rgba(79, 158, 255, 0.15);
 }
+
+/* Running-locked: active card BUT the selected device currently has a
+   running task. Visually dim + not-allowed, but KEEPS the "▸ 当前选中"
+   ribbon + active border so the user can still tell this IS the script
+   for the device. (Bug1, 2026-07-20.)
+   The dashed border distinguishes "currently locked" from "not selected"
+   (which also uses dashed, but is fully unbordered / no ribbon). */
+.script-card.script-card-running {
+  opacity: 0.55;
+  cursor: not-allowed;
+  border-style: dashed;
+}
+.script-card.script-card-running:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: var(--accent);  /* keep accent so the "still active" cue holds */
+  background: linear-gradient(180deg, rgba(79,158,255,0.08) 0%, var(--panel-2) 100%);
+}
 .script-card.script-card-active::before {
   content: "▸ 当前选中";
   position: absolute;

@@ -79,7 +79,7 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 ```
 
 - `index` 自动编号(1, 2, 3, ...)
-- `code` `KEY_HOME` / `KEY_ENTER` 等(KEY_NAME 来自 `tools/ir/keyevent.txt`)
+- `code` `KEY_HOME` / `KEY_ENTER` 等(24 个 KEY_NAME,见 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md),代码里硬编码在 `IRRemote.CODE_NUM_MAP`)
 - `Short` 或 `LongXXXX`(XXXX 为长按毫秒,如 `Long3000` = 长按 3 秒)
 - `delay_ms` 重复间延迟(整数 ms)
 - `count` 重复次数(整数)
@@ -162,14 +162,11 @@ ProjectorPressureTest/
 │   ├── app.js             # 前端逻辑 IIFE
 │   └── style.css          # 样式
 ├── scripts/               # 压测脚本
-│   ├── ir_runner.py             # 红外序列(默认无限循环)
-│   └── wifi_reboot_stress.py    # WiFi 重启压力
-├── ir_sequences/          # IR 序列 .ini 文件
-│   ├── default.ini
-│   └── KEY_REFERENCE.md   # 按键速查表
-├── tools/ir/              # IR 工具类
-│   ├── ir_remote.py       # IRRemote 工具(发 ADB sendevent)
-│   └── keyevent.txt        # 按键→event 原始数据
+│   ├── ir_runner.py             # 红外序列(自包含:IRRemote 内联,默认无限循环,长按=down+hold+up)
+│   └── wifi_reboot_stress.py    # WiFi 重启压力(与 IR 无关,独立脚本)
+├── ir_sequences/          # IR 序列 .ini 文件(单一 ini)
+│   ├── default.ini              # 默认 14 步序列(全 Short)
+│   └── KEY_REFERENCE.md         # 24 个按键的 KEY_NAME 速查(手动维护)
 └── logs/                  # 运行时日志
     ├── server.log
     └── <task_id>.log
@@ -220,8 +217,17 @@ ProjectorPressureTest/
 - 想彻底重置
   跑顶栏"重置"按钮(杀所有任务 + 重启 ADB),或手动删 logs/*.log。
 
-- ir_runner 跑起来报 "Key not found"
-  检查 ir_sequences/ 里 .ini 是不是 5 字段(无 name 字段)。
+- ir_runner 跑起来报 "Key not found" 或 "not in CODE_NUM_MAP"
+  检查 ini 里 `code` 字段是否在 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md) 列表内(24 个内置按键)。新增按键需改 `scripts/ir_runner.py` 的 `IRRemote.CODE_NUM_MAP`。
+
+- 长按没生效 / 设备无响应
+  默认 IR event 路径是 `/dev/input/event1`(从原 keyevent.txt 推断)。如果你的设备 event 路径不同:
+  - CLI 调试: 加 `--device-event-path /dev/input/eventN`
+  - 环境变量: `set IR_EVENT_PATH=/dev/input/eventN`(Windows) / `export IR_EVENT_PATH=/dev/input/eventN`(Linux)
+  - 直接改 [scripts/ir_runner.py](scripts/ir_runner.py) 顶部 `DEFAULT_EVENT_PATH` 常量
+
+- 想换设备 event 路径但 PPTP 平台不传 CLI 参数
+  当前平台透传的 `--device-event-path` 还没接(改中)。临时方案:设环境变量后重启 uvicorn,所有 ir_runner 任务都会读到。
 
 - 想改平台代码后没生效
   浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.0.1` + NoCache 中间件,普通 F5 可能拿到缓存)。

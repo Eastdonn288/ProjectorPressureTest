@@ -33,14 +33,11 @@ E:\ProjectorPressureTest\
 │   ├── SIMPLE-ARCHITECTURE.md
 │   └── SIMPLE-PLAN.md               — 早期需求/架构/计划
 ├── scripts\                         (平台调用的压测脚本)
-│   ├── ir_runner.py                 — 红外遥控序列循环(默认无限循环)
-│   └── wifi_reboot_stress.py        — 重启+ WiFi 重连压力测试
-├── ir_sequences\                    (用户可编辑的 .ini 序列文件)
-│   ├── default.ini
-│   └── KEY_REFERENCE.md              — 工具生成的按键速查
-├── tools\ir\
-│   ├── ir_remote.py                 — IRRemote 工具类(发 ADB sendevent)
-│   └── keyevent.txt                  — 按键→event 映射原始数据
+│   ├── ir_runner.py                 — 红外遥控序列循环(自包含 IRRemote,默认无限循环;长按=down+hold+up)
+│   └── wifi_reboot_stress.py        — 重启+ WiFi 重连压力测试(与 IR 无关,独立)
+├── ir_sequences\                    (用户可编辑的 .ini 序列文件 + 按键速查)
+│   ├── default.ini                  — 默认 14 步序列
+│   └── KEY_REFERENCE.md              — 24 个按键的 KEY_NAME 速查(手动维护)
 ├── static\
 │   ├── app.js                        (1249 行) — 前端所有逻辑
 │   ├── index.html                    (110 行)  — 4 面板 + 1 模态
@@ -230,7 +227,7 @@ const state = {
 
 1. **不要直接写代码**。先:
    - Read 标注的源文件 + grep 相关函数名
-   - 如果涉及 IR 序列,看 `tools/ir/ir_remote.py` + `docs/SIMPLE-PRD.md`
+   - 如果涉及 IR 序列,看 `scripts/ir_runner.py`(自包含 IRRemote,无外部依赖)+ `ir_sequences/default.ini`
 2. **列影响面**:
    - 后端 → server.py 哪个 route / 函数
    - 前端 → app.js 哪些函数 / state 哪些字段
@@ -396,4 +393,4 @@ curl http://127.0.0.1:8000/api/sequences
 **已知小问题**:
 - WS 在 server restart 时 log console 会"卡"在最后一行(没手动 rejoin)
 - 任务被删除时 log 文件可能短暂残留(orphan cleanup 只清 startup 时的)
-- keyevent.txt 解析的 KEY 数量会被前端 (已移走) 缓存,如重新需要需刷新
+- IR event 设备路径(默认 `/dev/input/event1`)是 hardcode 的,如果换设备要改 `ir_runner.py` 顶部 `DEFAULT_EVENT_PATH`(详见 [README.md 故障排查](../README.md))

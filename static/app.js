@@ -134,16 +134,38 @@
     const selectedScriptName = selectedDevice
       ? state.deviceScripts[selectedDevice] || null
       : null;
+    // Bug1: a card is "locked" when the selected device currently has a
+    // running task — the user shouldn't re-trigger Run or open the config
+    // modal mid-run. (Decision is per the selected device, not per task.)
+    const selectedDeviceRunning = !!(
+      selectedDevice &&
+      state.tasks.find(
+        (t) => t.device === selectedDevice &&
+               (t.status === "running" || t.status === "interrupting")
+      )
+    );
+    // Bug3: a selected device is "reachable" if it shows up in adb devices
+    // OR has a running task (temp-offline case). When unreachable AND not
+    // running, we suppress the active highlight so stale "current script"
+    // doesn't linger for an offline device.
+    const selectedDeviceReachable = !selectedDevice || state.devices.some(
+      (d) => d.serial === selectedDevice
+    ) || selectedDeviceRunning;
 
     el.innerHTML = state.scripts.map((s) => {
       // Per-card state: which cards are active (clickable + has Run button)
-      // vs disabled (no device selected, or device's script != this one).
+      // vs disabled (no device selected, or device's script != this one)
+      // vs locked (active card but device is currently running).
       const hasConfig = s.filename === "ir_runner.py";
-      const isActive = !!selectedDevice && selectedScriptName === s.filename;
-      const disabled = !selectedDevice || !isActive;
+      // Bug3: only highlight if the device is still reachable.
+      const isActive = selectedDeviceReachable && selectedScriptName === s.filename;
+      const isLocked = isActive && selectedDeviceRunning;
+      const disabled = !selectedDevice || !isActive || isLocked;
       const classes = [
         "script-card",
-        isActive ? "script-card-active" : "script-card-disabled",
+        isLocked ? "script-card-running"
+        : isActive ? "script-card-active"
+        : "script-card-disabled",
       ].join(" ");
 
       const iconChar = isActive ? "📌" : "📜";
@@ -177,12 +199,18 @@
       let runBtnHtml = "";
       if (isActive) {
         const needsSeq = hasConfig && !state.deviceSequences[selectedDevice];
-        const runTitle = needsSeq ? "先选序列(点此卡打开 picker)" : "在此设备上运行此脚本";
+        // Bug1: disable Run when device is currently running — already running,
+        // can't re-run. (The card stays clickable so user can re-pick a
+        // sequence if they want, but Run is hard-disabled.)
+        const runDisabled = needsSeq || isLocked;
+        const runTitle = isLocked ? "设备在跑任务,不能重复跑(等结束或中断)"
+                      : needsSeq  ? "先选序列(点此卡打开 picker)"
+                      :              "在此设备上运行此脚本";
         runBtnHtml = `
           <div class="script-card-run">
             <button class="btn btn-primary btn-run-script"
                     data-script="${esc(s.filename)}"
-                    ${needsSeq ? "disabled" : ""}
+                    ${runDisabled ? "disabled" : ""}
                     title="${esc(runTitle)}">
               ▶ 跑
             </button>
@@ -193,6 +221,7 @@
         <div class="${classes}" data-script="${esc(s.filename)}"
              data-has-config="${hasConfig}"
              data-active="${isActive}"
+             data-locked="${isLocked}"
              title="${esc(cardTitle)}">
           <div class="script-icon">${iconChar}</div>
           <div class="script-body">
@@ -203,12 +232,14 @@
         </div>`;
     }).join("");
 
-    // Click handler: only ACTIVE cards (matching selected device's script)
-    // are clickable, and they open the sequence picker.
+    // Click handler: only ACTIVE + non-locked cards are clickable, and they
+    // open the sequence picker. Locked cards (active but device is running)
+    // are visually dimmed and click no-op.
     el.querySelectorAll(".script-card").forEach((card) => {
       card.addEventListener("click", (e) => {
-        if (card.dataset.active !== "true") return;  // disabled cards: no-op
-        if (e.target.closest(".btn-run-script")) return;  // Run button has its own handler
+        if (card.dataset.active !== "true") return;     // disabled cards: no-op
+        if (card.dataset.locked === "true") return;     // Bug1: locked cards ignore clicks
+        if (e.target.closest(".btn-run-script")) return; // Run button has its own handler
         const filename = card.dataset.script;
         if (card.dataset.hasConfig === "true" && filename === "ir_runner.py") {
           openSeqModal({ device: state.selectedDeviceSerial });
@@ -573,16 +604,26 @@
     if (!t) return;
     // Already viewing this task - don't close+reopen WS (would trigger reconnect loop)
     if (state.currentTaskId === taskId) {
-      renderTasks(); // just refresh active highlight
+      renderTasks(); // refresh active highlight
+      renderScripts();  // Bug2: re-render scripts too (running status may have changed)
       return;
     }
     setConsoleTarget(taskId, t.device);
+    // Bug2: switching tasks implicitly switches "focus" to that task's device.
+    // Without this, the scripts panel keeps showing the previously-selected
+    // device's active highlight, and you have to click the device card to fix it.
+    state.selectedDeviceSerial = t.device;
+    savePersistedState();
     state.userScrolledUp = false;
     clearConsole();
     // User-initiated switch: reset reconnect backoff so we get fresh attempts
     state._wsReconnectAttempts = 0;
     openWs(taskId);
-    renderTasks(); // refresh active highlight
+    renderTasks();     // refresh active task highlight
+    renderDevices();   // Bug2: sync device card active highlight to t.device
+    renderScripts();   // Bug2 + Bug3: re-evaluate which script is active
+                       // (also Bug3 — if t.device is offline + non-running,
+                       //  isActive becomes false via selectedDeviceReachable)
   }
 
   function openWs(taskId) {
