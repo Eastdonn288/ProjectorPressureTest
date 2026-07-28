@@ -364,16 +364,24 @@ def run_loop(
                 print(f"\n[done] completed {loops} loop(s)")
                 break
             print(f"\n========== loop {loop_count}{'' if loops is None else f'/{loops}'} ==========")
-            for i, step in enumerate(steps, 1):
-                if step.index < start_index:
-                    continue
-                print(f"=== step {i}/{len(steps)}: {step.code} ({step.action}) ===")
+            # Only consider steps whose index >= start_index (CLI --step N skips
+            # the earlier ones). Inter-loop delay uses the LAST EXECUTED step's
+            # delay_ms — previously was hardcoded 1.0 which ignored ini config
+            # (bugfix 2026-07-20).
+            executed = [s for s in steps if s.index >= start_index]
+            for i, step in enumerate(executed, 1):
+                print(f"=== step {step.index}/{len(steps)}: {step.code} ({step.action}) ===")
                 run_step(ir, step, serial, dry_run=dry_run)
-                if i < len(steps):
+                if i < len(executed):
                     time.sleep(step.delay_ms / 1000.0)
-            # Pause between loops to avoid hammering if last delay was 0
+            # Inter-loop pause: respect the LAST executed step's delay_ms.
+            # Fallback to 1.0s if sequence is empty (no steps ran).
             if loops is None or loop_count < loops:
-                time.sleep(1.0)
+                inter_loop_ms = executed[-1].delay_ms if executed else 1000
+                if dry_run:
+                    print(f"[DRY] inter-loop sleep {inter_loop_ms}ms")
+                else:
+                    time.sleep(inter_loop_ms / 1000.0)
     except KeyboardInterrupt:
         print(f"\n[interrupted] stopped after {loop_count} loop(s)")
         return_code = 130
