@@ -1,6 +1,6 @@
 # 按键对照表
 
-> 手动维护 · 23 个按键 · 从 `tools/ir/keyevent.txt` 提取
+> 手动维护 · 24 个按键 · 新增 KEY_MEMO(2026-07-20)
 > 改 ini 时查这里:左边是按钮的中文描述,右边是 `ir_sequence.ini` 里要写的 KEY_NAME。
 
 | 中文名 | KEY_NAME |
@@ -17,6 +17,7 @@
 | Home键 | `KEY_HOME` |
 | 信源键 | `KEY_KP1` |
 | 左键 | `KEY_LEFT` |
+| Memo键 | `KEY_MEMO` |
 | Menu键 | `KEY_MENU` |
 | Mute键 | `KEY_MUTE` |
 | Netflix热键 | `KEY_PAGEUP` |

@@ -84,7 +84,7 @@ class IRRemote:
         "EV_ABS": 3,
         "EV_MSC": 4,
     }
-    # 设备按键码(从旧 keyevent.txt 提取 — 23 个按键)
+    # 设备按键码(从旧 keyevent.txt 提取 — 25 个按键,含 2026-07-20 新增的 KEY_MEMO)
     CODE_NUM_MAP = {
         "SYN_REPORT": 0,
         "MSC_SCAN": 4,
@@ -105,6 +105,7 @@ class IRRemote:
         "KEY_PAGEUP": 104,
         "KEY_KP1": 79,
         "KEY_POWER": 116,
+        "KEY_MEMO": 396,                # 0x18c — 新增(2026-07-20)
         "KEY_BOOKMARKS": 156,
         "KEY_ASSISTANT": 583,
         "KEY_CALENDAR": 397,
