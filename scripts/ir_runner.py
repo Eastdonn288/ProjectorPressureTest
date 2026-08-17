@@ -119,11 +119,10 @@ class IRRemote:
         "KEY_AB": 406,
     }
 
-    # 上层注入按键(Android keycode 名)—— user 版无需 userdebug 可用。
+    # 上层注入按键 A:厂商遥控按键(Android keycode 名)—— user 版无需 userdebug 可用。
     # key = ini 里写的名字(KEYCODE_* 形式,唯一标识);value = 注入目标 Android keycode 名称,
     # 由设备端自行解析为数值,故不需硬编码数字(数值在不同 Android 版本间稳定,但写名称最稳)。
     # 来源:厂商固件 keymap(2026-08-17 用户提供);中文名见 ir_sequences/KEY_REFERENCE.md 第二张表。
-    # 注意:未在此表内的 KEYCODE_* 会原样透传给 `input keyevent`(即可用任意标准 Android keycode 名)。
     ANDROID_KEYCODE_MAP = {
         "KEYCODE_2D3D": "KEYCODE_TV_INPUT_HDMI_1",
         "KEYCODE_BI": "KEYCODE_TV_INPUT_HDMI_3",
@@ -149,6 +148,25 @@ class IRRemote:
         "KEYCODE_HOME": "KEYCODE_F3",
         "KEYCODE_FOCUS_KEYSTONE": "KEYCODE_TV_SATELLITE_SERVICE",
     }
+
+    # 上层注入按键 B:安卓原生标准按键 —— 名称即 keycode 名(恒等透传),
+    # 注册在此仅为让 `supported keys` 打印与 KEY_REFERENCE.md 第三张表有据可查。
+    # 数值见 KEY_REFERENCE.md 第三张表(仅参考;ini 里一律写名称)。
+    NATIVE_ANDROID_KEYCODES = (
+        # 系统/导航
+        "KEYCODE_HOME", "KEYCODE_BACK", "KEYCODE_MENU", "KEYCODE_ENTER",
+        "KEYCODE_ESCAPE", "KEYCODE_APP_SWITCH", "KEYCODE_SETTINGS",
+        "KEYCODE_DPAD_UP", "KEYCODE_DPAD_DOWN", "KEYCODE_DPAD_LEFT",
+        "KEYCODE_DPAD_RIGHT", "KEYCODE_DPAD_CENTER",
+        # 电源/显示
+        "KEYCODE_POWER", "KEYCODE_SLEEP", "KEYCODE_WAKEUP",
+        "KEYCODE_BRIGHTNESS_UP", "KEYCODE_BRIGHTNESS_DOWN",
+        # 音量
+        "KEYCODE_VOLUME_UP", "KEYCODE_VOLUME_DOWN", "KEYCODE_MUTE",
+        # 媒体
+        "KEYCODE_MEDIA_PLAY_PAUSE", "KEYCODE_MEDIA_PLAY", "KEYCODE_MEDIA_PAUSE",
+        "KEYCODE_MEDIA_STOP", "KEYCODE_MEDIA_NEXT", "KEYCODE_MEDIA_PREVIOUS",
+    )
 
     def __init__(self, event_path: str, use_su: bool = False):
         self.event_path = event_path
@@ -512,9 +530,11 @@ def run_as_task(args) -> int:
         print(f"[runner] loaded {len(steps)} steps")
         print()
         sendevent_keys = sorted(k for k in ir.CODE_NUM_MAP if k.startswith("KEY_"))
-        input_keys = sorted(ir.ANDROID_KEYCODE_MAP.keys())
+        vendor_keys = sorted(ir.ANDROID_KEYCODE_MAP.keys())
+        native_keys = sorted(ir.NATIVE_ANDROID_KEYCODES)
         print(f"[runner] supported keys: {len(sendevent_keys)} sendevent (KEY_*, userdebug) -> {', '.join(sendevent_keys)}")
-        print(f"[runner] supported keys: {len(input_keys)} input keyevent (KEYCODE_*, works on user build) -> {', '.join(input_keys)}")
+        print(f"[runner] input keyevent (KEYCODE_*, works on user build): {len(vendor_keys)} vendor remote -> {', '.join(vendor_keys)}")
+        print(f"[runner] input keyevent native: {len(native_keys)} -> {', '.join(native_keys)}")
         print("[runner] mode: infinite loop (Ctrl+C or platform stop to end)")
         print()
 

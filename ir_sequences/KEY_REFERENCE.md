@@ -1,8 +1,8 @@
 # 按键对照表
 
-> 手动维护 · 两种按键族 · 新增 KEYCODE_* 上层注入按键(2026-08-17)
+> 手动维护 · 三种按键族 · 新增安卓原生 KEYCODE_* 按键(2026-08-17)
 > 改 ini 时查这里:左边是按钮的中文描述,右边是 ini 里要写的 KEY_NAME / KEYCODE_NAME。
-> 两族都支持短按 `Short` 与长按 `LongXXXX`(XXXX = 按住毫秒,缺省 1500);名称由 `ir_runner` 按前缀自动分发。
+> 名称由 `ir_runner` 按前缀自动分发。**长按仅第一族(KEY_*)有效**;KEYCODE_*(第二、三族)只支持短按,长按无效(见第二族说明)。
 
 ## 一、sendevent 按键(KEY_*,需 userdebug/root)
 
@@ -38,7 +38,7 @@
 ## 二、上层注入按键(KEYCODE_*,user 版可用,无需 userdebug)
 
 > 走 `adb shell input keyevent`,Android keycode **名称**由设备端解析为数值,故不需硬编码数字。
-> 中文名为**占位符**,后续由你自己修改。未列入下表的标准 KEYCODE_*(如 `KEYCODE_POWER`)会原样透传,可直接用。
+> 中文名为**占位符**,后续由你自己修改。通用原生标准 KEYCODE_* 见下方**第三张表**(名称即 keycode 名,原样透传可用)。
 
 > ⚠️ **【KEYCODE 长按暂无实际作用】(2026-08-17 确认)**
 > 此族按键**只支持短按 `Short`**。写 `LongXXXX` 不会报错、任务照常完成,
@@ -75,3 +75,38 @@
 
 > 备注:KEYCODE_MENU / KEYCODE_HOME 与第一张表的 KEY_MENU / KEY_HOME 是**同一物理按钮的两个命名**——
 > KEY_* 走 sendevent(userdebug),KEYCODE_* 走上层注入(user 版)。按需选一族使用,勿混用同一物理键的两族做同一步。
+
+## 三、安卓原生按键(KEYCODE_*,user 版可用,无需 userdebug)
+
+> 走 `adb shell input keyevent`,**名称即 Android keycode 名**(恒等透传),ini 里写名称即可。
+> 数值列**仅供参考**——名称由设备端解析,ini 里一律写 KEYCODE_* 名称,勿写数字。
+> 只支持短按 `Short`,长按 `LongXXXX` 无效(原因同第二族说明)。
+
+| 中文名 | ini 里写 | keycode 数值(参考) |
+|--------|----------|---------------------|
+| Home键 | `KEYCODE_HOME` | 3 |
+| 返回键 | `KEYCODE_BACK` | 4 |
+| 上键 | `KEYCODE_DPAD_UP` | 19 |
+| 下键 | `KEYCODE_DPAD_DOWN` | 20 |
+| 左键 | `KEYCODE_DPAD_LEFT` | 21 |
+| 右键 | `KEYCODE_DPAD_RIGHT` | 22 |
+| 确定键 | `KEYCODE_DPAD_CENTER` | 23 |
+| 音量+键 | `KEYCODE_VOLUME_UP` | 24 |
+| 音量-键 | `KEYCODE_VOLUME_DOWN` | 25 |
+| 电源键 | `KEYCODE_POWER` | 26 |
+| 回车键 | `KEYCODE_ENTER` | 66 |
+| Menu键 | `KEYCODE_MENU` | 82 |
+| 播放/暂停键 | `KEYCODE_MEDIA_PLAY_PAUSE` | 85 |
+| 停止键 | `KEYCODE_MEDIA_STOP` | 86 |
+| 下一曲键 | `KEYCODE_MEDIA_NEXT` | 87 |
+| 上一曲键 | `KEYCODE_MEDIA_PREVIOUS` | 88 |
+| 静音键 | `KEYCODE_MUTE` | 91 |
+| Esc/退出键 | `KEYCODE_ESCAPE` | 111 |
+| 播放键 | `KEYCODE_MEDIA_PLAY` | 126 |
+| 暂停键 | `KEYCODE_MEDIA_PAUSE` | 127 |
+| 最近任务键 | `KEYCODE_APP_SWITCH` | 166 |
+| 设置键 | `KEYCODE_SETTINGS` | 176 |
+| 亮度+键 | `KEYCODE_BRIGHTNESS_UP` | 221 |
+| 亮度-键 | `KEYCODE_BRIGHTNESS_DOWN` | 222 |
+| 待机键 | `KEYCODE_SLEEP` | 223 |
+| 唤醒键 | `KEYCODE_WAKEUP` | 224 |
