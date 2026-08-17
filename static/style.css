@@ -622,6 +622,30 @@ html, body {
   font-family: inherit;
 }
 .seq-new input:focus { outline: none; border-color: var(--accent); }
+.seq-warn {
+  margin: 10px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  border-left: 4px solid var(--warn);
+  border-radius: 6px;
+  background: rgba(251, 191, 36, 0.06);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.seq-warn b { color: var(--warn); }
+.seq-warn-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #d9ae4d;
+  font-weight: 400;
+}
+.seq-warn code {
+  background: rgba(251, 191, 36, 0.14);
+  padding: 0 3px;
+  border-radius: 3px;
+  font-family: Consolas, monospace;
+}
 .seq-hint { font-size: 11px; }
 .seq-hint code {
   background: var(--panel-2);

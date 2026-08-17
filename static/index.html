@@ -94,6 +94,11 @@
     </div>
     <div class="modal-body">
       <div class="seq-target muted" id="seq-target">未选设备</div>
+      <div class="seq-warn">
+        ⚠ <b>KEYCODE 长按暂无实际作用</b>
+        <div class="seq-warn-sub">KEYCODE_* 键(BI / 信源 / HDMI 等)目前<b>只支持短按 Short</b>;
+          ini 里写 <code>LongXXXX</code> 不会报错,但命令静默失败、不会真正注入按键。KEY_* 键长按不受影响。</div>
+      </div>
       <h4>可用序列 <span class="muted" id="seq-count"></span></h4>
       <div class="seq-list" id="seq-list">
         <div class="muted">加载中…</div>

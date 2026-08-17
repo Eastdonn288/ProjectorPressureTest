@@ -39,7 +39,13 @@
 
 > 走 `adb shell input keyevent`,Android keycode **名称**由设备端解析为数值,故不需硬编码数字。
 > 中文名为**占位符**,后续由你自己修改。未列入下表的标准 KEYCODE_*(如 `KEYCODE_POWER`)会原样透传,可直接用。
-> 长按走 `input keydown` → 保持 → `input keyup`,按住毫秒数写 `LongXXXX`;注意按住时长需**大于系统长按阈值(~500ms)** 才被识别为真长按。
+
+> ⚠️ **【KEYCODE 长按暂无实际作用】(2026-08-17 确认)**
+> 此族按键**只支持短按 `Short`**。写 `LongXXXX` 不会报错、任务照常完成,
+> 但底层 `adb shell input keydown` / `input keyup` 子命令在当前 Android 版本
+> (实机 Android 14 / SDK 34)不存在,命令**静默失败**——不注入任何按键,白等 `XXXX` 毫秒。
+> 只有短按(以及 Android 12+ 的 `--longpress`,本平台暂未采用)能真正注入。
+> 若真机确有"长按退出"类需求,需另议方案(见下方备注)。
 
 | 中文名(占位) | ini 里写 | 注入目标 Android keycode |
 |--------------|----------|--------------------------|
