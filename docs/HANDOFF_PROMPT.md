@@ -25,7 +25,8 @@
 ```
 E:\ProjectorPressureTest\
 ├── server.py                       (870 行) — FastAPI 后端,所有 API + WS
-├── start.bat                       — 启动 launcher (uiautocator 路径已清)
+├── start.bat                       — 启动 launcher(成功自动关闭,失败保留信息)
+├── server_window.ps1               — PPTP-Server 窗口:显示 uvicorn 日志 + 写文件
 ├── stop.bat
 ├── docs\
 │   ├── HANDOFF_PROMPT.md            ← 你正在读
@@ -43,7 +44,8 @@ E:\ProjectorPressureTest\
 │   ├── index.html                    (110 行)  — 4 面板 + 1 模态
 │   └── style.css                     (638 行)
 └── logs\
-    ├── server.log                    — uvicorn 日志
+    ├── server.out.log                — uvicorn stdout
+    ├── server.err.log                — uvicorn stderr
     └── <task_id>.log                 — 每任务 stdout(原始 + replay)
 ```
 

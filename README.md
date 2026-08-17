@@ -39,6 +39,11 @@ pip install fastapi uvicorn pydantic
 
 双击 start.bat,浏览器自动打开 http://127.0.0.1:8000。
 
+启动行为:
+- 弹出 **PPTP-Server** 窗口,实时显示 uvicorn 日志(同时写入 `logs\server.out.log` / `logs\server.err.log`;关闭该窗口即停止服务)
+- launcher 窗口在**服务启动成功后自动关闭**;若 20 秒内未就绪或找不到 Python,则**保留失败信息**等待手动关闭
+- 若端口 8000 已被占用(PPTP 已在运行),launcher 提示后直接退出
+
 或者命令行(用项目的 conda Python):
 
 ```cmd
@@ -149,7 +154,8 @@ key 名:`pptp.deviceState.v1`,存在 `localStorage` 里。
 ```
 ProjectorPressureTest/
 ├── server.py              # 后端单文件 (FastAPI, 870 行)
-├── start.bat              # 一键启动
+├── start.bat              # 一键启动(启动成功自动关闭,失败保留信息)
+├── server_window.ps1      # PPTP-Server 窗口脚本(实时显示 uvicorn 日志 + 写文件)
 ├── stop.bat               # 一键停止
 ├── README.md              # 本文档
 ├── docs/
@@ -168,8 +174,9 @@ ProjectorPressureTest/
 │   ├── default.ini              # 默认 14 步序列(全 Short)
 │   └── KEY_REFERENCE.md         # 24 个按键的 KEY_NAME 速查(手动维护)
 └── logs/                  # 运行时日志
-    ├── server.log
-    └── <task_id>.log
+    ├── server.out.log     # uvicorn stdout
+    ├── server.err.log     # uvicorn stderr
+    └── <task_id>.log      # 每个任务的完整日志
 ```
 
 ---

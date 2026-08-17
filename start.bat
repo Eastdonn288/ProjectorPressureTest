@@ -14,6 +14,16 @@ echo   v2.0
 echo ============================================
 echo.
 
+REM ---- Pre-check: is port 8000 already serving PPTP? ----
+netstat -ano | findstr ":8000 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (
+    echo   [INFO] Port 8000 is already listening.
+    echo   PPTP may already be running - open http://127.0.0.1:8000 directly.
+    echo   This window will close in 2 seconds.
+    timeout /t 2 /nobreak >nul
+    exit /b 0
+)
+
 REM ---- Find Python: PATH first, then common conda/env paths ----
 set "PYTHON="
 where python >nul 2>&1
@@ -43,53 +53,53 @@ if errorlevel 1 (
 
 echo.
 echo   Starting uvicorn on http://127.0.0.1:8000 ...
+echo   Live server logs show in the PPTP-Server window
+echo   (also saved to logs\server.out.log and logs\server.err.log)
 echo.
 
-REM ---- Start server in background (minimized so no extra popup window) ----
-start "PPTP-Server" /MIN cmd /c "cd /d %ROOT_DIR% && "%PYTHON%" -u -m uvicorn server:app --host 127.0.0.1 --port 8000 1> %ROOT_DIR%logs\server.log 2>&1"
+REM ---- Start server in its own visible window (see server_window.ps1) ----
+REM Closing the PPTP-Server window stops the server.
+start "PPTP-Server" /D "%ROOT_DIR%" powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT_DIR%server_window.ps1" "%PYTHON%"
 
 REM ---- Wait for port ----
 set "i=0"
 :wait_port
-if %i% geq 15 goto :wait_done
+if %i% geq 20 goto :wait_timeout
 timeout /t 1 /nobreak >nul
-netstat -ano | findstr ":8000 " >nul 2>&1
-if not errorlevel 1 (
-    echo   [OK] Server ready
-    goto :open_browser
-)
+netstat -ano | findstr ":8000 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 goto :server_ok
 set /a i+=1
 goto :wait_port
-:wait_done
-echo   [WARN] Server not ready after 15s, see logs\server.log
 
-:open_browser
+:wait_timeout
 echo.
-echo ============================================
-echo   PPTP is running
-echo ============================================
+echo   [FAIL] Server did not listen on port 8000 within 20 seconds.
+echo   Please check:
+echo     1. The error shown in the PPTP-Server window
+echo        (missing dependency / wrong Python version / bad path)
+echo     2. logs\server.err.log
+echo     3. Whether port 8000 is occupied by another program
+echo   ----------------------------------------------------------
+echo   This window stays open so you can read the failure info.
+echo   Press any key to close it.
 echo.
-echo   Open in browser: http://127.0.0.1:8000
-echo   API docs:        http://127.0.0.1:8000/docs
-echo   Server log:      logs\server.log
-echo.
-echo   To stop PPTP: run stop.bat
-echo.
+pause >nul
+exit /b 1
 
-REM Open browser directly - port is already confirmed listening
+:server_ok
+echo.
+echo   [OK] PPTP is running -> http://127.0.0.1:8000
+echo   Opening browser... this window will close automatically.
+echo   (The server keeps running in the PPTP-Server window.)
 start "" "http://127.0.0.1:8000"
-
-goto :end
+timeout /t 2 /nobreak >nul
+exit /b 0
 
 :no_python
 echo   [FAIL] python not found in PATH or common locations
 echo          Tried: where python, common conda/env paths
 echo          Install Python 3.10+ and ensure python.exe is reachable
-
-:end
 echo.
-echo Press any key to close this window
-echo (server will keep running in background if started)
-echo.
+echo   Press any key to close this window.
 pause >nul
-exit /b 0
+exit /b 1
