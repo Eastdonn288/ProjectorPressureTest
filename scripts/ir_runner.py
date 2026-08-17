@@ -21,6 +21,10 @@
   - `kind=LongXXXX`:长按,XXXX 是按住时长(ms);仅 `Long` 缺省 1500ms
   - `count`:重复次数(每次之间 delay_ms)
 - 默认按 IR 设备路径 `/dev/input/event1` 发送 sendevent,可通过 CLI 参数 / 环境变量 / 改顶部常量覆盖
+- 两种按键命名(ini 里都可用,按名字自动分发):
+  - `KEY_*`(如 KEY_HOME):走 sendevent(linux input code,直接写 /dev/input/eventN,需 userdebug/root)
+  - `KEYCODE_*`(如 KEYCODE_IP / KEYCODE_2D3D):走上层 `adb shell input keyevent`
+    (Android keycode 名称,user 版无需 userdebug;名称由设备端解析为数值)
 
 依赖:仅 Python 3.10+ 标准库。
 """
@@ -113,6 +117,37 @@ class IRRemote:
         "KEY_VOLUMEDOWN": 114,
         "KEY_MUTE": 113,
         "KEY_AB": 406,
+    }
+
+    # 上层注入按键(Android keycode 名)—— user 版无需 userdebug 可用。
+    # key = ini 里写的名字(KEYCODE_* 形式,唯一标识);value = 注入目标 Android keycode 名称,
+    # 由设备端自行解析为数值,故不需硬编码数字(数值在不同 Android 版本间稳定,但写名称最稳)。
+    # 来源:厂商固件 keymap(2026-08-17 用户提供);中文名见 ir_sequences/KEY_REFERENCE.md 第二张表。
+    # 注意:未在此表内的 KEYCODE_* 会原样透传给 `input keyevent`(即可用任意标准 Android keycode 名)。
+    ANDROID_KEYCODE_MAP = {
+        "KEYCODE_2D3D": "KEYCODE_TV_INPUT_HDMI_1",
+        "KEYCODE_BI": "KEYCODE_TV_INPUT_HDMI_3",
+        "KEYCODE_PIC": "KEYCODE_TV_INPUT_HDMI_4",
+        "KEYCODE_ADC": "KEYCODE_TV_NETWORK",
+        "KEYCODE_COLOR": "KEYCODE_TV_ANTENNA_CABLE",
+        "KEYCODE_REST1": "KEYCODE_BUTTON_2",
+        "KEYCODE_REST2": "KEYCODE_TV_TERRESTRIAL_ANALOG",
+        "KEYCODE_REST3": "KEYCODE_BUTTON_5",
+        "KEYCODE_ATV": "KEYCODE_ZENKAKU_HANKAKU",
+        "KEYCODE_DTV": "KEYCODE_BUTTON_15",
+        "KEYCODE_FAC": "KEYCODE_HENKAN",
+        "KEYCODE_WRITE_MAC": "KEYCODE_BUTTON_12",
+        "KEYCODE_AV": "KEYCODE_BUTTON_9",
+        "KEYCODE_YPBPR": "KEYCODE_TV_TIMER_PROGRAMMING",
+        "KEYCODE_HDMI": "KEYCODE_NAVIGATE_PREVIOUS",
+        "KEYCODE_VGA": "KEYCODE_NAVIGATE_NEXT",
+        "KEYCODE_USB": "KEYCODE_NAVIGATE_IN",
+        "KEYCODE_MAC": "KEYCODE_NAVIGATE_OUT",
+        "KEYCODE_DDC": "KEYCODE_TV_RADIO_SERVICE",
+        "KEYCODE_IP": "KEYCODE_BUTTON_14",
+        "KEYCODE_MENU": "KEYCODE_BUTTON_13",
+        "KEYCODE_HOME": "KEYCODE_F3",
+        "KEYCODE_FOCUS_KEYSTONE": "KEYCODE_TV_SATELLITE_SERVICE",
     }
 
     def __init__(self, event_path: str, use_su: bool = False):
@@ -228,6 +263,39 @@ class IRRemote:
             raise RuntimeError(f"ADB failed: {stderr}")
         return 0
 
+    # ---------- 按键名 → 注入方式 分发 ----------
+    @classmethod
+    def resolve_key(cls, name: str):
+        """名字 → (method, target)。
+
+        - `KEYCODE_*` → ("input", Android keycode 名):走 `adb shell input keyevent`,
+          user 版无需 userdebug;未在 ANDROID_KEYCODE_MAP 内的 KEYCODE_* 原样透传
+          (即可用任意标准 Android keycode 名,如 KEYCODE_POWER)。
+        - 其余 `KEY_*` → ("sendevent", linux input code):走 sendevent 直接写
+          /dev/input/eventN(需 userdebug/root)。
+        """
+        if name.startswith("KEYCODE_"):
+            return ("input", cls.ANDROID_KEYCODE_MAP.get(name, name))
+        code = cls.CODE_NUM_MAP.get(name)
+        if code is None:
+            raise KeyError(f"Unknown key name: {name} (neither in CODE_NUM_MAP nor ANDROID_KEYCODE_MAP)")
+        return ("sendevent", str(code))
+
+    # ---------- 上层注入路径(adb shell input keyevent / keydown / keyup) ----------
+    def input_keyevent(self, android_name: str, dry_run: bool = False, serial: Optional[str] = None) -> None:
+        """Short press 上层注入:input keyevent 自带 down+up,一次完成。"""
+        self._adb_run_shell([["shell", "input", "keyevent", android_name]], dry_run=dry_run, serial=serial)
+
+    def input_long_press(self, android_name: str, duration_ms: int, dry_run: bool = False, serial: Optional[str] = None) -> None:
+        """Long press 上层注入:input keydown → hold → input keyup,精确控制按住时长。
+        注意按住时长需大于系统长按阈值(~500ms)才算真长按。"""
+        self._adb_run_shell([["shell", "input", "keydown", android_name]], dry_run=dry_run, serial=serial)
+        if dry_run:
+            print(f"      [DRY] hold {duration_ms}ms (input keyevent)")
+        else:
+            time.sleep(duration_ms / 1000.0)
+        self._adb_run_shell([["shell", "input", "keyup", android_name]], dry_run=dry_run, serial=serial)
+
 
 # ====================================================================
 # SequenceConfig — ir_sequences/*.ini 解析(5 字段格式)
@@ -315,9 +383,15 @@ class SequenceConfig:
 # ====================================================================
 def run_step(ir: IRRemote, step: SequenceStep, serial: str, dry_run: bool = False) -> None:
     """Execute one step N times (count). Each press has its own log line."""
-    if step.code not in ir.CODE_NUM_MAP:
-        available = ", ".join(sorted(ir.CODE_NUM_MAP.keys()))
-        raise RuntimeError(f"key '{step.code}' not in CODE_NUM_MAP. Available: {available}")
+    # 按名字自动分发:KEYCODE_* → input keyevent(user 版可用);KEY_* → sendevent(userdebug)
+    try:
+        method, target = IRRemote.resolve_key(step.code)
+    except KeyError:
+        sendevent_keys = ", ".join(sorted(k for k in ir.CODE_NUM_MAP if k.startswith("KEY_")))
+        input_keys = ", ".join(sorted(ir.ANDROID_KEYCODE_MAP))
+        raise RuntimeError(
+            f"key '{step.code}' unknown. sendevent keys: {sendevent_keys} | input keyevent keys: {input_keys}"
+        ) from None
 
     for n in range(1, step.count + 1):
         if step.action == "Long":
@@ -327,7 +401,10 @@ def run_step(ir: IRRemote, step: SequenceStep, serial: str, dry_run: bool = Fals
             else:
                 print(f"  -> {step.code} Long({dur}ms)")
             try:
-                ir.long_press(step.code, dur, dry_run=dry_run, serial=serial)
+                if method == "input":
+                    ir.input_long_press(target, dur, dry_run=dry_run, serial=serial)
+                else:
+                    ir.long_press(step.code, dur, dry_run=dry_run, serial=serial)
             except Exception as e:
                 raise RuntimeError(f"step '{step.code}' failed: {e}") from e
         else:  # Short
@@ -336,7 +413,10 @@ def run_step(ir: IRRemote, step: SequenceStep, serial: str, dry_run: bool = Fals
             else:
                 print(f"  -> {step.code}")
             try:
-                ir.short_press(step.code, dry_run=dry_run, serial=serial)
+                if method == "input":
+                    ir.input_keyevent(target, dry_run=dry_run, serial=serial)
+                else:
+                    ir.short_press(step.code, dry_run=dry_run, serial=serial)
             except Exception as e:
                 raise RuntimeError(f"step '{step.code}' failed: {e}") from e
         if n < step.count:
@@ -431,7 +511,10 @@ def run_as_task(args) -> int:
         print(f"[runner] event_path= {event_path}")
         print(f"[runner] loaded {len(steps)} steps")
         print()
-        print(f"[runner] supported keys: {len(ir.CODE_NUM_MAP)} -> {', '.join(sorted(k for k in ir.CODE_NUM_MAP if k.startswith('KEY_')))}")
+        sendevent_keys = sorted(k for k in ir.CODE_NUM_MAP if k.startswith("KEY_"))
+        input_keys = sorted(ir.ANDROID_KEYCODE_MAP.keys())
+        print(f"[runner] supported keys: {len(sendevent_keys)} sendevent (KEY_*, userdebug) -> {', '.join(sendevent_keys)}")
+        print(f"[runner] supported keys: {len(input_keys)} input keyevent (KEYCODE_*, works on user build) -> {', '.join(input_keys)}")
         print("[runner] mode: infinite loop (Ctrl+C or platform stop to end)")
         print()
 
