@@ -10,7 +10,7 @@
 
 ## 0. You are working on
 
-**PPTP — Projector Pressure Test Platform**。一个本地单机的 Web 压测平台,用于在多台 ADB Android 投影仪设备上启动 Python 压测脚本(IR 遥控器模拟、WiFi 重启压力测试、电池测试),实时看每台设备输出的日志。
+**PPTP — Projector Pressure Test Platform**。一个本地单机的 Web 压测平台,用于在多台 ADB Android 投影仪设备上启动 Python 压测脚本(IR 遥控器模拟、WiFi 开关/重启/切换压力测试),实时看每台设备输出的日志。脚本可用 `PARAMS` 自描述可配置项,前端自动识别并弹窗配置。
 
 设计原则:
 - **纯本地 / 单机** — 所有数据落本地,无鉴权
@@ -24,7 +24,7 @@
 
 ```
 E:\ProjectorPressureTest\
-├── server.py                       (870 行) — FastAPI 后端,所有 API + WS
+├── server.py                       (923 行) — FastAPI 后端,所有 API + WS
 ├── start.bat                       — 启动 launcher(成功自动关闭,失败保留信息)
 ├── server_window.ps1               — PPTP-Server 窗口:显示 uvicorn 日志 + 写文件
 ├── stop.bat
@@ -35,14 +35,18 @@ E:\ProjectorPressureTest\
 │   └── SIMPLE-PLAN.md               — 早期需求/架构/计划
 ├── scripts\                         (平台调用的压测脚本)
 │   ├── ir_runner.py                 — 红外遥控序列循环(自包含 IRRemote,默认无限循环;长按=down+hold+up)
-│   └── wifi_reboot_stress.py        — 重启+ WiFi 重连压力测试(与 IR 无关,独立)
+│   ├── wifi_onoff_stress.py         — WiFi 开关压力(关/开循环 + wpa_cli 扫描统计;PARAMS 可配)
+│   ├── wifi_reboot_stress.py        — 重启 + WiFi 重连压力测试(PARAMS 可配)
+│   └── wifi_switch_stress.py        — 多网络循环切换(预置 WIFI_NETWORKS;PARAMS 可配)
 ├── ir_sequences\                    (用户可编辑的 .ini 序列文件 + 按键速查)
-│   ├── default.ini                  — 默认 14 步序列
-│   └── KEY_REFERENCE.md              — 24 个按键的 KEY_NAME 速查(手动维护)
+│   ├── 1.ini                        — 当前序列(KEY_VCR + KEYCODE_HDMI)
+│   └── KEY_REFERENCE.md             — 按键速查:KEY_* 24 + KEYCODE_* 厂商 23 + 原生 26
 ├── static\
-│   ├── app.js                        (1249 行) — 前端所有逻辑
-│   ├── index.html                    (110 行)  — 4 面板 + 1 模态
-│   └── style.css                     (638 行)
+│   ├── app.js                        (1439 行) — 前端所有逻辑
+│   ├── index.html                    (138 行)  — 4 面板 + 2 模态
+│   └── style.css                     (715 行)
+├── reports\
+│   └── stress-test\wifi\            — WiFi 压测报告 JSON(脚本生成,gitignore)
 └── logs\
     ├── server.out.log                — uvicorn stdout
     ├── server.err.log                — uvicorn stderr
@@ -77,7 +81,7 @@ E:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 
 # 验证
 curl http://127.0.0.1:8000/healthz
-# {"ok":true,"version":"2.0","time":"..."}
+# {"ok":true,"version":"2.2.0","time":"..."}
 ```
 
 Python 依赖: `pip install fastapi uvicorn pydantic` (就这三个,没别的)。
@@ -95,7 +99,8 @@ Python 依赖: `pip install fastapi uvicorn pydantic` (就这三个,没别的)�
 | GET | `/api/server/status` | uvicorn PID + uptime + 任务计数 |
 | POST | `/api/server/shutdown` | 优雅关停(级联 CTRL_BREAK + os._exit) |
 | GET | `/api/devices` | adb devices -l 解析结果 |
-| GET | `/api/scripts` | scripts/*.py 列表 |
+| GET | `/api/scripts` | scripts/*.py 列表(含 `has_params` 源嗅探标志) |
+| GET | `/api/scripts/{name}/params` | **读脚本声明的参数 schema**(跑 `--dump-params`,按 `(name, mtime)` 缓存) |
 | GET | `/api/sequences` | **ir_sequences/*.ini 列表** |
 | GET | `/api/sequences/{name}` | 读单个 .ini 内容 |
 | PUT | `/api/sequences/{name}` | 写整个 .ini 内容 |
@@ -129,6 +134,7 @@ const state = {
   tasks: [],                   // GET /api/tasks
   deviceScripts: {},           // { [serial]: "ir_runner.py" }  — 设备→脚本
   deviceSequences: {},        // { [serial]: "default" }     — 设备→序列文件名
+  deviceParams: {},           // { [serial]: { [script]: {param: value} } } — 设备×脚本参数(前端配置)
   selectedDeviceSerial: null, // 当前选中的设备(驱动脚本卡高亮)
   currentDeviceSerial: null,  // 日志面板绑定的设备
   currentTaskId: null,        // 日志面板绑定的任务
@@ -141,8 +147,8 @@ const state = {
 };
 ```
 
-**localStorage 持久化**(`STORAGE_KEY = "pptp.deviceState.v1"`,L1201):
-- 保存:`selectedDeviceSerial` + `deviceScripts` + `deviceSequences`
+**localStorage 持久化**(`STORAGE_KEY = "pptp.deviceState.v1"`,L1389):
+- 保存:`selectedDeviceSerial` + `deviceScripts` + `deviceSequences` + `deviceParams`
 - **不保存** devices/scripts/tasks(始终从 server 拉)
 - 防抖 200ms
 
@@ -152,50 +158,68 @@ const state = {
 
 按时间倒序,这些是用户已经"批准"的设计选择:
 
-1. **Per-device sequence binding (each device independent)**
+1. **脚本参数:自描述 schema,前端零硬编码 (v2.2.0)**
+   - 脚本定义模块级 `PARAMS` 列表 + 支持 `--dump-params`(打印 `{"fields":[...]}`,ASCII 安全)
+   - 后端 `GET /api/scripts/{name}/params` 跑 `python -u script.py --dump-params`,按 `(name, mtime)` 缓存(`_PARAMS_CACHE`)
+   - `_list_scripts()` 源文件嗅探 `--dump-params` 标 `has_params`(纯文件读取,不启子进程)
+   - 前端看到 `has_params` 就在脚本卡上支持点击弹窗,按 `type`(`int`/`float`/`bool`/`str`)渲染表单
+   - 新增脚本只需定义 `PARAMS`,平台/后端/前端全都不用改 —— 与 ir_runner 序列选择的"自描述"思路一致
+
+2. **脚本参数按 设备×脚本 独立持久化 (v2.2.0)**
+   - `state.deviceParams: { [serial]: { [script]: {param: value} } }`,严格独立、互不干扰(用户明确要求"不能存在记忆或干扰")
+   - 存入 localStorage(`pptp.deviceState.v1`),跨刷新保留
+   - 跑任务时后端把配置值合并进 `--params` JSON 传给脚本
+   - 配置入口做成和 ir_runner 一样的"点击卡片 → 弹窗"(用户明确要求)
+
+3. **WIFI_NETWORKS 硬编码、不做成 param (v2.2.0)**
+   - wifi_switch_stress 的预置网络列表是脚本文件里的常量,按用户要求**不做成前端参数**
+   - 要换网络直接改脚本顶部 `WIFI_NETWORKS`
+   - `use_su` 保持为参数(部分设备免 root,可关掉走 `cmd wifi` 直接调)
+
+4. **Per-device sequence binding (each device independent)**
    - `state.deviceSequences: { [serial]: filename }` — A 选 default, B 选 aging 互不影响
    - 切设备时脚本卡实时刷新
    - 选中设备的 ir_runner 卡显示该设备的序列名
    - 禁止全局 "pinned script" 这种共享模式
 
-2. **Sequence files instead of in-memory editor**
+5. **Sequence files instead of in-memory editor**
    - 用户改 ini 文件直接编辑
    - modal 只做选择 / 创建空模板,**不做 step 编辑**
    - 之前做过 step-by-step 编辑(代码/kind/delay/count 行),已废弃
 
-3. **Run button on script card (not device card)**
+6. **Run button on script card (not device card)**
    - ir_runner 脚本卡右侧"▶ 跑"按钮
    - 设备卡只显示状态(chip/运行中/离线)
    - 按钮在脚本卡因为 runnability 取决于 "设备 + 脚本 + 序列" 三态
 
-4. **Script dropdown gating**
+7. **Script dropdown gating**
    - 设备未选中 → dropdown 禁用 + 提示"先点击选中"
    - 跑任务中 → 禁用(脚本锁定)
    - 离线 → 禁用
    - 选中 + 已选脚本 + 有序列 → 启用
 
-5. **Visual badges**
+8. **Visual badges**
    - 设备卡 active: 蓝色边框 + 右上 "✓ 已选中" 蓝色 pill(角标,完全在卡内)
    - 设备卡 active+running: 右上 "⚡ 运行中" 绿色 pill
    - 脚本卡 active: 置顶 + 边框 + 左上 "▸ 当前选中" 蓝色 pill(完全在卡内)
    - "跑 X" 旧 badge 已删除(避免重复)
 
-6. **localStorage 刷新保留状态**
-   - 已选设备 / 已选脚本 / 已选序列跨刷新保留
+9. **localStorage 刷新保留状态**
+   - 已选设备 / 已选脚本 / 已选序列 / 已选参数跨刷新保留
    - 服务器数据(任务/devices)不持久化,总是从 server 拉
 
-7. **RAF 批量推送日志(避免"刷")**
-   - 客户端批量 buffer,RAF 一次性 textContent 更新
-   - DOM 1000 行上限(类似 VSCode 终端 scrollback)
-   - 10000 行上限的服务端 replay(防止异常巨大 log)
+10. **RAF 批量推送日志(避免"刷")**
+    - 客户端批量 buffer,RAF 一次性 textContent 更新
+    - DOM 1000 行上限(类似 VSCode 终端 scrollback)
+    - 10000 行上限的服务端 replay(防止异常巨大 log)
 
-8. **modal 标题动态化**
-   - 文件模式:`${seqFilename}.ini`
-   - 设备模式:`设备 ${serial} 的序列`
+11. **modal 标题动态化**
+    - 文件模式:`${seqFilename}.ini`
+    - 设备模式:`设备 ${serial} 的序列`
 
-9. **Cache busting + NoCache middleware**
-   - `index.html` script/css link 带 `?v=2.0.1`
-   - server 加 `NoCacheMiddleware`,静态文件 `Cache-Control: no-store`
+12. **Cache busting + NoCache middleware**
+    - `index.html` script/css link 带 `?v=2.2.0`
+    - server 加 `NoCacheMiddleware`,静态文件 `Cache-Control: no-store`
 
 > 完整前端交互设计沉淀(为什么这样做、踩过什么坑、还有什么没定)见 [FRONTEND_UX.md](FRONTEND_UX.md)。
 
@@ -229,7 +253,8 @@ const state = {
 
 1. **不要直接写代码**。先:
    - Read 标注的源文件 + grep 相关函数名
-   - 如果涉及 IR 序列,看 `scripts/ir_runner.py`(自包含 IRRemote,无外部依赖)+ `ir_sequences/default.ini`
+   - 如果涉及 IR 序列,看 `scripts/ir_runner.py`(自包含 IRRemote,无外部依赖)+ `ir_sequences/1.ini`
+   - 如果涉及 WiFi 脚本,看 `scripts/wifi_*.py`(共用契约:`--device` + `--params` + `--dump-params` + `su 0` 调 adb)
 2. **列影响面**:
    - 后端 → server.py 哪个 route / 函数
    - 前端 → app.js 哪些函数 / state 哪些字段
@@ -262,31 +287,34 @@ const state = {
 
 **Backend (server.py)**:
 - `_list_adb_devices()` L198 — `adb devices -l` 解析
-- `_list_scripts()` L242 — 扫 `scripts/*.py`
-- `_stream_logs(task_id)` L255 — 主异步协程,读 stdout + 推 WS
+- `_list_scripts()` L242 — 扫 `scripts/*.py`;源嗅探 `--dump-params` 标 `has_params`
+- `api_script_params(name)` L417 — 跑 `--dump-params` 读参数 schema,`_PARAMS_CACHE` 按 `(name, mtime)` 缓存
+- `_stream_logs(task_id)` L263 — 主异步协程,读 stdout + 推 WS
 - `_reap_orphan_scripts()` L98 — startup hook,清 python.exe 孤儿 + 旧 `_seq_*.ini`
 - `NoCacheMiddleware` L60+ — `Cache-Control: no-store` for static
-- `api_run()` L521 — 含 device-uniqueness 409 校验
-- `api_force_cleanup()` L650 — SIGKILL all + 清空 TASKS
-- `api_create_sequence()` L491 — 写模板
+- `api_run()` L574 — 含 device-uniqueness 409 校验 + `--params` 透传
+- `api_force_cleanup()` L702 — SIGKILL all + 清空 TASKS
+- `api_create_sequence()` L544 — 写模板
 - `api_ir_keys()` — **已删除**(ir_runner keys 不再需要)
 
 **Frontend (static/app.js)**:
-- `state` L14-40
-- `STORAGE_KEY` L1201
-- `loadPersistedState()` / `savePersistedState()` L1203 / L1220
-- `renderScripts()` L122 — 4 状态(active/disabled), ir_runner 卡有 Run 按钮
-- `renderDevices()` L207 — 设备卡 active 角标 / 脚本 chip
-- `openSeqModal()` L1086 — 纯 picker 模态
-- `onRunClick()` L670 — 无参,读 state.selectedDeviceSerial
-- `onSelectDevice()` L638 — 同步 device + log
-- `openWs()` / `scheduleReconnect()` — 日志 WS 重连
+- `state` L14-40(`deviceParams` L29)
+- `STORAGE_KEY` L1389
+- `loadPersistedState()` / `savePersistedState()` L1391 / L1409
+- `renderScripts()` L126 — 4 状态(active/disabled),ir_runner 卡有 Run 按钮,has_params 卡可点开参数弹窗
+- `renderDevices()` L285 — 设备卡 active 角标 / 脚本 chip
+- `openSeqModal()` L1147 — 纯 picker 模态
+- `loadParamsSchema()` L1259 / `paramInputHtml()` L1270 / `openParamsModal()` L1285 / `saveParams()` L1305 — 参数配置模态
+- `onRunClick()` L726 — 无参,读 state.selectedDeviceSerial,合并 state.deviceParams
+- `onSelectDevice()` L762 — 同步 device + log
+- `openWs()` / `scheduleReconnect()` L644 / L696 — 日志 WS 重连
 
 **Frontend (static/index.html)**:
 - 4 个 `.panel`(`#panel-devices/scripts/logs/tasks`)
 - `#modal-seq` (line 89) sequence picker
+- `#modal-params` (line 122) 脚本参数配置
 - 顶部 `.topbar` 含 "重置" 和 "关机" 按钮 + 服务信息
-- `<script src="/static/app.js?v=2.0.1">` — 版本号防缓存
+- `<script src="/static/app.js?v=2.2.0">` — 版本号防缓存
 
 **CSS 章节** (static/style.css):
 - 顶部 25-105 行:基础元素(panel/btn/list)
@@ -389,10 +417,12 @@ curl http://127.0.0.1:8000/api/sequences
 
 ---
 
-**最后更新**: 2026-07-18(当前会话末尾)
+**最后更新**: 2026-08-24(v2.2.0:脚本参数前端可配 + WiFi 压测脚本)
 **会话状态**: 完整运行中,所有改动已通过端到端验证
 **未完成需求**: 无(等用户给新任务)
 **已知小问题**:
 - WS 在 server restart 时 log console 会"卡"在最后一行(没手动 rejoin)
 - 任务被删除时 log 文件可能短暂残留(orphan cleanup 只清 startup 时的)
 - IR event 设备路径(默认 `/dev/input/event1`)是 hardcode 的,如果换设备要改 `ir_runner.py` 顶部 `DEFAULT_EVENT_PATH`(详见 [README.md 故障排查](../README.md))
+- WiFi 脚本在部分设备上需要 root:本设备已验证 `su 0 wpa_cli ...` 和 `su 0 cmd wifi ...`(`su -c` 会报错);`use_su` 参数可关
+- wifi_switch 的 `WIFI_NETWORKS` 是预置列表,SSID 若在真机上连不上,先 `wpa_cli scan_results` 核对实际 SSID(遇到过 `-`/`_` 拼写差异)
