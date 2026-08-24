@@ -23,6 +23,10 @@
     // sequence editor modal is opened from a device card. Not persisted to
     // disk; cleared on full page reload.
     deviceSequences: {},
+    // Per-device, per-script params config: { [serial]: { [script]: {k:v} } }.
+    // Each (device, script) pair is strictly independent - configuring
+    // wifi_onoff for device A never affects wifi_reboot or device B.
+    deviceParams: {},
     // The currently selected device (last device card clicked). The script
     // panel shows the script for THIS device (highlighted + pinned to top).
     // Other devices' selections are stored in state.deviceScripts but not
@@ -157,6 +161,9 @@
       // vs disabled (no device selected, or device's script != this one)
       // vs locked (active card but device is currently running).
       const hasConfig = s.filename === "ir_runner.py";
+      // Scripts that declare params (via --dump-params) get a params modal
+      // on card click, mirroring ir_runner's sequence picker.
+      const hasParamsConfig = !!s.has_params;
       // Bug3: only highlight if the device is still reachable.
       const isActive = selectedDeviceReachable && selectedScriptName === s.filename;
       const isLocked = isActive && selectedDeviceRunning;
@@ -183,6 +190,11 @@
           subtitle = boundSeq
             ? `设备 ${selectedDevice} · 序列: ${boundSeq}.ini`
             : `设备 ${selectedDevice} · 未选序列 (点此卡选择)`;
+        } else if (hasParamsConfig) {
+          const bp = state.deviceParams?.[selectedDevice]?.[s.filename];
+          subtitle = bp && Object.keys(bp).length
+            ? `设备 ${selectedDevice} · 参数已配置 (点此卡修改)`
+            : `设备 ${selectedDevice} · 未配置参数 (点此卡配置)`;
         } else {
           subtitle = `设备 ${selectedDevice} 已选此脚本`;
         }
@@ -220,6 +232,7 @@
       return `
         <div class="${classes}" data-script="${esc(s.filename)}"
              data-has-config="${hasConfig}"
+             data-has-params="${hasParamsConfig}"
              data-active="${isActive}"
              data-locked="${isLocked}"
              title="${esc(cardTitle)}">
@@ -243,6 +256,8 @@
         const filename = card.dataset.script;
         if (card.dataset.hasConfig === "true" && filename === "ir_runner.py") {
           openSeqModal({ device: state.selectedDeviceSerial });
+        } else if (card.dataset.hasParams === "true") {
+          openParamsModal({ device: state.selectedDeviceSerial, script: filename });
         }
       });
     });
@@ -728,6 +743,10 @@
       }
       params.sequence = `ir_sequences/${seqName}.ini`;
     }
+    // Merge per-(device, script) params config (if any). For scripts without
+    // config this is a no-op and the script runs with its own defaults.
+    const stored = state.deviceParams?.[serial]?.[script];
+    if (stored && Object.keys(stored).length) Object.assign(params, stored);
     try {
       const res = await api("/api/run", {
         method: "POST",
@@ -897,6 +916,18 @@
         dirty = true;
       }
     }
+    // Forget params configs for scripts that no longer exist on disk
+    for (const serial of Object.keys(state.deviceParams)) {
+      for (const sname of Object.keys(state.deviceParams[serial])) {
+        if (!validFilenames.has(sname)) {
+          delete state.deviceParams[serial][sname];
+          dirty = true;
+        }
+      }
+      if (!Object.keys(state.deviceParams[serial]).length) {
+        delete state.deviceParams[serial];
+      }
+    }
     const k = scriptsRenderKey();
     if (k !== _lastKey.scripts) {
       _lastKey.scripts = k;
@@ -1064,6 +1095,18 @@
       if (e.key === "Escape" && !$("modal-seq").hidden) closeSeqModal();
     });
 
+    // Modal: script params config
+    document.querySelectorAll("#modal-params [data-close]").forEach((b) => {
+      b.addEventListener("click", closeParamsModal);
+    });
+    $("modal-params").addEventListener("click", (e) => {
+      if (e.target.id === "modal-params") closeParamsModal();
+    });
+    $("btn-params-save").addEventListener("click", saveParams);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("modal-params").hidden) closeParamsModal();
+    });
+
     // console scroll detection: pause auto-scroll when user scrolls up
     const con = $("log-console");
     con.addEventListener("scroll", () => {
@@ -1204,6 +1247,85 @@
     setTimeout(closeSeqModal, 400);
   }
 
+  // ---------------- Script params config modal ----------------
+  // Scripts that declare params support a `--dump-params` flag which prints
+  // {"fields": [...]}. The platform renders a modal from this schema and
+  // stores the values per (device, script) in state.deviceParams (persisted
+  // like sequences, strictly independent per pair).
+  let _paramsSchemaCache = {};   // { [scriptName]: fields[] }
+  let _paramsCtx = null;         // { device, script }
+  let _paramsFields = [];
+
+  async function loadParamsSchema(name) {
+    if (_paramsSchemaCache[name]) return _paramsSchemaCache[name];
+    try {
+      const r = await api(`/api/scripts/${encodeURIComponent(name)}/params`);
+      _paramsSchemaCache[name] = r.fields || [];
+    } catch (_) {
+      _paramsSchemaCache[name] = [];
+    }
+    return _paramsSchemaCache[name];
+  }
+
+  function paramInputHtml(f, value) {
+    const n = esc(f.name);
+    if (f.type === "bool") {
+      return `<input type="checkbox" name="${n}" ${value ? "checked" : ""}>`;
+    }
+    if (f.type === "int" || f.type === "float") {
+      let extra = "";
+      if (f.min != null) extra += ` min="${f.min}"`;
+      if (f.max != null) extra += ` max="${f.max}"`;
+      const step = f.type === "float" ? "any" : "1";
+      return `<input type="number" name="${n}" step="${step}"${extra} value="${esc(value)}">`;
+    }
+    return `<input type="text" name="${n}" value="${esc(value)}">`;
+  }
+
+  async function openParamsModal({ device, script }) {
+    _paramsCtx = { device, script };
+    _paramsFields = await loadParamsSchema(script);
+    if (!_paramsFields.length) {
+      $("params-status").textContent = "该脚本未声明参数";
+      return;
+    }
+    $("params-target").textContent = `设备 ${device} · ${script}`;
+    $("params-form").innerHTML = _paramsFields.map((f) => {
+      const cur = state.deviceParams?.[device]?.[script]?.[f.name] ?? f.default;
+      return `
+        <div class="param-row">
+          <label class="param-label">${esc(f.label || f.name)}</label>
+          <div class="param-control">${paramInputHtml(f, cur)}</div>
+        </div>`;
+    }).join("");
+    $("params-status").textContent = "";
+    $("modal-params").hidden = false;
+  }
+
+  function saveParams() {
+    const ctx = _paramsCtx;
+    if (!ctx) return;
+    const params = {};
+    for (const f of _paramsFields) {
+      const el = document.querySelector(`#modal-params input[name="${esc(f.name)}"]`);
+      if (!el) continue;
+      if (f.type === "bool") params[f.name] = el.checked;
+      else if (f.type === "int") params[f.name] = parseInt(el.value, 10) || 0;
+      else if (f.type === "float") params[f.name] = parseFloat(el.value) || 0;
+      else params[f.name] = el.value;
+    }
+    if (!state.deviceParams[ctx.device]) state.deviceParams[ctx.device] = {};
+    state.deviceParams[ctx.device][ctx.script] = params;
+    savePersistedState();
+    renderScripts();
+    $("params-status").textContent = `✓ 已保存 · 设备 ${ctx.device} · ${ctx.script}`;
+    setTimeout(closeParamsModal, 400);
+  }
+
+  function closeParamsModal() {
+    $("modal-params").hidden = true;
+  }
+
   // Force-stop the currently-viewed task. Used when device is temp-offline
   // (normal "中断" sends CTRL_BREAK which may not reach the subprocess).
   async function onForceStopCurrent() {
@@ -1253,6 +1375,7 @@
   // What we keep across page refresh / server restart:
   //   - selectedDeviceSerial  (user preference: which device they're looking at)
   //   - deviceSequences       (user config: which device runs which IR sequence)
+  //   - deviceParams          (user config: per-device, per-script script params)
   //
   // What we DELIBERATELY discard (2026-07-20 reversal):
   //   - deviceScripts         (session state: "what do I want to run RIGHT NOW";
@@ -1275,6 +1398,8 @@
       // deviceScripts intentionally NOT loaded - see comment above.
       if (data.deviceSequences && typeof data.deviceSequences === "object")
         state.deviceSequences = data.deviceSequences;
+      if (data.deviceParams && typeof data.deviceParams === "object")
+        state.deviceParams = data.deviceParams;
     } catch (_) {
       // Ignore corrupt state - just start fresh
     }
@@ -1290,6 +1415,7 @@
           selectedDeviceSerial: state.selectedDeviceSerial,
           // deviceScripts intentionally NOT saved - see comment above.
           deviceSequences: state.deviceSequences,
+          deviceParams: state.deviceParams,
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
       } catch (_) { /* quota exceeded etc - ignore */ }

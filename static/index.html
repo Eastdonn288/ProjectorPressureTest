@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PPTP · 投影仪压测平台</title>
-  <link rel="stylesheet" href="/static/style.css?v=2.0.1" />
+  <link rel="stylesheet" href="/static/style.css?v=2.2.0" />
   <!-- 每次代码更新后 bump ?v= 强制浏览器重新加载,避免缓存问题 -->
 </head>
 <body>
@@ -77,7 +77,7 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=2.0.1"></script>
+  <script src="/static/app.js?v=2.2.0"></script>
 </body>
 
 <!-- ===== Sequence picker modal =====
@@ -110,6 +110,29 @@
     <div class="modal-footer">
       <span class="seq-status muted" id="seq-status"></span>
       <button class="btn" data-close>取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Script params config modal =====
+     Renders the fields a script declares via --dump-params. Values are stored
+     per (device, script) in localStorage (state.deviceParams), strictly
+     independent between devices and between scripts.
+-->
+<div class="modal-backdrop" id="modal-params" hidden>
+  <div class="modal" role="dialog" aria-labelledby="modal-params-title">
+    <div class="modal-header">
+      <h3 id="modal-params-title">配置脚本参数</h3>
+      <button class="modal-close" data-close>×</button>
+    </div>
+    <div class="modal-body">
+      <div class="seq-target muted" id="params-target">未选脚本</div>
+      <div class="params-form" id="params-form">加载中…</div>
+    </div>
+    <div class="modal-footer">
+      <span class="seq-status muted" id="params-status"></span>
+      <button class="btn" data-close>取消</button>
+      <button class="btn btn-primary" id="btn-params-save">保存</button>
     </div>
   </div>
 </div>

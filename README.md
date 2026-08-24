@@ -16,8 +16,11 @@
 - 实时日志:每台设备的 stdout 实时推送到浏览器
 - 任务控制:运行 / 中断 / 硬停 / 重置,所见即所得
 - **IR 序列**:ir_sequences/ 下的 .ini 文件定义按键顺序,前端 modal 选取并绑定到设备
+- **双通道按键注入**:`KEY_*` 走 sendevent 直写 event 设备(需 userdebug/root);`KEYCODE_*` 走上层 `adb shell input keyevent`(**user 版固件可用**,含 23 个厂商键 + 26 个安卓原生键 + 透传)
+- **脚本参数前端可配**:脚本用 `PARAMS` 自描述可配置项(循环次数、等待时长等),前端自动识别并弹出配置窗口,按 **设备 × 脚本** 独立保存到 localStorage
+- **WiFi 压测脚本**:wifi_onoff / wifi_reboot / wifi_switch 三个独立脚本,覆盖开关、重启重连、多网络循环切换
 
-后端 + 前端合计约 **2900 行代码**(server.py 870 + app.js 1249 + style.css 638 + index.html 110)。
+后端 + 前端 + 脚本合计约 **4700 行代码**(server.py 923 + app.js 1439 + style.css 715 + index.html 138 + ir_runner.py 614 + wifi_* 853)。
 
 ---
 
@@ -84,16 +87,21 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 ```
 
 - `index` 自动编号(1, 2, 3, ...)
-- `code` `KEY_HOME` / `KEY_ENTER` 等(24 个 KEY_NAME,见 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md),代码里硬编码在 `IRRemote.CODE_NUM_MAP`)
+- `code` 三种按键族之一(见 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md)):
+  - `KEY_*`(24 个,如 `KEY_HOME` / `KEY_ENTER`)→ sendevent 直写 event 设备,**需 userdebug/root**(硬编码在 `IRRemote.CODE_NUM_MAP`)
+  - `KEYCODE_*` 厂商键(23 个,如 `KEYCODE_BI` / `KEYCODE_IP`)→ `adb shell input keyevent`,**user 版可用**
+  - `KEYCODE_*` 安卓原生键(26 个,如 `KEYCODE_POWER` / `KEYCODE_HOME`)→ 名称原样透传,user 版可用
 - `Short` 或 `LongXXXX`(XXXX 为长按毫秒,如 `Long3000` = 长按 3 秒)
 - `delay_ms` 重复间延迟(整数 ms)
 - `count` 重复次数(整数)
 
 完整按键表见 `ir_sequences/KEY_REFERENCE.md`(`KEY_HOME` → 主页键)。
 
+> ⚠️ **KEYCODE_* 长按暂无效**:目前只有短按 `Short` 生效。ini 里写 `LongXXXX` 不会报错、任务照常完成,但底层 `input keydown`/`keyup` 在当前设备(Android 14 / SDK 34)不存在,命令**静默失败、不会真正注入按键**。只有 `KEY_*` 一族支持长按。
+
 ### 使用流程
 
-1. 把 .ini 放进 `ir_sequences/`(或复制 default.ini 修改)
+1. 把 .ini 放进 `ir_sequences/`(或复制现有 .ini 修改)
 2. 在 ir_runner 脚本卡上点击 → 弹出 modal 选序列
 3. 选中一个 → 状态保存到 localStorage
 4. 同一台设备重启平台后选择保留
@@ -123,15 +131,46 @@ if __name__ == "__main__":
     main()
 ```
 
-契约只有两条:
+契约只有三条:
 
 - 接收 --device `<serial>`(必需,平台自动传入)
 - 接收 --params `<json>`(可选,前端可传入参数)
+- (可选)定义模块级 `PARAMS` 列表 + 支持 `--dump-params`,前端自动识别并在脚本卡上渲染配置弹窗
 
 其余完全自由 —— 用 subprocess 调 ADB、用 requests 调 HTTP、写文件、画图都可以。
 脚本的 stdout/stderr 实时显示在前端日志面板;退出码 0 = finished,非 0 = failed。
 
-scripts/wifi_reboot_stress.py 是 WiFi 重连压力测试,可以直接用。scripts/ir_runner.py 是红外序列执行脚本(默认无限循环,要点"中断"停止)。
+### 怎么让参数前端可配(可选)
+
+脚本里声明一个 `PARAMS` 列表,前端就自动弹出配置窗口,后端 / 前端 / 平台代码一行都不用改:
+
+```python
+PARAMS = [
+    {"name": "cycles", "label": "循环次数", "type": "int", "default": 100, "min": 1, "max": 100000},
+    {"name": "use_su", "label": "cmd wifi 使用 su 权限", "type": "bool", "default": True},
+]
+```
+
+字段键:`name` / `label` / `type`(`int`/`float`/`bool`/`str`)/ `default` / `min` / `max`。配置值按 **设备 × 脚本** 独立保存,互不干扰。平台通过跑 `python 脚本.py --dump-params` 读取这份自描述 schema,缓存按 `(脚本名, mtime)` 失效。
+
+---
+
+## WiFi 压测脚本
+
+三个独立 WiFi 压测脚本都在 scripts/ 下,`wifi_*` 前缀。各自可配参数通过前端弹窗设置,报告 JSON 落在 `reports/stress-test/wifi/`(已 gitignore)。
+
+| 脚本 | 测什么 | 可配参数 |
+|---|---|---|
+| `wifi_onoff_stress.py` | WiFi 开关循环:关 → 等 → 开 → 等 → wpa_cli 扫描统计 | `iterations` `off_sec` `on_sec` `scan_sec` `count_threshold` `use_su` |
+| `wifi_reboot_stress.py` | adb 重启循环:重启 → 等设备上线 → 等 WiFi 重连 | `iterations` `wait_sec` `wifi_settle_sec` `back_online_timeout` |
+| `wifi_switch_stress.py` | 多网络循环切换:按预置列表轮番连接并验证 SSID | `cycles` `connect_wait_sec` `switch_gap_sec` `use_su` |
+
+要点:
+
+- **预置网络列表**:wifi_switch 的 `WIFI_NETWORKS` 硬编码在脚本文件里(SSID / 密码 / security),按项目决策**不做成前端参数**,要换网络直接改脚本顶部。
+- **su 权限**:本设备上 `wpa_cli scan_results` 和 `cmd wifi connect-network` 都需要 root。脚本统一用 AOSP 风格 `su 0 <cmd>`(不是 `su -c`)。`use_su` 参数可关(针对允许免 root 的设备)。
+- **判定**:wifi_onoff 按扫描到的网络数是否达阈值判 PASS;wifi_switch 按连接成功率 ≥ 98% 判 PASS;wifi_reboot 按每轮设备能否按时上线 + WiFi 重连判 PASS。退出码 0 = PASS,非 0 = FAIL。
+- **中断**:运行中可点"中断"(CTRL_BREAK),脚本会打印已完成部分的汇总并保存报告。
 
 ---
 
@@ -142,6 +181,7 @@ scripts/wifi_reboot_stress.py 是 WiFi 重连压力测试,可以直接用。scri
 - 当前选中的设备(`selectedDeviceSerial`)
 - 每台设备选的脚本(`deviceScripts`)
 - 每台设备选的序列(`deviceSequences`)
+- 每台设备、每个脚本配置的参数(`deviceParams`)
 
 服务器数据(devices / scripts / tasks / server info)不持久化,每次都从后端拉。
 
@@ -168,11 +208,15 @@ ProjectorPressureTest/
 │   ├── app.js             # 前端逻辑 IIFE
 │   └── style.css          # 样式
 ├── scripts/               # 压测脚本
-│   ├── ir_runner.py             # 红外序列(自包含:IRRemote 内联,默认无限循环,长按=down+hold+up)
-│   └── wifi_reboot_stress.py    # WiFi 重启压力(与 IR 无关,独立脚本)
-├── ir_sequences/          # IR 序列 .ini 文件(单一 ini)
-│   ├── default.ini              # 默认 14 步序列(全 Short)
-│   └── KEY_REFERENCE.md         # 24 个按键的 KEY_NAME 速查(手动维护)
+│   ├── ir_runner.py             # 红外序列(自包含:IRRemote 内联,默认无限循环,双通道注入,长按=down+hold+up)
+│   ├── wifi_onoff_stress.py     # WiFi 开关压力(关/开循环 + wpa_cli 扫描,参数可配)
+│   ├── wifi_reboot_stress.py    # WiFi 重启压力(reboot + 上线等待,参数可配)
+│   └── wifi_switch_stress.py    # WiFi 多网络循环切换(预置列表,参数可配)
+├── ir_sequences/          # IR 序列 .ini 文件
+│   ├── 1.ini                    # 当前默认序列(KEY_VCR + KEYCODE_HDMI,5 字段格式)
+│   └── KEY_REFERENCE.md         # 按键速查三张表:KEY_* 24 + KEYCODE_* 厂商 23 + 原生 26(手动维护)
+├── reports/               # 压测报告 JSON(脚本自动生成,gitignore)
+│   └── stress-test/wifi/        # WiFi 脚本报告(wifi_switch_*.json / wifi_cycle_*.json)
 └── logs/                  # 运行时日志
     ├── server.out.log     # uvicorn stdout
     ├── server.err.log     # uvicorn stderr
@@ -189,13 +233,15 @@ ProjectorPressureTest/
 | GET | `/api/server/status` | uvicorn PID + uptime + 任务计数 |
 | POST | `/api/server/shutdown` | 优雅关停(级联 CTRL_BREAK + 退出) |
 | GET | `/api/devices` | ADB 设备列表 |
-| GET | `/api/scripts` | scripts/ 下脚本列表 |
+| GET | `/api/scripts` | scripts/ 下脚本列表(含 has_params 标志) |
+| GET | `/api/scripts/{name}/params` | 读脚本自描述的参数 schema(`--dump-params`) |
 | GET | `/api/sequences` | ir_sequences/ 下 .ini 列表 |
 | GET | `/api/sequences/{name}` | 读单个 .ini 内容 |
 | PUT | `/api/sequences/{name}` | 写整个 .ini 内容 |
 | DELETE | `/api/sequences/{name}` | 删 .ini(default 拒绝) |
 | POST | `/api/sequences` | 新建 .ini(写最小模板) |
 | POST | `/api/run` | 启动任务(同设备并发返回 409) |
+| POST | `/api/stop/{task_id}` | 单任务中断(CTRL_BREAK) |
 | POST | `/api/tasks/force-stop-by-device/{serial}` | SIGKILL 该设备任务 |
 | POST | `/api/tasks/force-cleanup` | SIGKILL 全部 + 清空任务 |
 | POST | `/api/tasks/cleanup` | 删所有终态任务 + log |
@@ -225,7 +271,16 @@ ProjectorPressureTest/
   跑顶栏"重置"按钮(杀所有任务 + 重启 ADB),或手动删 logs/*.log。
 
 - ir_runner 跑起来报 "Key not found" 或 "not in CODE_NUM_MAP"
-  检查 ini 里 `code` 字段是否在 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md) 列表内(24 个内置按键)。新增按键需改 `scripts/ir_runner.py` 的 `IRRemote.CODE_NUM_MAP`。
+  检查 ini 里 `code` 字段是否在 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md) 三张表内:
+  - `KEY_*`(24 个)→ `IRRemote.CODE_NUM_MAP`,新增需改 `scripts/ir_runner.py`
+  - `KEYCODE_*` 厂商键(23 个)→ 映射到 Android keycode 名,新增需改 `ANDROID_KEYCODE_MAP`
+  - `KEYCODE_*` 原生键 / 未映射键 → 名称原样透传,一般无需改码
+
+- KEYCODE 长按没反应
+  已知限制:`KEYCODE_*` 只有短按 `Short` 生效,`LongXXXX` 静默失败(命令不存在,不注入按键)。要用长按只能走 `KEY_*` 一族(需 userdebug/root)。
+
+- WiFi 脚本扫不到网络 / 连接报 SecurityException
+  本设备上 wpa_cli 扫描和 `cmd wifi connect-network` 都需要 root。确认脚本参数里 `use_su` 开着(默认 true);若设备免 root,手动关掉再跑。su 用 AOSP 风格 `su 0 <cmd>`,`su -c` 在本设备会报 `invalid uid/gid '-c'`。
 
 - 长按没生效 / 设备无响应
   默认 IR event 路径是 `/dev/input/event1`(从原 keyevent.txt 推断)。如果你的设备 event 路径不同:
@@ -237,13 +292,13 @@ ProjectorPressureTest/
   当前平台透传的 `--device-event-path` 还没接(改中)。临时方案:设环境变量后重启 uvicorn,所有 ir_runner 任务都会读到。
 
 - 想改平台代码后没生效
-  浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.0.1` + NoCache 中间件,普通 F5 可能拿到缓存)。
+  浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.2.0` + NoCache 中间件,普通 F5 可能拿到缓存)。
 
 ---
 
 ## 后续(本期不做)
 
-本期已实现:设备列表、脚本列表、IR 序列选择 + 创建、modal 配置、localStorage 持久化、强制停止、重启 ADB、modal 选序列。
+本期已实现:设备列表、脚本列表、IR 序列选择 + 创建、modal 配置、脚本参数前端可配(params,按 设备×脚本 独立持久化)、WiFi 压测脚本(wifi_onoff / wifi_reboot / wifi_switch)、localStorage 持久化、强制停止、重启 ADB、KEYCODE_* 上层注入(厂商 23 + 原生 26 + 透传,user 版可用)。
 
 本期仍不做:
 - 报告生成、历史日志检索

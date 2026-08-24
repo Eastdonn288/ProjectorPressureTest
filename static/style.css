@@ -553,6 +553,34 @@ html, body {
   border-radius: 4px;
   font-size: 12px;
 }
+
+/* Script params config modal (per-device, per-script) */
+.params-form {
+  display: flex; flex-direction: column; gap: 10px;
+  max-height: 52vh; overflow-y: auto;
+}
+.param-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.param-label { font-size: 13px; color: var(--fg); flex: 1; }
+.param-control { flex: 0 0 200px; display: flex; justify-content: flex-end; }
+.param-control input[type="number"],
+.param-control input[type="text"] {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 13px;
+}
+.param-control input[type="checkbox"] {
+  width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer;
+}
 .seq-list {
   max-height: 50vh;
   overflow-y: auto;

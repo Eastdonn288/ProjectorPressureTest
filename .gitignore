@@ -64,6 +64,9 @@ desktop.ini
 # ===== Project specific (PPTP v2.0) =====
 # v1.0 已清理;此处留空,后续如需忽略特定文件再加
 
+# 脚本运行产生的压测报告(JSON)
+reports/
+
 # 允许提交空 data/ 目录(运行时由 server.py 创建)
 !data/.gitkeep
 !logs/.gitkeep

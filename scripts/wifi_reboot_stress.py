@@ -39,6 +39,21 @@ import time
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
+# Frontend-configurable params (declared for the PPTP platform).
+# The platform renders a config modal from this list and passes the chosen
+# values back via `--params`. Field keys: name / label / type / default /
+# min / max. Run with `--dump-params` to print this schema as JSON.
+PARAMS = [
+    {"name": "iterations", "label": "循环次数", "type": "int", "default": 100,
+     "min": 1, "max": 100000},
+    {"name": "wait_sec", "label": "重启后等待(秒)", "type": "int",
+     "default": 60, "min": 1, "max": 3600},
+    {"name": "wifi_settle_sec", "label": "上线后WiFi稳定等待(秒)", "type": "int",
+     "default": 5, "min": 0, "max": 3600},
+    {"name": "back_online_timeout", "label": "设备上线超时(秒)", "type": "int",
+     "default": 90, "min": 5, "max": 3600},
+]
+
 
 def adb_shell(serial: str, *args: str, timeout: int = 10) -> tuple[int, str, str]:
     """Run `adb -s <serial> shell <args...>`.
@@ -105,6 +120,15 @@ def wait_for_device_online(serial: str, timeout_sec: int) -> bool:
 
 
 def main() -> int:
+    # --dump-params is consumed by the PPTP platform to render the params
+    # config modal. Must short-circuit before argparse (and before any device
+    # interaction). ensure_ascii keeps stdout pure-ASCII for safe piping.
+    if "--dump-params" in sys.argv:
+        print(json.dumps({"fields": PARAMS}))
+        return 0
+
+    defaults = {f["name"]: f["default"] for f in PARAMS}
+
     p = argparse.ArgumentParser(description="Reboot + Wi-Fi reconnect stress test")
     p.add_argument("--device", required=True, help="ADB device serial")
     p.add_argument("--params", default="{}",
@@ -117,10 +141,10 @@ def main() -> int:
         print(f"[warn] invalid --params JSON, using defaults: {args.params}")
         params = {}
 
-    iterations = int(params.get("iterations", 100))
-    wait_sec = int(params.get("wait_sec", 60))
-    wifi_settle_sec = int(params.get("wifi_settle_sec", 5))
-    back_online_timeout = int(params.get("back_online_timeout", 90))
+    iterations = int(params.get("iterations", defaults["iterations"]))
+    wait_sec = int(params.get("wait_sec", defaults["wait_sec"]))
+    wifi_settle_sec = int(params.get("wifi_settle_sec", defaults["wifi_settle_sec"]))
+    back_online_timeout = int(params.get("back_online_timeout", defaults["back_online_timeout"]))
 
     print(f"[config] device         = {args.device}")
     print(f"[config] iterations     = {iterations}")

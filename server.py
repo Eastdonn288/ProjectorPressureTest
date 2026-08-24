@@ -85,7 +85,7 @@ WS_CLIENTS: dict[str, set[WebSocket]] = {}
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="PPTP", version="2.0")
+app = FastAPI(title="PPTP", version="2.2.0")
 
 # Disable HTTP caching for static files (dev mode)
 app.add_middleware(NoCacheMiddleware)
@@ -239,13 +239,21 @@ def _list_adb_devices() -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 # Helpers - scripts
 # ---------------------------------------------------------------------------
-def _list_scripts() -> list[dict[str, str]]:
+def _list_scripts() -> list[dict[str, Any]]:
     """Return .py files under scripts/."""
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
     for p in sorted(SCRIPTS_DIR.glob("*.py")):
         if p.name.startswith("_"):
             continue
-        items.append({"name": p.stem, "filename": p.name, "path": str(p)})
+        # Cheap source-sniff: a script that implements --dump-params declares
+        # frontend-configurable params (see /api/scripts/{name}/params).
+        has_params = False
+        try:
+            has_params = "--dump-params" in p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        items.append({"name": p.stem, "filename": p.name, "path": str(p),
+                      "has_params": has_params})
     return items
 
 
@@ -330,7 +338,7 @@ class SequenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": "2.0", "time": datetime.now().isoformat(timespec="seconds")}
+    return {"ok": True, "version": "2.2.0", "time": datetime.now().isoformat(timespec="seconds")}
 
 
 @app.get("/api/server/status")
@@ -399,6 +407,51 @@ async def api_devices():
 @app.get("/api/scripts")
 async def api_scripts():
     return {"scripts": _list_scripts()}
+
+
+# Params schema cache: key = (script name, mtime), so editing a script
+# invalidates its cached entry automatically.
+_PARAMS_CACHE: dict[tuple[str, float], dict] = {}
+
+
+@app.get("/api/scripts/{name}/params")
+async def api_script_params(name: str):
+    """Return the frontend-configurable param schema declared by a script.
+
+    Scripts that declare params support a `--dump-params` flag which prints
+    {"fields": [...]} (list of {name, label, type, default, ...}) and exits.
+    Scripts without it return an empty fields list.
+    """
+    script_path = (SCRIPTS_DIR / name).resolve()
+    if SCRIPTS_DIR.resolve() not in script_path.parents:
+        raise HTTPException(400, "invalid script path")
+    if not script_path.exists() or script_path.suffix != ".py":
+        raise HTTPException(404, f"script not found: {name}")
+
+    key = (name, script_path.stat().st_mtime)
+    cached = _PARAMS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    fields: list = []
+    try:
+        r = subprocess.run(
+            [sys.executable, "-u", str(script_path), "--dump-params"],
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
+            cwd=str(ROOT),
+        )
+        out = (r.stdout or "").strip()
+        if out:
+            data = json.loads(out)
+            if isinstance(data, dict) and isinstance(data.get("fields"), list):
+                fields = data["fields"]
+    except Exception:
+        fields = []
+
+    result = {"script": name, "fields": fields}
+    _PARAMS_CACHE[key] = result
+    return result
 
 
 @app.get("/api/sequences")
