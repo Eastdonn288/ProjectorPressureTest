@@ -238,7 +238,8 @@ class IRRemote:
         if dry_run:
             print("DRY RUN (su):", " ".join(cmd))
             return 0
-        completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, encoding="utf-8", errors="replace")
         if completed.returncode == 0:
             return completed.returncode
         # Some devices don't support -c; fall back to piping into su.
@@ -252,6 +253,7 @@ class IRRemote:
         completed = subprocess.run(
             fallback_cmd, input=joined + "\nexit\n",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         if completed.returncode == 0:
             return completed.returncode
@@ -269,7 +271,8 @@ class IRRemote:
             if dry_run:
                 print("DRY RUN:", " ".join(cmd))
                 continue
-            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, encoding="utf-8", errors="replace")
             if completed.returncode == 0:
                 continue
             stderr = (completed.stderr or completed.stdout or "").strip()

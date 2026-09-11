@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PPTP · 投影仪压测平台</title>
-  <link rel="stylesheet" href="/static/style.css?v=2.2.0" />
+  <link rel="stylesheet" href="/static/style.css?v=2.7.4" />
+  <script src="/static/vendor/echarts.min.js?v=2.7.4"></script>
   <!-- 每次代码更新后 bump ?v= 强制浏览器重新加载,避免缓存问题 -->
 </head>
 <body>
@@ -12,6 +13,11 @@
     <h1>PPTP <span class="sub">Projector Pressure Test Platform</span></h1>
     <div class="status">
       <span id="server-info" class="server-info" title="PPTP 服务进程信息">加载中…</span>
+      <!-- Archive is a whole-platform concern (it is where every run's files
+           end up permanently), so it lives up here with the other global
+           controls rather than inside the task panel's card toolbar. -->
+      <span id="archive-hint" class="muted archive-hint" title="存档占用">存档 …</span>
+      <button id="btn-open-archive" class="btn" title="在资源管理器中打开 archive 目录">打开存档</button>
       <button id="btn-reset" class="btn" title="硬重置:杀掉所有任务 + 重启 ADB server + 清空状态">重置</button>
       <button id="btn-shutdown" class="btn btn-danger" title="关闭 PPTP 服务,所有正在运行的任务会被中断">关机</button>
       <span id="backend-pill" class="pill">●</span>
@@ -47,27 +53,37 @@
       <div class="panel-header">
         <h2>日志</h2>
         <div>
-          <button id="btn-export-log" class="btn" disabled>导出</button>
+          <!-- Export is hidden since v2.7.0: every run is archived to
+               archive/<task>/ automatically. The handler is kept (see
+               onExportLog) - remove `hidden` to bring the button back. -->
+          <button id="btn-export-log" class="btn" hidden disabled>导出</button>
           <button id="btn-clear-log" class="btn">清空</button>
           <button id="btn-hard-stop" class="btn btn-danger" disabled
                   title="设备临时离线时启用,直接 SIGKILL 子进程">硬停</button>
           <button id="btn-stop-task" class="btn btn-danger" disabled>中断</button>
         </div>
       </div>
+      <!-- #log-info is rewritten wholesale by renderLogInfo() on every 2s task
+           poll, so nothing may nest inside it that needs to survive a refresh. -->
       <div class="log-info" id="log-info">
         <span class="muted">未选择任务</span>
       </div>
+      <div id="perf-chart" class="perf-chart" hidden></div>
       <div class="panel-body">
-        <pre id="log-console" class="console">点击设备卡查看日志,或在脚本区选脚本后点设备卡上的"▶ 跑 XXX"</pre>
+        <pre id="log-console" class="console">Click a device card to view its log, or pick a script then press Run on the device card</pre>
       </div>
     </section>
 
     <!-- 任务状态 -->
     <section class="panel" id="panel-tasks">
       <div class="panel-header">
-        <h2>任务 <span id="task-hint" class="muted">点击查看日志</span></h2>
-        <div>
-          <button id="btn-cleanup-tasks" class="btn" title="删除所有已结束的任务(finished / failed / interrupted)">清空已完成</button>
+        <!-- No hint span here: this panel is only 300px wide and a static
+             "点击查看日志" label pushed the two buttons into each other. The
+             guidance already lives on every card (title="点击查看日志") and in
+             the console placeholder. -->
+        <h2>任务</h2>
+        <div class="panel-actions">
+          <button id="btn-cleanup-tasks" class="btn" title="只把已结束的卡片从列表移除;存档目录永久保留在 archive/">清空已完成的卡片</button>
           <button id="btn-refresh-tasks" class="btn">刷新</button>
         </div>
       </div>
@@ -77,7 +93,7 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=2.2.0"></script>
+  <script src="/static/app.js?v=2.7.4"></script>
 </body>
 
 <!-- ===== Sequence picker modal =====

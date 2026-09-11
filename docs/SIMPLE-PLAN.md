@@ -1,7 +1,7 @@
 # PPTP 极简版 项目计划
 
-> ⚠️ **本文件为 v2.0 极简版初版实施计划记录,已不再完全代表当前实现。**
-> 2026-07-18 起,信息以 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 为准(列出了真实 API、数据模型、设计决策)。
+> ⚠️ **本文件为 v2.0 极简版初版实施计划记录,已归档,不代表当前实现。**
+> 当前版本 **v2.4.2**(2026-08-25)。所有准确信息以 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 为准;版本沿革见 [CHANGELOG.md](../CHANGELOG.md)。
 > 保留本文档作为开发历史参考。
 
 > 版本:v2.0(精简版) | 配套 [SIMPLE-PRD.md](SIMPLE-PRD.md) / [SIMPLE-ARCHITECTURE.md](SIMPLE-ARCHITECTURE.md)

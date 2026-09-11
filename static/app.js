@@ -34,6 +34,11 @@
     selectedDeviceSerial: null,
     currentDeviceSerial: null,
     currentTaskId: null,
+    // PERF realtime chart (v2.4.0): per-task sample data bound to currentTaskId.
+    // perfMeta holds the PERF| meta line of the CURRENT task; perfSamples holds
+    // per-task sample buffers (survive task switches, cleared on delete/reset).
+    perfMeta: null,       // { taskId, sources, track_fg, ... }
+    perfSamples: {},      // { [taskId]: [ {t,cpu,gpu,mem,fg_cpu,fg_pkg,gpu_clk} ] }
     currentWs: null,
     backendOnline: false,
     userScrolledUp: false,
@@ -41,10 +46,57 @@
     shuttingDown: false,
     // Modal context: { source: "file" | "device", file?: "default", device?: serial }
     seqContext: null,
+
+    // ----- Log capture (v2.6.0, display dropped in v2.7.0) -----
+    // The server still captures logcat (always) and the serial console (opt-in)
+    // for every task, but the frontend renders ONLY stdout - permanently. The
+    // device channels are archived to disk and never displayed, so there is no
+    // channel state here at all. See archiveChartIfAvailable() for the one bit
+    // of the archive the browser still contributes.
+    //
+    // Per-device serial-capture opt-in (the run-time control on the device card).
+    deviceSerialCapture: {},   // { [serial]: bool }
+    deviceSerialPort: {},      // { [serial]: "COM9" }
+    serialPorts: [],           // cached COM port list from /api/serial/ports
+    // Archive occupancy for the tasks panel header (GET /api/archive/stats).
+    archiveStats: null,        // { count, bytes }
+    // Task ids we have already tried to POST a rendered chart for, so the 2s
+    // poll does not re-upload on every tick.
+    chartPosted: {},
   };
 
   // Cache last render keys to skip unnecessary re-renders
   const _lastKey = { devices: "", scripts: "", tasks: "" };
+
+  // ----- PERF realtime chart (v2.4.0) -----
+  // The chart (#perf-chart) lives in the LOG panel between #log-info and the
+  // console, bound to state.currentTaskId. Switching tasks disposes + hides /
+  // re-inits the chart on the same div - zero residue. All ECharts work happens
+  // at discrete navigation points (task open / WS onopen / delete / reset) and
+  // on the rAF log flush - NOT in the 2s render poll.
+  // Device-side capture channels that exist on the server and in the archive,
+  // but are never rendered here. Used only by the (currently hidden) export
+  // path and by the archive summary line the server pushes.
+  const CAPTURE_EXPORT = ["logcat", "serial"];
+
+  const PERF_PREFIX = "PERF|";
+  const PERF_SAMPLE_CAP = 86400;  // per-task sample buffer (24h @2s; long runs keep full history)
+  const PERF_WINDOW_MS = 60 * 60 * 1000;  // rolling 1-hour chart x-axis window (6 ticks x 10min)
+  let perfChart = null;           // current echarts instance
+  let perfChartTaskId = null;     // task the chart is currently bound to
+  let perfPending = [];           // batched samples awaiting chart flush
+  let perfOption = null;          // current chart option (series data mutated in place)
+  let perfSeriesKeys = [];        // series keys in chart order, e.g. ["cpu","gpu","mem"]
+  // Wall-clock x-axis: perfXBase = task.started_at epoch ms, so a sample's
+  // x-coord = s.clock (script-provided) or perfXBase + s.t*1000 (fallback for
+  // pre-v2.4.1 logs). fmtClock renders HH:MM:SS (local time) on the x-axis.
+  let perfXBase = Date.now();
+  const fmtClock = (ms) =>
+    new Date(ms).toLocaleTimeString("zh-CN", { hour12: false });
+  const perfX = (s) => {
+    if (s && s.clock != null) return s.clock;
+    return perfXBase + (s && s.t != null ? s.t * 1000 : 0);
+  };
 
   // ---------------- DOM helpers ----------------
   const $ = (id) => document.getElementById(id);
@@ -104,7 +156,11 @@
         device: t.device, status: t.status, task_id: t.task_id, script: t.script,
       })),
       deviceScripts: state.deviceScripts,
-      current: state.currentDeviceSerial,
+      // Serial opt-in controls are re-rendered from state, so their changes
+      // must invalidate the key or the checkbox would snap back on the 3s poll.
+      serialCapture: state.deviceSerialCapture,
+      serialPort: state.deviceSerialPort,
+      serialPorts: state.serialPorts,
       scriptMap: Object.fromEntries(state.scripts.map((s) => [s.filename, s.name])),
     });
   }
@@ -281,24 +337,28 @@
     }
   }
 
+  // Latest task for a device, by started_at descending (null if none).
+  function latestTaskOf(serial) {
+    return [...state.tasks]
+      .filter((t) => t.device === serial)
+      .sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""))[0] || null;
+  }
+
   // ---------------- Render: Devices ----------------
   function renderDevices() {
     const el = $("device-list");
-    if (!state.devices.length && !state.tasks.some((t) => t.status === "running")) {
-      el.innerHTML = `<div class="empty">
-        未检测到 ADB 设备<br>
-        <small>请确认 adb 已安装并连接</small>
-      </div>`;
-      return;
-    }
+    const liveSerials = new Set(state.devices.map((d) => d.serial));
 
-    // Fix 1: synthesize "temporarily offline" devices for tasks that are running
+    // Fix 1: synthesize "temporarily offline" devices for tasks that are live
     // but whose device is not in the current `adb devices` list. This lets the
     // user see the device card during planned ADB outages (e.g., reboot stress
     // tests where the script intentionally waits for the device to come back).
-    const liveSerials = new Set(state.devices.map((d) => d.serial));
+    // `interrupting` counts as live: pressing 中断 on a reboot test leaves the
+    // script running out its wait for a device that is still absent, and the
+    // card must not blink out of existence for those seconds.
     const tempOffline = state.tasks
-      .filter((t) => t.status === "running" && !liveSerials.has(t.device))
+      .filter((t) => (t.status === "running" || t.status === "interrupting")
+                     && !liveSerials.has(t.device))
       .reduce((acc, t) => {
         if (!acc.find((d) => d.serial === t.device)) {
           acc.push({
@@ -312,23 +372,64 @@
         }
         return acc;
       }, []);
-    const allDevices = [...state.devices, ...tempOffline];
+
+    // Fix 2: battery tests end with the device powered off (discharge drains it
+    // to shutdown -> `stop reason : power_off`). That would normally make the
+    // card vanish from the list, which reads as "device disappeared". Keep a
+    // dedicated card for it (mirrors the temp-offline card): a terminal
+    // battery task whose device is no longer in `adb devices` and is still the
+    // device's latest task. When the device comes back the normal card returns.
+    const battOff = [];
+    {
+      const seen = new Set();
+      for (const t of state.tasks) {
+        if (t.script !== "battery_inout_stress.py") continue;
+        if (!["finished", "interrupted", "failed"].includes(t.status)) continue;
+        if (liveSerials.has(t.device)) continue;
+        if (seen.has(t.device)) continue;
+        const latest = latestTaskOf(t.device);
+        if (!latest || latest.script !== "battery_inout_stress.py") continue;
+        seen.add(t.device);
+        const isDischarge = latest.params && latest.params.mode === "discharge";
+        battOff.push({
+          serial: t.device,
+          status: "device",
+          model: isDischarge ? "(放电测试 · 设备已关机)" : "(电池测试 · 设备已关机)",
+          product: "",
+          transport: "",
+          _batt_off: true,
+        });
+      }
+    }
+
+    if (!state.devices.length && !state.tasks.some((t) => t.status === "running") && !battOff.length) {
+      el.innerHTML = `<div class="empty">
+        未检测到 ADB 设备<br>
+        <small>请确认 adb 已安装并连接</small>
+      </div>`;
+      return;
+    }
+
+    const allDevices = [...state.devices, ...tempOffline, ...battOff];
 
     el.innerHTML = allDevices.map((d) => {
       const isTempOffline = !!d._temp_offline;
-      const stClass = isTempOffline ? "online"
+      const isBattOff = !!d._batt_off;
+      const stClass = isBattOff ? "offline"
+                    : isTempOffline ? "online"
                     : d.status === "device" ? "online"
                     : d.status === "unauthorized" ? "unauthorized"
                     : "offline";
-      const stText = isTempOffline ? "临时离线(任务在跑)"
+      const stText = isBattOff ? "设备已关机"
+                  : isTempOffline ? "临时离线(任务在跑)"
                   : d.status === "device" ? "在线"
                    : d.status === "unauthorized" ? "需授权"
                    : "离线";
       const running = state.tasks.find(
         (t) => t.device === d.serial && (t.status === "running" || t.status === "interrupting")
       );
-      // Treat temp-offline as "not offline" so user can still interact (e.g. force stop)
-      const isOffline = !isTempOffline && d.status !== "device";
+      // Treat temp-offline / batt-off as "not offline" so user can still interact (e.g. force stop)
+      const isOffline = !isTempOffline && !isBattOff && d.status !== "device";
       const isCurrentView = state.currentDeviceSerial === d.serial;
       const remembered = state.deviceScripts[d.serial] || null;
 
@@ -352,6 +453,42 @@
           ${optionsHtml}
         </select>`;
 
+      // Serial-capture opt-in. The port is a per-device preference (remembered);
+      // the checkbox is per-session, matching the existing split where
+      // deviceParams persist but deviceScripts deliberately do not.
+      const scriptMeta = state.scripts.find((s) => s.filename === remembered);
+      const ownsSerial = !!(scriptMeta && scriptMeta.owns_serial);
+      const wantSerial = !!state.deviceSerialCapture[d.serial];
+      const portValue = state.deviceSerialPort[d.serial] || "";
+      const serialDisabled = ownsSerial || dropdownDisabled;
+      const serialTitle = ownsSerial
+        ? "该脚本自身占用串口,平台串口抓取已自动让位(避免抢口导致电量曲线变平)"
+        : notSelected ? `先点击设备 ${d.serial} 选中它`
+        : running ? "任务运行中,串口抓取设置已锁定"
+        : isOffline ? "设备离线"
+        : "勾选后,本设备的下一次任务会同时采集串口 console 日志";
+      const portOptions = state.serialPorts.map((p) => {
+        const sel = p === portValue ? " selected" : "";
+        return `<option value="${esc(p)}"${sel}>${esc(p)}</option>`;
+      }).join("");
+      // Highlight only when capture will ACTUALLY run: a checked box on an
+      // unselected/locked device is not something to draw attention to.
+      const serialActive = wantSerial && !serialDisabled;
+      const serialHtml = `
+        <div class="device-row4${serialActive ? " serial-on" : ""}">
+          <label class="serial-opt" title="${esc(serialTitle)}">
+            <input type="checkbox" class="serial-cap" data-serial="${esc(d.serial)}"
+                   ${wantSerial ? "checked" : ""} ${serialDisabled ? "disabled" : ""}>
+            <span${ownsSerial ? ' class="muted"' : ""}>串口日志</span>
+          </label>
+          <select class="serial-port" data-serial="${esc(d.serial)}"
+                  ${serialDisabled || !wantSerial ? "disabled" : ""}
+                  title="${esc(serialTitle)}">
+            <option value=""${portValue ? "" : " selected"}>— COM —</option>
+            ${portOptions}
+          </select>
+        </div>`;
+
       let btnHtml = "";
       // Run button moved to the script card. Device card just shows status:
       // online/offline/running + (when a script is selected) the chip in
@@ -359,6 +496,8 @@
       // literal "undefined" when no badge applies.
       if (running) {
         btnHtml = `<span class="badge-mini badge-running">运行中</span>`;
+      } else if (isBattOff) {
+        btnHtml = `<span class="badge-mini" style="background:rgba(248,113,113,0.18);color:var(--err);border-color:var(--err)">放电关机</span>`;
       } else if (isOffline) {
         btnHtml = `<span class="badge-mini" style="background:rgba(248,113,113,0.12);color:var(--err);border-color:var(--err)">离线</span>`;
       } else if (!remembered) {
@@ -372,7 +511,7 @@
       // device-level state only: online/offline, selected script, run button.
       // Per-device bound sequence is surfaced via the ir_runner script card.
       return `
-        <div class="device-card ${isCurrentView ? "active" : ""} ${isOffline ? "offline" : ""} ${isTempOffline ? "device-card-temp-offline" : ""}"
+        <div class="device-card ${isCurrentView ? "active" : ""} ${isOffline ? "offline" : ""} ${isTempOffline ? "device-card-temp-offline" : ""} ${isBattOff ? "device-card-batt-off" : ""}"
              data-serial="${esc(d.serial)}">
           <div class="device-row1">
             <span class="dot ${stClass}"></span>
@@ -384,6 +523,7 @@
             ${remembered ? `<span class="device-script-chip" title="当前选中的脚本">${esc(remembered.replace(/\.py$/, ""))}</span>` : ""}
           </div>
           <div class="device-row3">${dropdownHtml}</div>
+          ${serialHtml}
           <div class="device-actions">${btnHtml}</div>
         </div>`;
     }).join("");
@@ -409,9 +549,35 @@
       sel.addEventListener("click", (e) => e.stopPropagation());
     });
 
+    // Serial-capture opt-in controls. State lives in `state` (not in the DOM)
+    // because the card is re-rendered every 3s by the device poll.
+    el.querySelectorAll(".serial-cap").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        e.stopPropagation();
+        const serial = cb.dataset.serial;
+        state.deviceSerialCapture[serial] = cb.checked;
+        if (cb.checked && !state.deviceSerialPort[serial] && state.serialPorts.length === 1) {
+          // Single-port hosts (the common case) should not need a second click.
+          state.deviceSerialPort[serial] = state.serialPorts[0];
+        }
+        savePersistedState();
+        renderDevices();
+      });
+      cb.addEventListener("click", (e) => e.stopPropagation());
+    });
+    el.querySelectorAll(".serial-port").forEach((sel) => {
+      sel.addEventListener("change", (e) => {
+        e.stopPropagation();
+        state.deviceSerialPort[sel.dataset.serial] = sel.value || "";
+        savePersistedState();
+      });
+      sel.addEventListener("click", (e) => e.stopPropagation());
+    });
+
     el.querySelectorAll(".device-card").forEach((c) => {
       c.addEventListener("click", (e) => {
-        if (e.target.closest("button") || e.target.closest("select")) return;
+        if (e.target.closest("button") || e.target.closest("select")
+            || e.target.closest("label") || e.target.closest("input")) return;
         onSelectDevice(c.dataset.serial);
       });
     });
@@ -436,8 +602,11 @@
           <div class="task-row1">
             <span class="device-name" title="${esc(t.device)}">${esc(t.device)}</span>
             <span class="task-row1-right">
+              ${t.archive
+                ? `<button class="task-open" data-open="${esc(t.task_id)}" title="打开存档文件夹 archive/${esc(t.archive.module || "")}/${esc(t.archive.dir)}/">存档</button>`
+                : ""}
               ${isTerminal
-                ? `<button class="task-del" data-del="${esc(t.task_id)}" title="删除此任务(同时删除日志文件)">×</button>`
+                ? `<button class="task-del" data-del="${esc(t.task_id)}" title="从列表移除(存档保留在 archive/)">×</button>`
                 : ""}
               <span class="${cls}">${esc(t.status)}</span>
             </span>
@@ -454,6 +623,12 @@
 
     el.querySelectorAll(".task-card").forEach((c) => {
       c.addEventListener("click", () => viewTaskLogs(c.dataset.task));
+    });
+    el.querySelectorAll(".task-open").forEach((b) => {
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        onRevealArchive(b.dataset.open);
+      });
     });
     el.querySelectorAll(".task-del").forEach((b) => {
       b.addEventListener("click", (e) => {
@@ -517,7 +692,15 @@
   // snappy while preserving enough recent context to read.
   const LOG_DOM_CAP = 1000;
 
+  // The console shows stdout only. logcat/serial are still captured and
+  // archived server-side, but the client never subscribes to them (see openWs),
+  // so their frames do not even reach the browser - nothing to filter here.
   function appendLogLine(line) {
+    // PERF| JSON lines are consumed by the chart layer; the readable line
+    // replaces the raw JSON in the console. Malformed PERF lines pass through.
+    if (typeof line === "string" && line.startsWith(PERF_PREFIX)) {
+      line = handlePerfLine(line);
+    }
     logBuf.push(line);
     if (logFlushScheduled) return;
     logFlushScheduled = true;
@@ -526,11 +709,14 @@
 
   function flushLogBuffer() {
     logFlushScheduled = false;
+    flushPerfChart();   // PERF samples flush even if there is no log text this frame
     if (logBuf.length === 0) return;
 
     const con = $("log-console");
-    if (con.textContent.startsWith("点击")) con.textContent = "";
-    const ts = new Date().toLocaleTimeString();
+    if (con.textContent.startsWith("Click")) con.textContent = "";
+    // hour12:false -> guaranteed 24h "HH:mm:ss" (a zh-CN locale can otherwise
+    // emit Chinese AM/PM like "下午3:30" into the log, violating the ASCII rule).
+    const ts = fmtClock(Date.now());
     // One textContent update for all buffered lines
     con.textContent += logBuf.map((line) => `[${ts}] ${line}\n`).join("");
     logBuf.length = 0;
@@ -539,7 +725,8 @@
     const allLines = con.textContent.split("\n");
     if (allLines.length > LOG_DOM_CAP + 1) {
       const dropped = allLines.length - LOG_DOM_CAP - 1;
-      con.textContent = `(已省略前 ${dropped} 行 · 完整日志见 logs/${state.currentTaskId || "task"}.log)\n`
+      const where = logFileName(state.currentTaskId);
+      con.textContent = `(truncated ${dropped} lines; full log: ${where})\n`
                     + allLines.slice(-LOG_DOM_CAP).join("\n");
     }
 
@@ -550,11 +737,432 @@
     $("btn-export-log").disabled = false;
   }
 
+  // Where this task's stdout log lives, for the console-truncation note.
+  // Server-authoritative: once a task is archived the file has moved into
+  // archive/<dir>/, and only the server knows that name, so never rebuild it
+  // here. tasks from before v2.6.0 carried no log_files map at all.
+  function logFileName(tid) {
+    if (!tid) return "logs/(no task)";
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (t && t.archive) {
+      const m = t.archive.module ? `${t.archive.module}/` : "";
+      return `archive/${m}${t.archive.dir}/stdout.log`;
+    }
+    if (t && t.log_files && t.log_files.stdout) return `logs/${t.log_files.stdout}`;
+    return `logs/${tid}.log`;
+  }
+
   function clearConsole() {
     $("log-console").textContent = "";
     const lcEl = $("log-info").querySelector(".line-count");
     if (lcEl) lcEl.textContent = "0 行";
     $("btn-export-log").disabled = true;
+  }
+
+  // ---------------- PERF realtime chart ----------------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // PERF wire scripts power different chart types. "perf" = the performance
+  // monitor (CPU/GPU/mem/fg); "battery" = the battery charge/discharge monitor
+  // (level/temp). Returns null for tasks that don't stream PERF records.
+  const PERF_SCRIPT_KINDS = {
+    "perf_monitor.py": "perf",
+    "battery_inout_stress.py": "battery",
+  };
+  function perfKind(taskId) {
+    if (!taskId) return null;
+    const t = state.tasks.find((x) => x.task_id === taskId);
+    if (!t) return null;
+    return PERF_SCRIPT_KINDS[t.script] || null;
+  }
+  function isPerfTask(taskId) {
+    return perfKind(taskId) !== null;
+  }
+
+  // Parse a PERF| line. Returns the human-readable line to show in the console
+  // (the raw JSON is consumed). Malformed PERF lines return the original text.
+  // The log console must stay ASCII/English (v2.5.1): no Chinese in what gets
+  // printed to it - status/jump strings come straight from the script's ASCII
+  // sample fields.
+  function readableBattLine(obj) {
+    const t = obj.t != null ? `${obj.t.toFixed(1)}s` : "-";
+    const clk = obj.clock != null ? fmtClock(obj.clock) : fmtClock(perfX(obj));
+    const lv = obj.level != null ? `${obj.level}%` : "-";
+    const tp = obj.temp != null ? `${obj.temp.toFixed(1)}C` : "-";
+    const vv = obj.voltage_mv != null ? `${(obj.voltage_mv / 1000).toFixed(2)}V` : "-";
+    const st = obj.status || "-";
+    let s = `[batt] ${clk} (${t}) level=${lv} temp=${tp} voltage=${vv} status=${st}`;
+    if (obj.jump && obj.jump_type) {
+      const prev = obj.level != null && obj.jump != null ? obj.level - obj.jump : null;
+      s += ` [!] jump[${obj.jump_type}]${prev != null ? ` ${prev}->${obj.level}%` : ""}`;
+    }
+    return s;
+  }
+
+  function handlePerfLine(line) {
+    let obj;
+    try { obj = JSON.parse(line.slice(PERF_PREFIX.length)); }
+    catch (_) { return line; }
+    if (!obj || typeof obj !== "object") return line;
+    const tid = state.currentTaskId;
+    const kind = perfKind(tid);
+
+    if (obj.type === "meta") {
+      if (tid) state.perfMeta = Object.assign({ taskId: tid, kind }, obj);
+      if (perfChart && perfChartTaskId === tid) {
+        perfOption = buildPerfOption(tid);
+        backfillPerfOption(tid);
+        perfChart.setOption(perfOption, true);
+      }
+      if (kind === "battery") {
+        const src = obj.sources || {};
+        const modeName = src.mode === "discharge" ? "discharge" : "charge";
+        return `[batt] monitor start | mode=${modeName} | port=${src.com_port || "(none)"} | source=dumpsys battery`;
+      }
+      const src = obj.sources || {};
+      return `[perf] monitor start | CPU=${src.cpu ? "stat" : "N/A"} | MEM=${src.mem ? "meminfo" : "N/A"}`
+           + ` | GPU=${src.gpu ? "mali/dvfs" : "N/A"} | FG=${src.fg ? "top" : "off"}`;
+    }
+
+    if (obj.type === "sample") {
+      perfPending.push(obj);   // flushed to the chart on the next rAF log flush
+      if (kind === "battery") return readableBattLine(obj);
+      const t = obj.t != null ? `${obj.t.toFixed(1)}s` : "-";
+      const fmt = (v) => (v == null ? "-" : `${v.toFixed(1)}%`);
+      const clk = obj.clock != null ? fmtClock(obj.clock) : fmtClock(perfX(obj));
+      let s = `[perf] ${clk} (${t}) cpu=${fmt(obj.cpu)} gpu=${fmt(obj.gpu)} mem=${fmt(obj.mem)}`;
+      if (obj.fg_pkg) s += ` fg=${obj.fg_pkg} ${fmt(obj.fg_cpu)}`;
+      if (obj.gpu_clk != null) s += ` gpu_clk=${obj.gpu_clk}MHz`;
+      return s;
+    }
+
+    return line;  // unknown PERF| type - show raw
+  }
+
+  // Append a sample to the per-task buffer, deduping on t (WS replay re-sends
+  // the same samples when a task is re-viewed; identical t = already known).
+  function pushPerfSample(taskId, s) {
+    if (!state.perfSamples[taskId]) state.perfSamples[taskId] = [];
+    const arr = state.perfSamples[taskId];
+    const last = arr[arr.length - 1];
+    if (last && last.t === s.t) return false;
+    arr.push(s);
+    if (arr.length > PERF_SAMPLE_CAP) arr.splice(0, arr.length - PERF_SAMPLE_CAP);
+    return true;
+  }
+
+  function resetPerfBuffer(taskId) {
+    perfPending = [];
+    if (state.perfMeta && state.perfMeta.taskId !== taskId) state.perfMeta = null;
+    syncPerfChart();
+  }
+
+  // Core no-residue logic: show/rebind/hide the chart based on the CURRENT task.
+  // Called ONLY at discrete navigation points (task view, WS onopen, delete,
+  // cleanup, reset) - never from the 2s render poll.
+  function syncPerfChart() {
+    const el = $("perf-chart");
+    const tid = state.currentTaskId;
+    const isPerf = isPerfTask(tid);
+    const chartOk = typeof echarts !== "undefined";
+    if (!isPerf || !chartOk) {
+      if (perfChart) { perfChart.dispose(); perfChart = null; }
+      perfChartTaskId = null;
+      perfOption = null;
+      el.hidden = true;
+      return;
+    }
+    // Un-hide BEFORE init (a hidden div has zero size -> blank canvas)
+    el.hidden = false;
+    if (!perfChart || perfChartTaskId !== tid) {
+      if (perfChart) { perfChart.dispose(); perfChart = null; }
+      perfChart = echarts.init(el);
+      perfChartTaskId = tid;
+      perfOption = null;   // stale option from the previous task - force rebuild
+    }
+    // Anchor the wall-clock x-axis at this task's start time (fallback for
+    // samples without a script-provided clock).
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (t && t.started_at) {
+      const ms = new Date(t.started_at).getTime();
+      if (!Number.isNaN(ms)) perfXBase = ms;
+    }
+    if (state.perfMeta && state.perfMeta.taskId !== tid) state.perfMeta = null;
+    if (!perfOption) {
+      perfOption = buildPerfOption(tid);
+      backfillPerfOption(tid);
+    }
+    perfChart.setOption(perfOption, true);
+    perfChart.resize();
+    flushPerfChart();   // catch samples that arrived before the chart existed
+  }
+
+  // Build a fresh chart option for a task (empty series data). Determines which
+  // series exist from the task's PERF meta (GPU hidden when the node is unreadable).
+  // Right edge of the rolling x-axis window: the newest buffered sample's
+  // clock, or the task-start anchor before any sample arrives.
+  function perfWindowEnd(taskId) {
+    const arr = state.perfSamples[taskId];
+    if (arr && arr.length) return perfX(arr[arr.length - 1]);
+    return perfXBase;
+  }
+
+  // Build the series list + keys for a task's chart (shared by the live 1h
+  // window and the full-history PNG export). Determines which series exist from
+  // the task's PERF meta (GPU hidden when the node is unreadable).
+  function perfSeriesAndKeys(taskId) {
+    const meta = state.perfMeta && state.perfMeta.taskId === taskId ? state.perfMeta : null;
+    const src = (meta && meta.sources) || {};
+    // meta.kind (set at meta receipt) is the safer source; fall back to resolving
+    // the task by script name in case state.tasks isn't populated yet.
+    const kind = (meta && meta.kind) || perfKind(taskId);
+    const series = [];
+    const keys = [];
+    const mk = (name, color, key, yAxisIndex) => {
+      series.push({
+        name, type: "line", showSymbol: false, sampling: "lttb",
+        connectNulls: false,
+        lineStyle: { width: 1.5 }, itemStyle: { color },
+        // fg_cpu (top's multi-core %CPU) can exceed 100% -> own right axis;
+        // battery temp uses the right axis with its own °C scale.
+        yAxisIndex,
+        data: [],
+      });
+      keys.push(key);
+    };
+    if (kind === "battery") {
+      // Battery chart: level (left, 0-100%) + temperature (right, auto °C).
+      mk("电量", "#4f9eff", "level", 0);
+      mk("温度", "#ef4444", "temp", 1);
+    } else {
+      mk("CPU", "#4f9eff", "cpu", 0);
+      if (src.gpu) mk("GPU", "#4ade80", "gpu", 0);
+      mk("MEM", "#fbbf24", "mem", 0);
+      if (src.fg) mk("前台APP", "#f87171", "fg_cpu", 1);
+    }
+    return { series, keys, kind };
+  }
+
+  // Build a fresh chart option for a task (empty series data). Live usage: fixed
+  // 1h rolling window (v2.5.1). `fullRange: true` (full-history PNG export)
+  // spans the whole run and lets ECharts pick the tick step.
+  function buildPerfOption(taskId, fullRange) {
+    const { series, keys, kind } = perfSeriesAndKeys(taskId);
+    perfSeriesKeys = keys;
+    let xMin, xMax, xInterval, xSplit;
+    if (fullRange) {
+      const arr = state.perfSamples[taskId];
+      if (arr && arr.length) {
+        xMin = perfX(arr[0]);
+        xMax = perfX(arr[arr.length - 1]);
+        if (xMax - xMin < 1000) { xMin -= 500; xMax += 500; }  // single-sample run
+      }
+      // Exported PNG time axis: one tick every 0.5h (user requirement).
+      // hideOverlap on axisLabel drops colliding labels on very long runs.
+      xInterval = 30 * 60 * 1000;
+    } else {
+      // Fixed rolling 1-hour window: the axis always spans the last hour,
+      // anchored to the newest sample, with exact 10-minute ticks (~6 splits,
+      // "实时显示 1h"). Older points scroll off the left edge; the sample buffer
+      // keeps full history for CSV/PNG export. `interval` pins the 10-min step
+      // (splitNumber alone would let ECharts pick 5/15/30).
+      xInterval = 10 * 60 * 1000;
+      xSplit = 6;
+      xMin = perfWindowEnd(taskId) - PERF_WINDOW_MS;
+      xMax = perfWindowEnd(taskId);
+    }
+    const unitOf = { "电量": "%", "温度": "°C", "CPU": "%", "GPU": "%", "MEM": "%", "前台APP": "%" };
+    const option = {
+      backgroundColor: "#0a0d12",
+      animation: false,
+      grid: { left: 46, right: 56, top: 26, bottom: 26 },
+      legend: { top: 2, textStyle: { color: "#8b93a3" }, data: series.map((s) => s.name) },
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "#1d222b", borderColor: "#2a313d",
+        textStyle: { color: "#d6dbe4" },
+        formatter: (params) => {
+          if (!params || !params.length) return "";
+          const x = params[0].value[0];
+          let s = fmtClock(x);
+          if (x >= perfXBase) s += ` · t=${((x - perfXBase) / 1000).toFixed(1)}s`;
+          for (const p of params) {
+            const v = p.value[1];
+            s += `<br/>${p.marker}${p.seriesName}: ${v == null ? "-" : v.toFixed(1) + (unitOf[p.seriesName] || "%")}`;
+          }
+          return s;
+        },
+      },
+      xAxis: {
+        type: "time",
+        min: xMin,
+        max: xMax,
+        interval: xInterval,      // undefined in full-range -> auto ticks
+        splitNumber: xSplit,
+        axisLabel: { color: "#8b93a3", formatter: (v) => fmtClock(v), hideOverlap: true },
+        splitLine: { lineStyle: { color: "#1d222b" } },
+      },
+      yAxis: kind === "battery" ? [
+        {
+          type: "value", min: 0, max: 100,
+          axisLabel: { color: "#8b93a3", formatter: "{value}%" },
+          splitLine: { lineStyle: { color: "#1d222b" } },
+        },
+        {
+          type: "value", position: "right",
+          axisLabel: { color: "#ef4444", formatter: "{value}°C" },
+          splitLine: { show: false },
+        },
+      ] : [
+        {
+          type: "value", min: 0, max: 100,
+          axisLabel: { color: "#8b93a3", formatter: "{value}%" },
+          splitLine: { lineStyle: { color: "#1d222b" } },
+        },
+        {
+          type: "value", min: 0, max: 400, position: "right",
+          axisLabel: { color: "#f87171", formatter: "{value}%" },
+          splitLine: { show: false },
+        },
+      ],
+      // No dataZoom: the x-axis is a fixed rolling 1h window (v2.5.1); a zoom
+      // control would let users drag out of the 1h view and fight the flush.
+      series,
+    };
+    return option;
+  }
+
+  // Fill the current option's (empty) series with already-buffered samples.
+  // Used on task re-view / replay rebuild so history reappears instantly.
+  function backfillPerfOption(taskId) {
+    const arr = state.perfSamples[taskId];
+    if (!arr || !perfOption) return;
+    for (let i = 0; i < perfSeriesKeys.length; i++) {
+      const key = perfSeriesKeys[i];
+      const data = perfOption.series[i].data;
+      if (data.length > 0) continue;   // already has data - don't duplicate
+      for (const s of arr) data.push([perfX(s), s[key] == null ? null : +s[key]]);
+    }
+  }
+
+  // Flush batched samples (from perfPending) into the bound chart. Called at the
+  // end of flushLogBuffer (rAF-batched), so a 50k-line replay renders as a few
+  // setOption calls instead of one per line.
+  function flushPerfChart() {
+    if (perfPending.length === 0) return;
+    if (!perfChart || perfChartTaskId !== state.currentTaskId) {
+      perfPending.length = 0;   // dropped - chart is on another task
+      return;
+    }
+    const tid = state.currentTaskId;
+    const pending = perfPending.splice(0, perfPending.length);
+    const fresh = [];
+    for (const s of pending) if (pushPerfSample(tid, s)) fresh.push(s);
+    if (!perfOption || fresh.length === 0) return;
+    for (let i = 0; i < perfSeriesKeys.length; i++) {
+      const key = perfSeriesKeys[i];
+      const data = perfOption.series[i].data;
+      for (const s of fresh) data.push([perfX(s), s[key] == null ? null : +s[key]]);
+      if (data.length > PERF_SAMPLE_CAP) data.splice(0, data.length - PERF_SAMPLE_CAP);
+    }
+    // v2.5.1: roll the fixed 1h x-axis window forward to the newest sample,
+    // and trim points that fell out of the window (keeps the chart light).
+    const endX = perfX(fresh[fresh.length - 1]);
+    const minX = endX - PERF_WINDOW_MS;
+    if (perfOption.xAxis) {
+      perfOption.xAxis.min = minX;
+      perfOption.xAxis.max = endX;
+    }
+    for (let i = 0; i < perfSeriesKeys.length; i++) {
+      const d = perfOption.series[i].data;
+      while (d.length && d[0][0] < minX) d.shift();
+    }
+    perfChart.setOption(perfOption);
+  }
+
+  // Render a FULL-HISTORY PNG of a task's perf/battery data - NOT the 1h live
+  // window - on a throwaway off-screen chart and return a data URL. The whole
+  // sample buffer is plotted (lttb downsampling keeps long runs renderable), the
+  // x-axis spans the entire run with auto ticks. Works even after switching away
+  // from the task (perfSamples keeps everything; perfXBase is re-anchored to the
+  // task's start so t-based fallbacks stay correct).
+  function exportFullChartDataUrl(tid) {
+    const arr = state.perfSamples[tid];
+    if (!arr || !arr.length) return null;
+    const savedBase = perfXBase;
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (t && t.started_at) {
+      const ms = new Date(t.started_at).getTime();
+      if (!Number.isNaN(ms)) perfXBase = ms;
+    }
+    let dataUrl = null;
+    try {
+      const option = buildPerfOption(tid, true);
+      for (let i = 0; i < perfSeriesKeys.length; i++) {
+        const key = perfSeriesKeys[i];
+        const data = option.series[i].data;
+        for (const s of arr) data.push([perfX(s), s[key] == null ? null : +s[key]]);
+      }
+      const div = document.createElement("div");
+      div.style.cssText = "position:fixed;left:-9999px;top:0;width:1280px;height:360px;";
+      document.body.appendChild(div);
+      try {
+        const chart = echarts.init(div);
+        chart.setOption(option, true);
+        dataUrl = chart.getDataURL({ pixelRatio: 2, backgroundColor: "#0a0d12" });
+        chart.dispose();
+      } finally {
+        document.body.removeChild(div);
+      }
+    } catch (_) {
+      dataUrl = null;
+    } finally {
+      perfXBase = savedBase;
+    }
+    return dataUrl;
+  }
+
+  function buildPerfCsv(task, samples) {
+    const kind = perfKind(task.task_id);
+    const L = [];
+    L.push(kind === "battery" ? "# PPTP 电池采样导出" : "# PPTP 性能采样导出");
+    L.push(`# 任务: ${task.task_id}`);
+    L.push(`# 设备: ${task.device}`);
+    L.push(`# 脚本: ${task.script}`);
+    L.push(`# 状态: ${task.status}`);
+    if (task.params && Object.keys(task.params).length) {
+      L.push(`# 参数: ${JSON.stringify(task.params)}`);
+    }
+    if (kind === "battery") {
+      L.push("t_sec,t_wall,level_percent,temp_c,voltage_mv,status,jump_delta,jump_type");
+      for (const s of samples) {
+        const f = (v) => (v == null ? "" : v);
+        const wall = fmtClock(s.clock != null ? s.clock : perfX(s));
+        L.push([f(s.t), wall, f(s.level), f(s.temp), f(s.voltage_mv),
+                s.status || "", f(s.jump), s.jump_type || ""].join(","));
+      }
+    } else {
+      L.push("t_sec,t_wall,cpu_percent,gpu_percent,mem_percent,fg_cpu_percent,fg_pkg,gpu_clk_mhz");
+      for (const s of samples) {
+        const f = (v) => (v == null ? "" : v);
+        const wall = fmtClock(s.clock != null ? s.clock : perfX(s));
+        L.push([f(s.t), wall, f(s.cpu), f(s.gpu), f(s.mem), f(s.fg_cpu),
+                s.fg_pkg || "", f(s.gpu_clk)].join(","));
+      }
+    }
+    return L.join("\n") + "\n";
+  }
+
+  function downloadBlob(content, filename, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   async function onExportLog() {
@@ -581,12 +1189,17 @@
       return;
     }
 
+    // Filenames carry device + script + time so an exported file is
+    // self-describing once it leaves this machine.
+    const base = exportBaseName(t);
+
     let header = "=== PPTP 任务日志导出 ===\n";
     header += `导出时间: ${new Date().toISOString()}\n`;
     header += `任务ID:   ${t.task_id}\n`;
     header += `设备:     ${t.device}\n`;
     header += `脚本:     ${t.script}\n`;
     header += `状态:     ${t.status}\n`;
+    header += `通道:     stdout\n`;
     if (t.params && Object.keys(t.params).length) {
       header += `参数:     ${JSON.stringify(t.params)}\n`;
     }
@@ -596,22 +1209,175 @@
       header += `退出码:   ${t.exit_code}\n`;
     }
     header += `总行数:   ${fullLines.length}\n`;
+    const capSummary = capturesSummary(t);
+    if (capSummary) header += `抓取:     ${capSummary}\n`;
     header += "\n=== 日志内容 ===\n";
 
-    const content = header + fullLines.join("\n") + "\n";
+    downloadBlob(header + fullLines.join("\n") + "\n",
+                 `${base}.stdout.log`, "text/plain;charset=utf-8");
 
+    // Device-side channels (logcat / serial), one file each. Skipped when the
+    // channel never produced anything, so an export does not litter empty files.
+    // NOTE: this whole export path is dormant in v2.7.0 - archiving replaced it
+    // and #btn-export-log is hidden. Kept working in case it comes back.
+    for (const chId of CAPTURE_EXPORT) {
+      const info = (t.captures || {})[chId];
+      if (!info) continue;
+      let extra = null;
+      try {
+        const d = await api(`/api/tasks/${tid}/log?source=${chId}`);
+        if (d.lines && d.lines.length) extra = d;
+      } catch (_) { /* channel missing on disk - just skip it */ }
+      if (!extra) continue;
+      const where = t.archive
+        ? `archive/${t.archive.dir}/${chId}.log`
+        : `logs/${(t.log_files || {})[chId] || chId}`;
+      let h = `=== PPTP ${chId} 通道导出 ===\n`;
+      h += `导出时间: ${new Date().toISOString()}\n`;
+      h += `任务ID:   ${t.task_id}\n`;
+      h += `设备:     ${t.device}\n`;
+      h += `脚本:     ${t.script}\n`;
+      h += `通道状态: ${info.status || "unknown"}${info.detail ? ` (${info.detail})` : ""}\n`;
+      h += `行数:     ${extra.lines.length}\n`;
+      if (extra.truncated) {
+        h += `注意:     文件较大,仅导出末尾部分(完整日志见 ${where})\n`;
+      }
+      h += "\n=== 日志内容 ===\n";
+      await sleep(300);   // Firefox blocks a rapid 2nd/3rd download
+      downloadBlob(h + extra.lines.join("\n") + "\n",
+                   `${base}.${ch.id}.log`, "text/plain;charset=utf-8");
+    }
+
+    // v2.4.0: perf_monitor tasks export CSV + chart PNG alongside the txt log,
+    // all downloaded from this one button (no zip). Chrome/Edge allow
+    // multiple downloads in one gesture; Firefox may block the 2nd/3rd.
+    const perfArr = state.perfSamples[tid];
+    if (perfArr && perfArr.length > 0) {
+      await sleep(300);
+      const csvTag = perfKind(tid) === "battery" ? "batt" : "perf";
+      downloadBlob(buildPerfCsv(t, perfArr), `${base}.${csvTag}.csv`, "text/csv;charset=utf-8");
+      await sleep(300);
+      // Full-history PNG (v2.5.1): renders a throwaway off-screen chart from the
+      // whole sample buffer - NOT the 1h live window - so the exported image
+      // covers the entire run (perf/battery alike). No longer requires the task
+      // to still be the current view.
+      const dataUrl = exportFullChartDataUrl(tid);
+      if (dataUrl) {
+        const a2 = document.createElement("a");
+        a2.href = dataUrl;
+        a2.download = `${base}.chart.png`;
+        document.body.appendChild(a2);
+        a2.click();
+        document.body.removeChild(a2);
+      }
+    }
+  }
+
+  // Shared export filename stem: pptp_<script>_<device>_<utc timestamp>.
+  function exportBaseName(t) {
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const filename = `pptp_${tid.slice(0, 8)}_${ts}.txt`;
+    const clean = (s) => String(s || "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 32);
+    return `pptp_${clean((t.script || "").replace(/\.py$/, ""))}_${clean(t.device)}_${ts}`;
+  }
 
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  // One-line human summary of what was captured, for the export header.
+  function capturesSummary(t) {
+    const caps = t.captures || {};
+    const ids = CAPTURE_EXPORT.filter((id) => caps[id]);
+    if (!ids.length) return "";
+    return ids.map((id) => {
+      const info = caps[id];
+      return `${id}=${info.status || "?"}${info.detail ? `(${info.detail})` : ""}`;
+    }).join(" ");
+  }
+
+  // ---------------- Archive (v2.7.0) ----------------
+
+  // Render this task's perf chart and hand it to the server, which writes it
+  // into the task's archive folder.
+  //
+  // The server has no chart renderer on purpose (ECharts lives only in this
+  // page, and pulling in matplotlib would mean maintaining two renderers for
+  // one picture), so THIS is the only way a chart.png ever comes into being.
+  // If no browser is open when a task ends there is simply no chart in the
+  // archive - the CSV/report/stdout all survive, and summary.json says so.
+  //
+  // Best-effort: every failure is swallowed. An upload problem must never
+  // disturb the console the user is reading.
+  async function archiveChartIfAvailable(tid) {
+    if (!tid || state.chartPosted[tid]) return;
+    const t = state.tasks.find((x) => x.task_id === tid);
+    if (!t || !t.archive) return;                       // not archived yet
+    if ((t.archive.files || []).includes("chart.png")) return;  // already has one
+    const arr = state.perfSamples[tid];
+    if (!arr || !arr.length) return;                    // nothing to draw
+    // Claim before awaiting so the 2s poll can't fire a second upload while the
+    // first is still in flight. One attempt per task per page load.
+    state.chartPosted[tid] = true;
+    try {
+      const dataUrl = exportFullChartDataUrl(tid);
+      if (!dataUrl) return;
+      await api(`/api/tasks/${tid}/archive/artifact`, {
+        method: "POST",
+        body: JSON.stringify({ name: "chart.png", data: dataUrl }),
+      });
+      // Reflect it locally so the card/occupancy update without a reload.
+      if (t.archive) {
+        t.archive.files = Array.from(new Set([...(t.archive.files || []), "chart.png"]));
+      }
+      refreshArchiveStats();
+    } catch (_) { /* best effort - the run's data is safe on disk regardless */ }
+  }
+
+  // Open a task's archive folder. Local single-user tool, so this is the server
+  // telling the OS to show a directory - no path is ever sent from here, the
+  // server derives it from the task id.
+  async function onRevealArchive(tid) {
+    try {
+      await api(`/api/tasks/${tid}/archive/reveal`, { method: "POST" });
+    } catch (e) {
+      appendLogLine(`[archive] could not open folder: ${e.message}`);
+    }
+  }
+
+  // Open the archive root (the tasks-panel button).
+  async function onRevealArchiveRoot() {
+    try {
+      await api("/api/archive/reveal", { method: "POST" });
+    } catch (e) {
+      appendLogLine(`[archive] could not open folder: ${e.message}`);
+    }
+  }
+
+  // Total archive occupancy, shown in the tasks panel header. Cheap (a
+  // directory walk) and on the 5s server-status cadence, not the 2s one.
+  async function refreshArchiveStats() {
+    try {
+      const s = await api("/api/archive/stats");
+      state.archiveStats = s;
+      const el = $("archive-hint");
+      if (el) {
+        el.textContent = s.count
+          ? `存档 ${fmtBytes(s.bytes)} · ${s.count} 个`
+          : "暂无存档";
+        // Per-module breakdown on hover - the archive is grouped by module
+        // (archive/wifi/…, archive/perf/…), so this is the fastest way to see
+        // where the disk went without opening Explorer.
+        const mods = Object.entries(s.modules || {})
+          .sort((a, b) => b[1].bytes - a[1].bytes)
+          .map(([m, v]) => `${m}: ${fmtBytes(v.bytes)} (${v.count})`);
+        el.title = [s.dir || "", ...mods].filter(Boolean).join("\n");
+      }
+    } catch (_) { /* ignore - occupancy is cosmetic */ }
+  }
+
+  function fmtBytes(n) {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    let v = Number(n);
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
   }
 
   async function viewTaskLogs(taskId) {
@@ -634,6 +1400,7 @@
     // User-initiated switch: reset reconnect backoff so we get fresh attempts
     state._wsReconnectAttempts = 0;
     openWs(taskId);
+    syncPerfChart();   // perf chart show/hide + rebind for the newly-viewed task
     renderTasks();     // refresh active task highlight
     renderDevices();   // Bug2: sync device card active highlight to t.device
     renderScripts();   // Bug2 + Bug3: re-evaluate which script is active
@@ -641,18 +1408,29 @@
                        //  isActive becomes false via selectedDeviceReachable)
   }
 
+  // stdout only, permanently (v2.7.0). The server accepts ?sources= and will
+  // stream logcat/serial to anyone who asks, but nobody asks: subscribing to
+  // just stdout is what keeps those channels off the wire entirely.
   function openWs(taskId) {
     if (state.currentWs) {
       try { state.currentWs.close(); } catch (_) {}
       state.currentWs = null;
     }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws/logs/${taskId}`);
+    const ws = new WebSocket(
+      `${proto}//${location.host}/ws/logs/${taskId}?sources=stdout`
+    );
     ws._taskId = taskId;
     state.currentWs = ws;
     ws.onopen = () => {
       // Successful connection - reset backoff counter
       state._wsReconnectAttempts = 0;
+      // Stale WS: user already switched to another task - don't touch its state
+      if (state.currentTaskId !== taskId) return;
+      // Replay is about to stream: rebuild the perf chart for this task from
+      // its buffered samples (task re-view); live samples append as they come.
+      resetPerfBuffer(taskId);
+      syncPerfChart();
     };
     ws.onmessage = (e) => {
       try {
@@ -667,19 +1445,28 @@
           // Flush any buffered lines BEFORE end so they're all visible
           flushLogBuffer();
           refreshTasks();
+          // The task just finished: render its perf chart from the samples we
+          // already have and hand it to the server, which puts it in the
+          // archive. This is the only moment we know both "it ended" and "we
+          // have the data".
+          archiveChartIfAvailable(ws._taskId);
         }
-        else if (msg.type === "state" &&
-                 ["finished","failed","interrupted"].includes(msg.status)) {
-          refreshTasks();
+        else if (msg.type === "state") {
+          if (msg.captures) {
+            const st = state.tasks.find((x) => x.task_id === ws._taskId);
+            if (st) st.captures = msg.captures;
+          }
+          if (["finished","failed","interrupted"].includes(msg.status)) refreshTasks();
         }
         else if (msg.type === "error") appendLogLine(`[error] ${msg.message}`);
         else if (msg.type === "replay_meta") {
           // Server tells us it truncated the replay. Insert a visible note
           // at the top of the console so the user knows there are earlier
           // lines in the log file (not lost, just not loaded).
-          const note = `── 共 ${msg.total_lines} 行 · 本次显示最近 ${msg.shown_lines} 行 · 完整日志见 logs/<task>.log ──`;
+          const where = logFileName(ws._taskId);
+          const note = `-- total ${msg.total_lines} lines, showing last ${msg.shown_lines}; full log: ${where} --`;
           const con = $("log-console");
-          if (con.textContent.startsWith("点击")) con.textContent = "";
+          if (con.textContent.startsWith("Click")) con.textContent = "";
           con.textContent = note + "\n" + con.textContent;
         }
       } catch (_) {}
@@ -705,13 +1492,13 @@
 
     state._wsReconnectAttempts = (state._wsReconnectAttempts || 0) + 1;
     if (state._wsReconnectAttempts > 5) {
-      appendLogLine(`[ws] 重连失败已达上限(5 次),请刷新页面`);
+      appendLogLine(`[ws] reconnect failed after 5 attempts - please refresh the page`);
       state._wsReconnectAttempts = 0;
       return;
     }
     const delay = Math.min(1000 * state._wsReconnectAttempts, 5000);
     appendLogLine(
-      `[ws] 连接断开,${delay / 1000} 秒后重连(第 ${state._wsReconnectAttempts}/5 次)`
+      `[ws] disconnected, retrying in ${delay / 1000}s (attempt ${state._wsReconnectAttempts}/5)`
     );
     state._wsReconnectTimer = setTimeout(() => {
       state._wsReconnectTimer = null;
@@ -747,10 +1534,24 @@
     // config this is a no-op and the script runs with its own defaults.
     const stored = state.deviceParams?.[serial]?.[script];
     if (stored && Object.keys(stored).length) Object.assign(params, stored);
+    // Serial capture is opt-in per run. A script that drives the port itself
+    // wins by default on the server; the card already disables the control in
+    // that case, so this only sends it when it is meaningful.
+    const scriptMeta = state.scripts.find((s) => s.filename === script);
+    const wantSerial = !!state.deviceSerialCapture[serial] && !(scriptMeta && scriptMeta.owns_serial);
+    const serialPort = state.deviceSerialPort[serial] || "";
+    if (wantSerial && !serialPort) {
+      alert("已勾选串口日志,但未选择 COM 端口");
+      return;
+    }
     try {
       const res = await api("/api/run", {
         method: "POST",
-        body: JSON.stringify({ device: serial, script, params }),
+        body: JSON.stringify({
+          device: serial, script, params,
+          serial_capture: wantSerial,
+          serial_port: wantSerial ? serialPort : null,
+        }),
       });
       await refreshTasks();
       viewTaskLogs(res.task_id);
@@ -786,6 +1587,7 @@
         state.currentTaskId = null;
         setConsoleTarget(null, serial);
         clearConsole();
+        syncPerfChart();   // no task -> hide perf chart
       }
     }
     renderDevices();
@@ -825,13 +1627,16 @@
       alert(`删除失败: ${e.message}`);
       return;
     }
-    // If we were viewing this task, reset the console and info bar
+    // Drop this task's perf buffer (memory hygiene) + hide chart if it was bound
+    delete state.perfSamples[taskId];
+    if (state.perfMeta && state.perfMeta.taskId === taskId) state.perfMeta = null;
     if (state.currentTaskId === taskId) {
       if (state.currentWs) { try { state.currentWs.close(); } catch (_) {} }
       state.currentWs = null;
       // B3 fix: setConsoleTarget also calls renderLogInfo to clear stale info
       setConsoleTarget(null, null);
       clearConsole();
+      syncPerfChart();
     }
     await refreshTasks();
   }
@@ -849,12 +1654,16 @@
     )) return;
     try {
       const r = await api("/api/tasks/cleanup", { method: "POST" });
+      // Drop perf buffers of cleaned tasks (memory hygiene)
+      if (r.ids) for (const id of r.ids) delete state.perfSamples[id];
       // If we were viewing one of the deleted tasks, reset
       if (state.currentTaskId && r.ids && r.ids.includes(state.currentTaskId)) {
         if (state.currentWs) { try { state.currentWs.close(); } catch (_) {} }
         state.currentWs = null;
         state.currentTaskId = null;
+        if (state.perfMeta) state.perfMeta = null;
         clearConsole();
+        syncPerfChart();
       }
       await refreshTasks();
     } catch (e) {
@@ -863,6 +1672,22 @@
   }
 
   // ---------------- Polling ----------------
+  // COM port list for the serial-capture opt-in. Cheap, and fetched with the
+  // same cadence as scripts rather than the 3s device poll - ports do not
+  // appear and vanish often, and a hot-plug is covered by the manual refresh.
+  async function refreshSerialPorts() {
+    try {
+      const r = await api("/api/serial/ports");
+      const ports = r.ports || [];
+      if (JSON.stringify(ports) === JSON.stringify(state.serialPorts)) return;
+      state.serialPorts = ports;
+      renderDevices();
+    } catch (_) {
+      // Server without pyserial: leave the list empty, the control stays
+      // disabled and the run still works. Never surface this as an error.
+    }
+  }
+
   async function refreshDevices() {
     try {
       const r = await api("/api/devices");
@@ -883,15 +1708,26 @@
         .filter((t) => t.status === "running" || t.status === "interrupting")
         .map((t) => t.device)
     );
+    // Also keep remembered selections for devices whose battery test ended with
+    // the device powered off - their card stays visible as a "discharge
+    // power-off" card, so dropping the script chip would look like a reset.
+    const keptSerials = new Set(runningSerials);
+    for (const t of state.tasks) {
+      if (t.script !== "battery_inout_stress.py") continue;
+      if (!["finished", "interrupted", "failed"].includes(t.status)) continue;
+      if (validSerials.has(t.device)) continue;
+      const latest = latestTaskOf(t.device);
+      if (latest && latest.script === "battery_inout_stress.py") keptSerials.add(t.device);
+    }
     let dirty = false;
     for (const serial of Object.keys(state.deviceScripts)) {
-      if (!validSerials.has(serial) && !runningSerials.has(serial)) {
+      if (!validSerials.has(serial) && !keptSerials.has(serial)) {
         delete state.deviceScripts[serial];
         dirty = true;
       }
     }
     for (const serial of Object.keys(state.deviceSequences)) {
-      if (!validSerials.has(serial) && !runningSerials.has(serial)) {
+      if (!validSerials.has(serial) && !keptSerials.has(serial)) {
         delete state.deviceSequences[serial];
         dirty = true;
       }
@@ -966,6 +1802,19 @@
     if (state.currentTaskId) {
       renderLogInfo();
     }
+    // Backfill charts for tasks that finished while we were NOT watching them.
+    // The WS "end" frame is filtered out when currentTaskId is a different task,
+    // and a page reload loses state.perfSamples entirely (WS replay rebuilds it
+    // from the archived log). This sweep catches both: any archived task whose
+    // samples we hold but whose archive has no chart.png gets one upload.
+    // archiveChartIfAvailable() claims the id before awaiting, so this cannot
+    // loop or upload twice.
+    for (const t of state.tasks) {
+      if (t.archive && !state.chartPosted[t.task_id]
+          && (state.perfSamples[t.task_id] || []).length) {
+        archiveChartIfAvailable(t.task_id);
+      }
+    }
   }
 
   function tickClock() {
@@ -1008,6 +1857,7 @@
       state.server = s;
       renderServerInfo();
     } catch (_) {}
+    refreshArchiveStats();
   }
 
   function renderServerInfo() {
@@ -1081,6 +1931,7 @@
     $("btn-hard-stop").addEventListener("click", onForceStopCurrent);
     $("btn-shutdown").addEventListener("click", onShutdownClick);
     $("btn-reset").addEventListener("click", onResetClick);
+    $("btn-open-archive").addEventListener("click", onRevealArchiveRoot);
 
     // Modal: IR sequence picker (list + select)
     document.querySelectorAll("#modal-seq [data-close]").forEach((b) => {
@@ -1112,6 +1963,11 @@
     con.addEventListener("scroll", () => {
       const atBottom = con.scrollHeight - con.scrollTop - con.clientHeight < 20;
       state.userScrolledUp = !atBottom;
+    });
+
+    // Keep the perf chart sized to the log panel when the window resizes
+    window.addEventListener("resize", () => {
+      if (perfChart) perfChart.resize();
     });
   }
 
@@ -1272,6 +2128,15 @@
     if (f.type === "bool") {
       return `<input type="checkbox" name="${n}" ${value ? "checked" : ""}>`;
     }
+    if (f.type === "select") {
+      // Dropdown; choices may be plain strings or {value, label} objects.
+      const opts = (f.choices || []).map((c) => {
+        const o = (c && typeof c === "object") ? c : { value: c, label: c };
+        const sel = String(o.value) === String(value) ? " selected" : "";
+        return `<option value="${esc(o.value)}"${sel}>${esc(o.label != null ? o.label : o.value)}</option>`;
+      }).join("");
+      return `<select name="${n}">${opts}</select>`;
+    }
     if (f.type === "int" || f.type === "float") {
       let extra = "";
       if (f.min != null) extra += ` min="${f.min}"`;
@@ -1307,7 +2172,7 @@
     if (!ctx) return;
     const params = {};
     for (const f of _paramsFields) {
-      const el = document.querySelector(`#modal-params input[name="${esc(f.name)}"]`);
+      const el = document.querySelector(`#modal-params [name="${esc(f.name)}"]`);
       if (!el) continue;
       if (f.type === "bool") params[f.name] = el.checked;
       else if (f.type === "int") params[f.name] = parseInt(el.value, 10) || 0;
@@ -1363,8 +2228,11 @@
     state.currentWs = null;
     state.currentTaskId = null;
     state.currentDeviceSerial = null;
+    state.perfMeta = null;
+    state.perfSamples = {};   // reset wipes all perf buffers
     setConsoleTarget(null, null);
     clearConsole();
+    syncPerfChart();
     await refreshTasks();
     await refreshDevices();
     btn.disabled = false;
@@ -1400,6 +2268,12 @@
         state.deviceSequences = data.deviceSequences;
       if (data.deviceParams && typeof data.deviceParams === "object")
         state.deviceParams = data.deviceParams;
+      // Serial port is a per-device preference worth remembering. The checkbox
+      // itself is NOT persisted - same reasoning as deviceScripts: "what do I
+      // want to capture RIGHT NOW" is session state, and a stale opt-in
+      // silently holding a COM port on the next session would be surprising.
+      if (data.deviceSerialPort && typeof data.deviceSerialPort === "object")
+        state.deviceSerialPort = data.deviceSerialPort;
     } catch (_) {
       // Ignore corrupt state - just start fresh
     }
@@ -1416,6 +2290,8 @@
           // deviceScripts intentionally NOT saved - see comment above.
           deviceSequences: state.deviceSequences,
           deviceParams: state.deviceParams,
+          // deviceSerialCapture intentionally NOT saved - see loadPersistedState.
+          deviceSerialPort: state.deviceSerialPort,
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
       } catch (_) { /* quota exceeded etc - ignore */ }
@@ -1427,6 +2303,7 @@
     bindEvents();
     refreshDevices();
     refreshScripts();
+    refreshSerialPorts();
     refreshTasks();
     refreshServerStatus();
     state._pollDevices = setInterval(refreshDevices, 3000);

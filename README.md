@@ -17,10 +17,16 @@
 - 任务控制:运行 / 中断 / 硬停 / 重置,所见即所得
 - **IR 序列**:ir_sequences/ 下的 .ini 文件定义按键顺序,前端 modal 选取并绑定到设备
 - **双通道按键注入**:`KEY_*` 走 sendevent 直写 event 设备(需 userdebug/root);`KEYCODE_*` 走上层 `adb shell input keyevent`(**user 版固件可用**,含 23 个厂商键 + 26 个安卓原生键 + 透传)
-- **脚本参数前端可配**:脚本用 `PARAMS` 自描述可配置项(循环次数、等待时长等),前端自动识别并弹出配置窗口,按 **设备 × 脚本** 独立保存到 localStorage
+- **脚本参数前端可配**:脚本用 `PARAMS` 自描述可配置项(循环次数、等待时长、传感器序列等),前端自动识别并弹出配置窗口,支持 `select` 下拉框类型,按 **设备 × 脚本** 独立保存到 localStorage
 - **WiFi 压测脚本**:wifi_onoff / wifi_reboot / wifi_switch 三个独立脚本,覆盖开关、重启重连、多网络循环切换
+- **蓝牙回连压测脚本**:bt_reboot_stress — 重启投影仪后检测**蓝牙音箱 A2DP 是否自动回连**(连好音箱后跑),判定 = 蓝牙适配器已开启 + 音箱真正连上;仿 wifi_reboot,可配循环次数/回连超时
+- **传感器压测脚本**:sensor_reboot_stress — 重启投影仪后检测 gsensor / ToF 回连,可配置选哪种传感器、循环次数与设备上线超时(采集窗口/检测次数/通过阈值硬编码)
+- **APP 冷热启动压测脚本**:app_launch_stress — 冷/热启动耗时压测(冷:force-stop 后测冷启动;热:HOME 退到后台后测回到前台),主指标 `am start -W` TotalTime + logcat Displayed 交叉验证,可按 p95 阈值判定(被测 APP 硬编码脚本顶部 `APP_PRESETS`,**内置 Netflix / Prime Video / YouTube TV 三个一起跑**)
+- **性能监控脚本(实时曲线)**:perf_monitor — CPU/GPU/内存% + 前台APP CPU% 实时监控,日志面板顶部实时曲线图,一键导出 log.txt + csv + png
+- **电池充放电压测脚本(实时曲线)**:battery_inout_stress — **充电/放电分开跑**,电量/温度/电压实时监控(电量靠串口开启 health 轮询),前端电量+温度双曲线,保留跳变/温控检测,**充到 100% 稳定或设备关机自动停**
+- **每任务三源日志采集(v2.6.0)**:每次跑脚本,**服务端自动**同时采集 **stdout**(脚本输出)+ **logcat**(设备系统日志,恒开);设备卡勾选后**额外**采集**串口 console**(COM 口)。三份日志自动落盘并归档,**脚本不用做任何事**(前端只显示 stdout)
 
-后端 + 前端 + 脚本合计约 **4700 行代码**(server.py 923 + app.js 1439 + style.css 715 + index.html 138 + ir_runner.py 614 + wifi_* 853)。
+后端 + 前端 + 脚本合计约 **9800 行代码**(server.py 2528 + app.js 2317 + style.css 872 + index.html 155 + ir_runner.py 617 + wifi_* 854 + sensor_reboot_stress.py 521 + app_launch_stress.py 599 + perf_monitor.py 513 + battery_inout_stress.py 601 + bt_reboot_stress.py 225)。
 
 ---
 
@@ -35,8 +41,13 @@
 ### 2. 安装依赖
 
 ```cmd
-pip install fastapi uvicorn pydantic
+pip install fastapi uvicorn pydantic pyserial
 ```
+
+> `pyserial` 是**串口功能**用的(枚举 COM 口 + 电池脚本开串口),不装的话其它一切正常,
+> **只是设备卡上的 COM 下拉框永远是空的**。装的时候要用**启动服务端的那个 Python** ——
+> `start.bat` 挑的是 PATH 里第一个 `python`,不一定是你在 conda 里装过的那个。
+> 服务端窗口启动时会打印 `[OK] Python: xxx at <路径>`,以它为准。
 
 ### 3. 启动
 
@@ -71,6 +82,107 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 8. 点 ir_runner 卡上的 `▶ 跑` 按钮 → 跑该脚本(要先点设备卡使其"选中",否则按钮隐藏)
 
 ---
+
+## 日志采集(logcat / 串口)
+
+**每个任务都会自动采集三样东西,不需要在脚本里写任何代码:**
+
+| 通道 | 何时采 | 内容 |
+|---|---|---|
+| **stdout** | 每个任务 | 脚本自己打印的东西(就是你以前看到的日志) |
+| **logcat** | 每个任务**自动开启** | 设备系统日志(`adb logcat -v threadtime`,信息级及以上) |
+| **串口** | **仅当你勾选时** | 设备调试串口 console(需要 USB 转串口线接到电脑) |
+
+### 怎么看
+
+**日志栏只显示 stdout**,永远如此 —— logcat 和串口体量太大,不做前端展示(用户 2026-09-11 决定)。它们只在后台采集 + 归档。
+
+任务结束时,日志栏最后会出现**一行归档摘要**,告诉你存到哪了、每个通道采了多少行:
+
+```
+[archive] 20260911-123312_perf_monitor_B0403374A2A508001F00/ | stdout 22L | logcat 8L | serial 0L | report.json
+```
+
+某个通道出问题时会带上原因,例如 `serial 0L (failed: port not present)`;logcat 被体积上限截断会显示 `capped`。**这一行是串口到底采到没有的唯一信号**,别忽略它。
+
+### 串口怎么开
+
+设备卡上有 **`串口日志` 勾选框 + COM 口下拉框**:
+
+1. 插好 USB 转串口线,下拉框会自动列出电脑上的 COM 口(如 `COM9`);下拉框为空说明没装 `pyserial` 或没插线
+2. 勾上 `串口日志`,选好 COM 口 → **该设备的下一次任务**会同时采集串口
+3. 选中的 COM 口会被记住(下次打开还在),**勾选状态不会记住**(避免下次误开)
+4. 任务运行中控件会锁定,改不了
+
+> **注意**:如果某个脚本**自己要用串口**(目前只有 `battery_inout_stress`),勾选框会**自动禁用**并提示"平台串口抓取已自动让位"。这是故意的 —— 抢口会让电池保活失败、电量曲线变平。
+
+**logcat 默认上限 1GB**(长测保护),超了会在文件末尾写明并停止采集。想调整:`PPTP_LOGCAT_MAX_MB=2048` 后再启动服务。参考量级:**空闲时约 1.6 行/秒,但一次重启的开机风暴就有约 1.3MB**(相差两个数量级)—— 三个重启类脚本默认 100 轮,约 128MB。
+
+### 什么时候会"断",断了会怎样
+
+**设备重启、adb 掉线对压测脚本来说是正常的** —— 平台会自动把三条链路接回来,你不需要做任何事:
+
+| 断了什么 | 平台怎么处理 | 你能看到什么 |
+|---|---|---|
+| **logcat** | 自动重启采集,最多 60 次连续重试(约 2 分钟),每次回读 2000 行把开机日志捡回来 | `logcat.log` 里一行 `--- logcat capture restart #N ---` |
+| **串口** | 自动重新打开端口,同样最多 60 次连续重试;收到数据即重置预算 | `serial.log` 里一行 `--- serial capture reconnecting #N ---` |
+| **adb 认不回设备** | 每 20 秒发一次 `adb reconnect offline`(只影响离线设备,**不打扰其它正在跑的脚本**) | 服务端控制台 |
+| **日志流(网页)** | 服务端发现连接卡死会**主动关掉**,浏览器随即自动重连 | 网页日志自己接上 |
+
+**设备卡不会因为掉线或重启消失** —— 它会变成「临时离线 · 任务在跑」的样子,任务卡也一直在。
+
+真实重启约造成 20-30 秒的缺口,这是设备关机的时间,不可避免;缺口在日志文件里都留了 marker 行,事后查得到。
+
+---
+
+## 自动存档
+
+**每个任务一结束,产物全部自动归拢到一个文件夹,永久保留,不需要手动导出。**
+
+### 存档在哪
+
+项目根目录下的 `archive/`,**按模块分类**,一次运行一个文件夹,名字一眼能认:
+
+```
+archive/
+├── wifi/
+│   └── 20260911-124233_wifi_reboot_stress_B0403374A2A508001F00/
+│       ├── stdout.log      脚本输出
+│       ├── logcat.log      设备系统日志
+│       ├── serial.log      串口 console(勾选了才有内容)
+│       ├── report.json     脚本自己写的压测报告
+│       ├── chart.png       性能图表(perf_monitor / battery 才有)
+│       └── summary.json    清单:参数/状态/耗时/各文件行数/备注
+├── perf/    battery/    sensor/    app-launch/    ir/    bt/
+```
+
+模块划分(`wifi` / `sensor` / `perf` / `battery` / `app-launch` / `ir` / `bt`)和 `reports/` 一致。
+
+**怎么打开**:顶栏的 **`打开存档`** 按钮(直接弹资源管理器),或任务卡右上角的 **`存档`** 按钮(跳到那一次运行)。顶栏还会显示总占用(如 `存档 1.2 GB · 37 个`),鼠标悬停可看各模块分别占多少。
+
+### 关于图表
+
+图表由**浏览器**渲染 —— 平台后端没有画图能力(不想为一张图引入第二套渲染)。所以:
+
+- 任务结束时浏览器开着 → 归档里有 `chart.png`(和你屏幕上看到的完全一致)
+- 任务结束时浏览器没开 → **没有图**,但三份日志 + `report.json` 都在,`summary.json` 会写明缺图
+- 事后打开页面看那个任务,平台会**自动补传**图表
+
+### 关于清理
+
+- **不做任何自动删除**,存档永久保留,磁盘占用在界面上可见
+- 任务卡上的 `×` 和「**清空已完成的卡片**」**只从列表移除卡片,不动存档** —— 这是故意的,避免一次误点把要保留的数据删掉
+- 想真正删:去 `archive/` 目录手动删
+
+> **`logs/` 和 `reports/` 不用管,也不能删**:
+> `logs/` 是运行期暂存区(日志和报告先落这里,任务结束**搬进** `archive/`)+ 服务自身日志
+> (`server.out.log`/`server.err.log`);`reports/` 是**脚本契约** —— 脚本脱离平台用命令行单独跑时也写
+> 这里。**走平台跑的话这两个目录平时都是空的** —— 东西全被搬进 `archive/` 了。
+> **你要找的东西永远在 `archive/` 里**,这两个是实现细节。
+
+### 导出按钮呢
+
+**已隐藏** —— 自动存档取代了它。代码保留着,以后需要可以把 `static/index.html` 里 `#btn-export-log` 的 `hidden` 去掉。
 
 ## IR 序列(可选高级功能)
 
@@ -151,7 +263,14 @@ PARAMS = [
 ]
 ```
 
-字段键:`name` / `label` / `type`(`int`/`float`/`bool`/`str`)/ `default` / `min` / `max`。配置值按 **设备 × 脚本** 独立保存,互不干扰。平台通过跑 `python 脚本.py --dump-params` 读取这份自描述 schema,缓存按 `(脚本名, mtime)` 失效。
+字段键:`name` / `label` / `type` / `default` / `min` / `max`。`type` 支持 `int` / `float` / `bool` / `str`,以及 **`select`(下拉框)**——下拉框需配 `choices` 列表(字符串或 `{value, label}` 对象),例如传感器序列选择:
+
+```python
+{"name": "sensor", "label": "传感器序列", "type": "select",
+ "choices": ["gsensor", "tof"], "default": "gsensor"}
+```
+
+配置值按 **设备 × 脚本** 独立保存,互不干扰。平台通过跑 `python 脚本.py --dump-params` 读取这份自描述 schema,缓存按 `(脚本名, mtime)` 失效。
 
 ---
 
@@ -174,6 +293,127 @@ PARAMS = [
 
 ---
 
+## 蓝牙回连压测脚本(bt_reboot_stress)
+
+重启投影仪后检测**蓝牙音箱是否自动回连**。先在投影仪蓝牙设置里把音箱连上(当前实测 BOGASING-G4),再跑本脚本。每轮:重启 → 等设备上线 → **轮询蓝牙 A2DP 回连**(每 5s 查一次,最多 `bt_reconnect_timeout` 秒)→ 音箱连上即 PASS。
+
+| 脚本 | 测什么 | 可配参数 |
+|---|---|---|
+| `bt_reboot_stress.py` | adb 重启循环:重启 → 等设备上线 → 等蓝牙音箱 A2DP 回连 | `iterations` `wait_sec` `bt_reconnect_timeout` `back_online_timeout` |
+
+要点:
+
+- **回连判定**:`dumpsys bluetooth_manager` —— 要求蓝牙适配器已开启(`enabled: true`)**且**至少一个 A2DP 状态机处于 `mConnectionState: CONNECTED`。光"蓝牙开着"不算回连,必须音箱真正连上。真机实测正常回连 ~6s。
+- **注意**:音箱刚连上后立即重启,回连可能失败(疑似音箱休眠 / 连接未稳定);在蓝牙设置里**重新手动连一次**后再重启,回连即恢复正常。因此正式压测前建议先手动确认音箱能连上。
+- **不做开关回连**:本设备蓝牙开关未对用户开放,用户无法手动关蓝牙,所以只测"重启后自动回连",不测"关蓝牙→开蓝牙"。
+
+---
+
+## 传感器压测脚本(sensor_reboot_stress)
+
+重启投影仪后检测指定传感器是否回连。每轮:重启 → 等设备上线 → 循环检测传感器是否能读到有效数据。报告 JSON 落在 `reports/stress-test/sensor/`(已 gitignore)。
+
+| 可配参数 | 说明 | 默认 |
+|---|---|---|
+| `sensor` | **传感器序列(下拉框)**:`gsensor` / `tof` | `gsensor` |
+| `iterations` | 循环次数 | `100` |
+| `reboot_timeout` | 设备上线超时(秒) | `80` |
+
+以下为**硬编码常量**(改脚本顶部,按项目决策不做成前端参数):`SENSOR_WINDOW`(采集窗口 5s)、`POLL_COUNT`(上线后检测 8 次)、`POLL_INTERVAL`(检测间隔 3s)、`PASS_THRESHOLD`(通过阈值 98%)。
+
+要点:
+
+- **gsensor**:`cat /dev/gsensor`,每行 7 个逗号分隔整数,第 7 字段为有效加速度(静止约 9800 mm/s²),窗口内至少 3 个有效样本判 OK。
+- **ToF**:`cat /sys/class/nd_tof/nds01/ranging_data_fast`,能解析出 `depth:` 即 OK。
+- **su 适配**:本设备 su 是"裸 su"(`su -c` 报 `invalid uid/gid -c`),读取会依次尝试多种 su 方式,最终回退到 **stdin 管道交互式 su**(复刻手动 `adb shell` → `su` → `cat` 流程)。运行时会打印实际生效的读取方式。
+- **判定**:成功率 ≥ `PASS_THRESHOLD`(硬编码 98%)判 PASS;退出码 0 = PASS,非 0 = FAIL。中断时打印已完成汇总,不做 PASS/FAIL 判定。
+
+---
+
+## APP 冷热启动压测脚本(app_launch_stress)
+
+测量目标 APP 冷启动 / 热启动耗时(到首帧)。**"要跑就三个一起跑"**:脚本顶部 `APP_PRESETS` 内置 Netflix / Prime Video / YouTube TV 三个(含各自启动 Activity,可留空自动解析),按顺序**每个 APP 各跑 `iterations` 轮**。报告 JSON 落在 `reports/stress-test/app-launch/`(已 gitignore),**每个 APP 一份**(`app_launch_<mode>_<label>_*.json`)。
+
+| 可配参数 | 说明 | 默认 |
+|---|---|---|
+| `mode` | **启动方式(下拉框)**:`cold`(冷)/ `hot`(热),冷热分开跑 | `cold` |
+| `iterations` | **每 APP** 循环次数 | `100` |
+| `settle_sec` | 每次启动后停留(秒),让 APP 稳定后再进入下一轮 | `3` |
+| `gap_sec` | 每次启动前等待(秒) | `1` |
+| `launch_timeout` | 单次启动超时(秒) | `20` |
+| `p95_threshold_ms` | **判定阈值**:每个 APP 有效样本 p95 ≤ 此值判该 APP PASS;`0` = 不判定 | `2000` |
+
+**被测 APP 硬编码在脚本顶部的 `APP_PRESETS` 列表**(按项目决策不做成前端参数):要换 APP / 改名单,直接编辑列表(加 `label` / `package` / `activity` 即可)。
+
+要点:
+
+- **冷启动**:每轮先 `am force-stop` + `pidof` 确认后台进程已死,再 `am start -W` 测冷启动时间。
+- **热启动**:每个 APP 开始前确保进程存活(若死了先冷拉起一次,**不计入样本**);每轮先按 HOME 退到后台,再拉起测回到前台时间。
+- **测什么**:主指标 = `am start -W` 的 `TotalTime`(ms);同时清空并抓 logcat `Displayed` 交叉验证(冷启动必有;热启动窗口不重建,通常没有,缺失时以语义校验为准)。Android 12+ 还会打印 `LaunchState: COLD/WARM/HOT`,脚本**硬校验**与所选模式一致——冷启动却拿到 HOT(进程没杀干净)、热启动却拿到 COLD(进程死了),该轮直接判 NG 不计入样本;系统没报状态(`UNKNOWN`/空)时以进程级校验(force-stop / pidof)为准。
+- **判定**:每个 APP 各自 p95 ≤ `p95_threshold_ms` 判该 APP PASS,**整体全过才 PASS**;中途某个 APP 无法解析启动 Activity 也会判 FAIL。退出码 0 = PASS,非 0 = FAIL。中断时打印已完成汇总,不做 PASS/FAIL 判定。
+- **屏幕**:启动时 `KEYCODE_WAKEUP` + `svc power stayon true`,避免息屏/灭屏污染启动耗时。
+
+---
+
+## 性能监控脚本(perf_monitor)
+
+手工测试 / 播放 APP 时,实时监控设备 **CPU / GPU / 内存** 使用率 + **前台 APP 的 CPU%**。选脚本后点设备卡上的"▶ 跑",**日志面板顶部会切出一块实时曲线图**(200px,和日志一起随任务绑定;切走不残留,切回来从重放重建)。
+
+| 可配参数 | 说明 | 默认 |
+|---|---|---|
+| `interval_sec` | 采样间隔(秒) | `2.0` |
+| `duration_sec` | 时长(秒);`0` = 手动停止 | `0` |
+| `track_foreground` | 是否跟踪前台 APP 的 CPU%(耗时更长) | `true` |
+
+**四条曲线(颜色区分):** CPU 蓝 / GPU 绿 / MEM 黄 / 前台APP 红。GPU 或前台系列不可用(节点读不到 / 参数关闭)时自动隐藏对应曲线。
+
+- **X 轴 = 固定 1h 滚动窗口(墙钟时间)**:标签 HH:MM:SS;始终显示最近 1 小时、约 6 个 10min 刻度(`interval:10min` + `splitNumber:6` + `hideOverlap`),右缘跟随最新样本滚动,超窗数据点自动剔除。完整历史仍保留在缓冲里供 CSV 导出与**全程图 PNG 导出**。**不支持手动缩放**(固定窗口与 dataZoom 互斥)
+- **Y 轴分两根**:左侧主轴 0-100% 给 CPU / GPU / MEM;前台APP 用右侧独立轴 0-400% —— `top` 的多核 %CPU 可以超 100(实测 116-123%),单轴会顶格裁切。原需求本就允许"Y 轴可以不同"
+- **长时检测友好**:采样缓冲上限 86400(24h@2s 全量保留);**导出的 chart.png 是全程图**(时间轴 = 任务从开始到结束的完整范围,横轴 0.5h 一个刻度),不再受屏幕 1h 实时窗口限制
+
+**数据源(MT9676 真机探明;需说明:本机实为 MT9676,`ro.soc.model=MT9676 / ro.hardware=mt5896 / egl=mali.mt5873`):**
+
+- **CPU%** `/proc/stat` 累计计数器差值(免 root)
+- **内存%** `/proc/meminfo` `MemAvailable/MemTotal`(系统整体,免 root;本机仅 ~1.75GB RAM,此指标很有意义)
+- **GPU%** `/sys/kernel/debug/mali0/dvfs_utilization` `busy_time/idle_time` 差值(**需 root**,`su 0 <cmd>`)
+- **GPU 频率**(附带) `mali0/gpu_clock`;前台 APP CPU% `dumpsys window` 取包名 + `top -n 1 -b | grep <pkg>` 解析
+
+**一键导出三件**:点击"导出"按钮,除原有 log.txt(含原始 `PERF|` 采样行)外,同时下载 **perf.csv**(可进 Excel,含 `t_sec` + `t_wall` 墙钟列)+ **chart.png**(深色底 2x 图,**全程时间轴,0.5h 一个刻度**)。Chrome/Edge 单次点击允许多个下载;Firefox 可能拦截后两个,届时分次导出或改用 Chrome。无性能数据的任务只导出 log.txt。
+
+> **wire 契约(v2.4.1 起)**:脚本每采样打印一行 `PERF|{"type":"sample","clock":<epoch_ms>,"t":...,"cpu":...,"gpu":...,"mem":...,"fg_cpu":...,"fg_pkg":...,"gpu_clk":...}`(JSON,ASCII);启动时打印 `PERF|{"type":"meta","sources":{...}}`。前端按 `type:"sample"` 分发进图表 —— 该字段一旦缺失,样本会被当未知类型丢弃,图表不出线、导出只剩 txt(v2.4.1 之前就是因此三条症状一起报)。
+
+> 播放视频时 GPU% 通常接近 0:视频解码走硬件专用解码器,CPU/GPU 主核都处于空闲,这是正常现象,不是监控失效。
+
+---
+
+## 电池充放电压测脚本(battery_inout_stress)
+
+充电或放电过程中实时监控设备 **电量 / 温度 / 电压 / 状态**。**一次只跑充电或放电**(自动插拔做不到):选 `mode` = `charge`(充到 100% 稳定自动停)或 `discharge`(放电到设备关机自动停)。曲线只含 **电量 + 温度** 两条(perf_monitor 同款实时图表),报告 JSON 落在 `reports/stress-test/battery/`(已 gitignore)。
+
+| 可配参数 | 说明 | 默认 |
+|---|---|---|
+| `mode` | **充/放电(下拉框)**:`charge` / `discharge` | `charge` |
+| `serial_port` | **串口 COM(下拉框,运行时枚举)**:电量靠串口开启 health 轮询才实时 | `(空)` |
+| `interval_sec` | 采样间隔(秒) | `10.0` |
+| `temp_warn_c` | 温控告警阈值(°C,达到则告警) | `45.0` |
+| `full_hold_sec` | 100% 稳定窗口(秒):满 100% 连续保持该时长才停;`0` = 一到 100% 就停 | `60` |
+
+**为什么必须选串口**:本机 `ro.config.batteryless=true`,电池由外部 BMS MCU 管理,`dumpsys battery` 默认只显示缓存值。开启 health 轮询的 `set polling true` 受 SELinux 限制,adb shell 执行报 `Failed transaction 2147483646`,**只有串口 console root shell 能开**(波特率 115200)。开启后 dumpsys 才实时刷新。试跑时确认 PC 上哪个 COM 口连到投影仪串口,在前端下拉框选它(选错/未选时脚本告警并继续用缓存值,曲线可能近似直线)。
+
+**中止条件**(单次):① 手动"中断";② 充电到 **100% 稳定**(status=full,或连续满 100% 达 `full_hold_sec`);③ **设备关机**(连续 2 次读电池失败,adb 失联)。
+
+**保留的错误检测**:电量**跳变检测**(方向感知:充电时骤降 / 放电时骤升 / 状态未知大跳变都标异常,`[batt] warning: level jump [...]` + 报告 `summary.jump_counts`)+ **温控告警**。
+
+**曲线(前端)**:`电量` 蓝(左轴 0-100%)+ `温度` 红(右轴 °C),固定 1h 滚动窗口(6×10min 刻度,同 perf_monitor);控制台可读行为英文 `[batt] 15:20:55 (10.0s) level=57% temp=40.8C voltage=11.6V status=charging`,跳变时追加 ` [!] jump[异常降低] 57->55%`(jump_type 为脚本 ASCII 字段)。
+
+**一键导出三件**:log.txt(含原始 `PERF|` 采样行)+ **batt.csv**(表头 `t_sec,t_wall,level_percent,temp_c,voltage_mv,status,jump_delta,jump_type`)+ **chart.png**(全程图,横轴 0.5h 一个刻度)。同 perf_monitor,Chrome/Edge 一次下载三个,Firefox 可能拦后两个。**不输出 Excel**。
+
+**放电测试结束后的设备卡**:放电模式以"设备关机"自动停,任务结束后设备不在 `adb devices`,平台会保留一张 **"放电关机"专用卡**(虚线红边 + "设备已关机"状态 + "放电关机"徽标,仿重启测试的"临时离线"卡)——测完卡片不消失;重新开机后自动恢复在线卡,删除对应任务后卡片移除。
+
+> **语言规则**:脚本文件 100% 英文/ASCII(含参数标签);前端 UI 文案用中文,**但日志控制台(#log-console)输出全英文**(v2.5.1 起)。因此电池脚本的**参数弹窗标签是英文**,这是"代码文件无中文"规则的直接结果。
+
+---
+
 ## 状态持久化(localStorage)
 
 平台会把以下用户选择存到浏览器 localStorage,F5 刷新后保留:
@@ -193,35 +433,52 @@ key 名:`pptp.deviceState.v1`,存在 `localStorage` 里。
 
 ```
 ProjectorPressureTest/
-├── server.py              # 后端单文件 (FastAPI, 870 行)
+├── server.py              # 后端单文件 (FastAPI, 2084 行)
 ├── start.bat              # 一键启动(启动成功自动关闭,失败保留信息)
 ├── server_window.ps1      # PPTP-Server 窗口脚本(实时显示 uvicorn 日志 + 写文件)
 ├── stop.bat               # 一键停止
 ├── README.md              # 本文档
 ├── docs/
-│   ├── HANDOFF_PROMPT.md # 完整信息源(API、数据模型、设计决策)
+│   ├── HANDOFF_PROMPT.md # 完整信息源(API、数据模型、设计决策、踩坑)
+│   ├── SIMPLE-ARCHITECTURE.md  # 架构总览(数据流、脚本契约;活跃)
+│   ├── FRONTEND_UX.md    # 前端交互设计沉淀(为什么这样做;活跃)
 │   ├── SIMPLE-PRD.md     # 初版 v2.0 设计 PRD(已归档)
-│   ├── SIMPLE-PLAN.md     # 初版 1.5 天实施计划(已归档)
-│   └── SIMPLE-ARCHITECTURE.md  # 初版架构图(已归档)
+│   └── SIMPLE-PLAN.md    # 初版 1.5 天实施计划(已归档)
 ├── static/
 │   ├── index.html         # 单页 HTML
 │   ├── app.js             # 前端逻辑 IIFE
-│   └── style.css          # 样式
+│   ├── style.css          # 样式
+│   └── vendor/
+│       └── echarts.min.js # ECharts 5.5.1 本地化(性能监控图表,~1MB,pin 版本)
 ├── scripts/               # 压测脚本
 │   ├── ir_runner.py             # 红外序列(自包含:IRRemote 内联,默认无限循环,双通道注入,长按=down+hold+up)
 │   ├── wifi_onoff_stress.py     # WiFi 开关压力(关/开循环 + wpa_cli 扫描,参数可配)
 │   ├── wifi_reboot_stress.py    # WiFi 重启压力(reboot + 上线等待,参数可配)
-│   └── wifi_switch_stress.py    # WiFi 多网络循环切换(预置列表,参数可配)
+│   ├── wifi_switch_stress.py    # WiFi 多网络循环切换(预置列表,参数可配)
+│   ├── sensor_reboot_stress.py  # 重启 + 传感器(gsensor/ToF)回连压测,参数可配(含传感器序列下拉框)
+│   ├── app_launch_stress.py     # APP 冷/热启动耗时压测(APP_PRESETS 内置 3 个 APP 一起跑,am start -W TotalTime + logcat Displayed)
+│   ├── perf_monitor.py          # 性能监控(CPU/GPU/内存% + 前台APP CPU%,PERF| 采样流 → 前端实时图表)
+│   ├── battery_inout_stress.py  # 电池充放电压测(充电/放电分开跑,电量/温度/电压,PERF| 采样流 → 前端电量+温度曲线,串口开 health 轮询)
+│   └── bt_reboot_stress.py      # 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询音箱回连,参数可配)
 ├── ir_sequences/          # IR 序列 .ini 文件
 │   ├── 1.ini                    # 当前默认序列(KEY_VCR + KEYCODE_HDMI,5 字段格式)
 │   └── KEY_REFERENCE.md         # 按键速查三张表:KEY_* 24 + KEYCODE_* 厂商 23 + 原生 26(手动维护)
-├── reports/               # 压测报告 JSON(脚本自动生成,gitignore)
-│   └── stress-test/wifi/        # WiFi 脚本报告(wifi_switch_*.json / wifi_cycle_*.json)
-└── logs/                  # 运行时日志
-    ├── server.out.log     # uvicorn stdout
-    ├── server.err.log     # uvicorn stderr
-    └── <task_id>.log      # 每个任务的完整日志
+├── reports/               # 脚本写报告的原始位置(脚本契约,gitignore)
+│   └── stress-test/{wifi,sensor,app-launch,perf,battery}/   # 平台运行时会复制一份进存档
+├── logs/                  # 运行期临时工作区(任务结束后内容会被搬进 archive/)+ 服务日志
+│   ├── server.out.log / server.err.log
+│   └── <task_id>_<时间>_<脚本>_<设备>.{log,logcat.log,serial.log}
+└── archive/               # ★ 任务存档(永久保留,按模块分类)
+    └── <模块>/{wifi,perf,battery,sensor,app-launch,ir,bt,other}/
+        └── <时间>_<脚本>_<设备>/
+            ├── stdout.log / logcat.log / serial.log
+            ├── report.json    #   脚本报告(从 reports/ 复制过来)
+            ├── chart.png      #   性能图表(浏览器渲染回传,perf/battery 才有)
+            └── summary.json   #   清单:参数/状态/耗时/各文件行数/备注
 ```
+
+> **用户只需要看 `archive/`。** `logs/` 与 `reports/` 都不能删:`logs/` 是运行期工作区 + 服务自身日志;
+> `reports/` 是脚本契约(脚本独立 CLI 跑时也写这里),平台运行时把报告**搬**进存档。
 
 ---
 
@@ -248,9 +505,13 @@ ProjectorPressureTest/
 | POST | `/api/adb/reconnect` | adb kill-server + start-server |
 | GET | `/api/tasks` | 全部任务状态 |
 | GET | `/api/tasks/{id}` | 单任务 |
-| GET | `/api/tasks/{id}/log` | 任务完整日志(导出用) |
-| DELETE | `/api/tasks/{id}` | 单任务删除 |
-| WS | `/ws/logs/{id}` | 实时 stdout 推送(RAF 批处理) |
+| GET | `/api/tasks/{id}/log?source=` | 单通道日志尾部读(默认 `stdout`;`logcat` / `serial`;非法 source → 400) |
+| DELETE | `/api/tasks/{id}` | 从列表移除任务(存档保留) |
+| GET | `/api/serial/ports` | 本机 COM 口列表(串口勾选框用;无 pyserial → 空列表) |
+| POST | `/api/tasks/{id}/archive/artifact` | 浏览器回传图表 PNG 进存档(名称白名单 + 8MB 上限) |
+| POST | `/api/tasks/{id}/archive/reveal` · `/api/archive/reveal` | 资源管理器打开某任务存档 / 存档根目录 |
+| GET | `/api/archive/stats` | 存档总数与总占用 |
+| WS | `/ws/logs/{id}?sources=` | 实时推送(RAF 批处理);前端只用默认的 `stdout` |
 
 完整数据模型、状态机、bug 历史见 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md)。
 
@@ -261,14 +522,26 @@ ProjectorPressureTest/
 - 设备列表为空
   确认命令行 `adb devices` 能看到设备。
 
+- **找不到日志**
+  去 `archive/<时间>_<脚本>_<设备>/`(任务卡上有 `存档` 按钮直接打开)。`logs/` 只是运行期临时目录,任务一结束内容就搬走了。
+
 - 脚本运行报错
-  看 logs/<task_id>.log,或前端日志面板。
+  看该任务存档里的 `stdout.log`,或前端日志面板。
+
+- 存档里没有 `chart.png`
+  跑完的时候浏览器没开着。图表由浏览器渲染(Tab 关了就画不出来),事后重新打开页面看那个任务会自动补传。三份日志和 `report.json` 不受影响。
+
+- 串口下拉框是空的
+  没装 pyserial(`pip install pyserial`)或没插 USB 转串口线。命令行 `python -m serial.tools.list_ports -v` 可确认。
+
+- **想知道串口到底采到没有**
+  看任务结束时日志栏最后那行 `[archive] ...`,里面有每个通道的行数;异常会带原因(如 `serial 0L (failed: port not present)`)。
 
 - 端口 8000 被占用
   跑 stop.bat,或手动 `netstat -ano | findstr :8000` 找进程杀掉。
 
 - 想彻底重置
-  跑顶栏"重置"按钮(杀所有任务 + 重启 ADB),或手动删 logs/*.log。
+  跑顶栏"重置"按钮(杀所有任务 + 重启 ADB)。**注意:重置不会删 `archive/`**,存档要清理得手动去目录里删。
 
 - ir_runner 跑起来报 "Key not found" 或 "not in CODE_NUM_MAP"
   检查 ini 里 `code` 字段是否在 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md) 三张表内:
@@ -282,6 +555,9 @@ ProjectorPressureTest/
 - WiFi 脚本扫不到网络 / 连接报 SecurityException
   本设备上 wpa_cli 扫描和 `cmd wifi connect-network` 都需要 root。确认脚本参数里 `use_su` 开着(默认 true);若设备免 root,手动关掉再跑。su 用 AOSP 风格 `su 0 <cmd>`,`su -c` 在本设备会报 `invalid uid/gid '-c'`。
 
+- sensor_reboot 读不到传感器数据
+  传感器节点(`/dev/gsensor` / `sys/class/nd_tof/...`)需要 root/su 才能读。本设备 su 是"裸 su",脚本会自动尝试多种 su 方式(含 stdin 交互式 su),运行日志会打印实际生效的读取方式;若全部失败,先确认设备已开 root/su。`dumpsys sensorservice` 拿不到这类节点数据。
+
 - 长按没生效 / 设备无响应
   默认 IR event 路径是 `/dev/input/event1`(从原 keyevent.txt 推断)。如果你的设备 event 路径不同:
   - CLI 调试: 加 `--device-event-path /dev/input/eventN`
@@ -292,13 +568,16 @@ ProjectorPressureTest/
   当前平台透传的 `--device-event-path` 还没接(改中)。临时方案:设环境变量后重启 uvicorn,所有 ir_runner 任务都会读到。
 
 - 想改平台代码后没生效
-  浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.2.0` + NoCache 中间件,普通 F5 可能拿到缓存)。
+  浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.5.1` + NoCache 中间件,普通 F5 可能拿到缓存)。
+
+- battery_inout_stress 电量曲线像直线 / 报"polling not enabled"
+  确认串口选对了:电量由外部 BMS 管理,必须通过串口 console 开 health 轮询才实时。选错 COM / 串口终端软件占着口 / 波特率不对都会导致开启失败,脚本会打印 `[batt] warning` 并继续用缓存值。先关掉串口终端软件,再在参数弹窗里选对 COM 口重跑。
 
 ---
 
 ## 后续(本期不做)
 
-本期已实现:设备列表、脚本列表、IR 序列选择 + 创建、modal 配置、脚本参数前端可配(params,按 设备×脚本 独立持久化)、WiFi 压测脚本(wifi_onoff / wifi_reboot / wifi_switch)、localStorage 持久化、强制停止、重启 ADB、KEYCODE_* 上层注入(厂商 23 + 原生 26 + 透传,user 版可用)。
+本期已实现:设备列表、脚本列表、IR 序列选择 + 创建、modal 配置、脚本参数前端可配(params,按 设备×脚本 独立持久化,含 `select` 下拉框类型)、WiFi 压测脚本(wifi_onoff / wifi_reboot / wifi_switch)、传感器压测脚本(sensor_reboot_stress,gsensor / ToF)、APP 冷热启动压测脚本(app_launch_stress,cold / hot 分开跑,APP_PRESETS 内置 Netflix / Prime Video / YouTube TV 三个一起跑,am start -W TotalTime + logcat Displayed 交叉验证,每 APP 各自 p95 判定、整体全过才 PASS)、性能监控脚本(perf_monitor,CPU/GPU/内存% + 前台APP CPU%,实时图表 + 三件套导出)、电池充放电压测脚本(battery_inout_stress,充电/放电分开跑,电量/温度/电压实时监控,电量靠串口开 health 轮询,100% 稳定或关机自动停,跳变/温控检测保留)、localStorage 持久化、强制停止、重启 ADB、KEYCODE_* 上层注入(厂商 23 + 原生 26 + 透传,user 版可用)。
 
 本期仍不做:
 - 报告生成、历史日志检索
