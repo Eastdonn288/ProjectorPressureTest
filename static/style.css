@@ -345,7 +345,8 @@ html, body {
 /* ===== Device card - serial capture opt-in (v2.6.0) ===== */
 /* The padding/border are always present (transparent when off) so toggling the
    checkbox highlights the row without nudging the card's layout. */
-.device-row4 {
+.device-row4,
+.device-row5 {
   display: flex; align-items: center; gap: 8px;
   padding: 3px 6px;
   margin-bottom: 6px;

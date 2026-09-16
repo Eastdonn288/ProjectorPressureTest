@@ -124,14 +124,22 @@ ARCHIVE_MODULE_FALLBACK = "other"
 ARCHIVE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
 ARCHIVE_UPLOADS = ("chart.png", "perf.csv")
 
-# Scripts that write their own JSON report under reports/stress-test/. Used only
-# to explain a MISSING report in summary.json ("this script writes no report"
-# vs "the report is missing") - the server never reads the list to find one.
+# Scripts that write their own JSON report under reports/stress-test/. Two jobs,
+# and the second one is easy to miss:
+#   1. it words the "no report" note in summary.json ("this script writes no
+#      report" vs "the report is missing");
+#   2. it is the ADMISSION GATE for the mtime fallback scan in
+#      _find_task_reports() - a hard kill can skip the script's own
+#      `report :` line, and the fallback only looks for scripts listed here.
+# So a report-writing script missing from this set loses its report, silently,
+# in exactly the case the fallback exists for. Keep it in step with scripts/.
 REPORT_WRITING_SCRIPTS = frozenset({
     "app_launch_stress.py",
     "battery_inout_stress.py",
+    "bt_reboot_stress.py",
     "perf_monitor.py",
     "sensor_reboot_stress.py",
+    "wifi_reboot_stress.py",
     "wifi_onoff_stress.py",
     "wifi_switch_stress.py",
 })
@@ -300,7 +308,7 @@ WS_SUBS: dict[int, set[str]] = {}
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="PPTP", version="2.7.4")
+app = FastAPI(title="PPTP", version="2.10.0")
 
 # Disable HTTP caching for static files (dev mode)
 app.add_middleware(NoCacheMiddleware)
@@ -1380,6 +1388,30 @@ def _archive_task(task_id: str, reason: str) -> None:
         if len(report_srcs) > 1:
             notes.append(f"{len(report_srcs)} reports from this run "
                          f"(one per app) - all archived")
+
+        # 2b) The data files written next to the report (perf_monitor v2 emits
+        #     samples.csv + events.csv). They keep their own names: unlike the
+        #     report they are not interchangeable, and the flat name already
+        #     carries the device and timestamp that make them self-describing.
+        #     Without this they would pile up in reports/ forever, since the
+        #     report move above is the only thing that empties that staging area.
+        seen_comp: set[str] = set()
+        for src in report_srcs:
+            for comp in _companion_files(src):
+                key = str(comp.resolve())
+                if key in seen_comp:
+                    continue
+                seen_comp.add(key)
+                try:
+                    shutil.copy2(comp, dest / comp.name)
+                    artifacts[comp.name] = {"bytes": comp.stat().st_size}
+                    try:
+                        comp.unlink()
+                    except Exception:
+                        notes.append(f"{comp.name}: copied, but the original in "
+                                     f"reports/ could not be removed")
+                except Exception as e:
+                    notes.append(f"{comp.name}: copy failed ({type(e).__name__})")
     elif task.get("script") not in REPORT_WRITING_SCRIPTS:
         notes.append("this script writes no report")
     else:
@@ -1431,7 +1463,7 @@ def _archive_task(task_id: str, reason: str) -> None:
 def _sniff_report_path(line: str) -> str | None:
     """Pull `<abs path>` out of a script's `  report : <path>` summary line.
 
-    The label is spelled `report` by all six report-writing scripts; only the
+    The label is spelled `report` by every report-writing script; only the
     column padding differs, so split on the LAST " : " and keep it if it looks
     like a .json path. Validation against REPORTS_DIR happens later, in
     _find_task_reports - this is only a candidate.
@@ -1471,6 +1503,16 @@ async def _broadcast_archive_line(task_id: str) -> None:
             bits[-1] += f" ({st}{': ' + info['detail'] if info.get('detail') else ''})"
     for name in (ARCHIVE_REPORT_NAME, *ARCHIVE_UPLOADS):
         if name in summary["artifacts"]:
+            bits.append(name)
+    # Report sidecars. v2.10.0 gives every report-writing script a Chinese .html
+    # twin of its JSON (perf_monitor had one since v2.9.0; see
+    # docs/REPORT_FORMAT.md). It lands in the archive via _companion_files, but
+    # its name is derived from the report stem, so it cannot be listed as a
+    # constant above. Suffix match is safe: the only .html that ever reaches this
+    # folder is a script's own report twin - nothing else writes one - and this
+    # line is meant to be a faithful inventory of the folder it names.
+    for name in sorted(summary["artifacts"]):
+        if name.lower().endswith(".html"):
             bits.append(name)
 
     arch = task["archive"]
@@ -1569,6 +1611,27 @@ def _find_task_reports(task: dict[str, Any]) -> tuple[list[Path], str | None]:
     return ordered, "mtime_scan"
 
 
+def _companion_files(report: Path) -> list[Path]:
+    """Data files a run wrote next to its report.
+
+    Same directory, same stem, a different extension - perf_monitor v2 writes
+    `perf_<dev>_<ts>.json` plus `.samples.csv`, `.events.csv` and `.html`. Pairing
+    is by exact stem prefix rather than by mtime or name substring so that a run
+    can never pick up a neighbour's data when two runs land in the same second.
+    Returns [] on any error: this feeds archiving, which must never raise.
+    """
+    out: list[Path] = []
+    try:
+        prefix = report.stem + "."
+        for f in report.parent.iterdir():
+            if (f.is_file() and f.suffix.lower() in (".csv", ".html")
+                    and f.name.startswith(prefix)):
+                out.append(f)
+    except Exception:
+        return []
+    return sorted(out)
+
+
 def _parse_dt(s: str | None):
     if not s:
         return None
@@ -1597,6 +1660,9 @@ class RunRequest(BaseModel):
     # Explicit override of the "script owns the port" arbitration: hold the
     # serial port for the whole run even if the script wants it too.
     serial_force: bool = False
+    # Logcat opt-out (v2.7.5). Defaults True so an older frontend that does not
+    # send it keeps exactly today's behaviour (every task captures logcat).
+    logcat_capture: bool = True
 
 
 class SequenceRequest(BaseModel):
@@ -1608,7 +1674,7 @@ class SequenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": "2.7.4", "time": datetime.now().isoformat(timespec="seconds")}
+    return {"ok": True, "version": "2.10.0", "time": datetime.now().isoformat(timespec="seconds")}
 
 
 @app.get("/api/server/status")
@@ -1966,6 +2032,13 @@ async def api_run(req: RunRequest):
         else:
             serial_status = "starting"
 
+    # Logcat opt-out (v2.7.5). The default (capture everything) is right for
+    # stress scripts, where the device-side crash trail is the whole point. It is
+    # wrong for a monitor that runs for hours: an 8-hour run writes ~1GB, nobody
+    # reads a 1GB logcat, and the extra `adb logcat` stream competes with the very
+    # measurements we are taking. Same per-run control shape as the serial opt-in.
+    logcat_status = "starting" if req.logcat_capture else "off"
+
     TASKS[task_id] = {
         "task_id": task_id,
         "device": device,
@@ -1982,7 +2055,8 @@ async def api_run(req: RunRequest):
         "log_files": {s: f"{log_stem}{LOG_SUFFIX[s]}" for s in CAPTURE_SOURCES},
         "captures": {},
         "_proc": proc,
-        "_cap_logcat": _new_capture(active=True, status="starting"),
+        "_cap_logcat": _new_capture(active=(logcat_status == "starting"),
+                                    status=logcat_status),
         "_cap_serial": _new_capture(
             active=(serial_status == "starting"),
             status=serial_status,
@@ -1998,7 +2072,7 @@ async def api_run(req: RunRequest):
     task["captures"] = _public_captures(task)
     task["_reader_task"] = asyncio.create_task(_stream_logs(task_id))
 
-    if LOGCAT_ENABLED:
+    if LOGCAT_ENABLED and logcat_status == "starting":
         task["_cap_logcat_task"] = asyncio.create_task(_capture_logcat(task_id))
     if serial_status == "starting":
         task["_cap_serial_task"] = asyncio.create_task(
@@ -2194,6 +2268,28 @@ def _archive_dir_for(task_id: str) -> Path | None:
     if ARCHIVE_DIR.resolve() not in d.parents:
         return None
     return d if d.is_dir() else None
+
+
+@app.get("/api/tasks/{task_id}/report")
+async def api_task_report(task_id: str):
+    """Serve a run's archived HTML report inline, in a new browser tab.
+
+    The frontend entry point is the 「报告」 button on a task card. archive/ is
+    not statically mounted, so this route is the only way to open one.
+
+    One run can hold more than one report - app_launch_stress writes one per
+    app - so this serves the first in name order. The button's title says how
+    many there are, and the rest are reachable by opening the archive folder.
+    """
+    dest = _archive_dir_for(task_id)
+    if dest is None:
+        raise HTTPException(404, "task not archived (or unknown task)")
+    htmls = sorted(
+        p for p in dest.iterdir()
+        if p.is_file() and p.suffix.lower() == ".html")
+    if not htmls:
+        raise HTTPException(404, "this run archived no html report")
+    return FileResponse(htmls[0], media_type="text/html")
 
 
 @app.post("/api/tasks/{task_id}/archive/artifact")

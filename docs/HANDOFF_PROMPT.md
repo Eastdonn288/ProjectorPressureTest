@@ -24,7 +24,7 @@
 
 ```
 E:\ProjectorPressureTest\
-├── server.py                       (2528 行) — FastAPI 后端,所有 API + WS + 三源采集引擎 + 自动存档
+├── server.py                       (2584 行) — FastAPI 后端,所有 API + WS + 三源采集引擎 + 自动存档
 ├── start.bat                       — 启动 launcher(成功自动关闭,失败保留信息)
 ├── server_window.ps1               — PPTP-Server 窗口:显示 uvicorn 日志 + 写文件
 ├── stop.bat
@@ -32,22 +32,28 @@ E:\ProjectorPressureTest\
 │   ├── HANDOFF_PROMPT.md            ← 你正在读
 │   ├── SIMPLE-PRD.md
 │   ├── SIMPLE-ARCHITECTURE.md
+│   ├── REPORT_FORMAT.md             — ★ v2.10.0 报告格式真源(HTML 架构 / row 模型 / payload schema /
+│   │                                  ★ Params 表 / 归档配对 / stdout 契约 / 新脚本接入清单)
+│   ├── PERF_MONITOR_V2.md           — perf_monitor v2 判定模型(judge / gates / ROW_SPEC)
 │   └── SIMPLE-PLAN.md               — 早期需求/架构/计划
 ├── scripts\                         (平台调用的压测脚本)
+│   ├── _pptp_report.py              (588 行) — ★ v2.10.0 共享报告引擎。**下划线开头 → 平台不当可跑脚本**;
+│   │                                  纯 stdlib、import 无副作用(`--dump-params` 短路不受影响)
 │   ├── ir_runner.py                 — 红外遥控序列循环(自包含 IRRemote,默认无限循环;长按=down+hold+up)
 │   ├── wifi_onoff_stress.py         — WiFi 开关压力(关/开循环 + wpa_cli 扫描统计;PARAMS 可配)
 │   ├── wifi_reboot_stress.py        — 重启 + WiFi 重连压力测试(PARAMS 可配)
 │   ├── wifi_switch_stress.py        — 多网络循环切换(预置 WIFI_NETWORKS;PARAMS 可配)
 │   ├── sensor_reboot_stress.py      — 重启 + 传感器(gsensor/ToF)回连压测;PARAMS 可配(含 select 下拉框)
 │   ├── app_launch_stress.py         — APP 冷/热启动耗时压测(APP_PRESETS 内置 3 个 APP 一起跑,am start -W TotalTime + logcat Displayed 交叉验证)
-│   ├── perf_monitor.py              — 性能监控(CPU/GPU/内存% + 前台APP CPU%;PERF| 流 → 前端图表,PARAMS 可配)
+│   ├── perf_monitor.py              (2173 行) — 性能监控 v2:三层分级采样 + nonce 帧 + 证据累积 + 收尾判定块;
+│   │                                  PERF| 流 → 前端图表;归档 report.json + samples.csv + events.csv
 │   ├── battery_inout_stress.py      — 电池充/放电压测(电量/温度/电压,串口开 health 轮询;PARAMS 可配,全英文 ASCII)
 │   └── bt_reboot_stress.py          — 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询回连;PARAMS 可配,判定 = 适配器开 + A2DP CONNECTED)
 ├── ir_sequences\                    (用户可编辑的 .ini 序列文件 + 按键速查)
 │   ├── 1.ini                        — 当前序列(KEY_VCR + KEYCODE_HDMI)
 │   └── KEY_REFERENCE.md             — 按键速查:KEY_* 24 + KEYCODE_* 厂商 23 + 原生 26
 ├── static\
-│   ├── app.js                        (2317 行) — 前端所有逻辑
+│   ├── app.js                        (2426 行) — 前端所有逻辑
 │   ├── index.html                    (155 行)  — 4 面板 + 2 模态
 │   ├── style.css                     (872 行)
 │   └── vendor\echarts.min.js         — ECharts 5.5.1 本地化(无构建步骤)
@@ -64,7 +70,8 @@ E:\ProjectorPressureTest\
     └── <module>\{wifi,perf,battery,sensor,app-launch,ir,bt,other}\
         └── <yyyyMMdd-HHmmss>_<script-stem>_<device>\
             ├── stdout.log / logcat.log / serial.log   — 从 logs/ 移入
-            ├── report.json   — 脚本自己写的那份的副本(从 reports/ 复制)
+            ├── report.json   — 脚本自己写的那份的副本(从 reports/ 复制;主报告改名,多份时 report-2.json…)
+            ├── <报告stem>.html — ★ v2.10.0 起每个脚本都有(伴随文件,**不改名**;ir_runner 无)
             ├── chart.png     — 浏览器渲染回传(perf/battery 才有,且要求结束时浏览器开着)
             └── summary.json  — 清单:task_id/参数/状态/bytes+lines/report_source/notes
 ```
@@ -124,7 +131,8 @@ Python 依赖: `pip install fastapi uvicorn pydantic` + **`pyserial`**(可选但
 | GET | `/api/server/status` | uvicorn PID + uptime + 任务计数 |
 | POST | `/api/server/shutdown` | 优雅关停(级联 CTRL_BREAK + os._exit) |
 | GET | `/api/devices` | adb devices -l 解析结果 |
-| GET | `/api/scripts` | scripts/*.py 列表(含 `has_params` 源嗅探标志) |
+| GET | `/api/scripts` | scripts/*.py 列表(含 `has_params` 源嗅探标志)。`_` 开头跳过 |
+| GET | `/api/tasks/{id}/report` | **v2.10.0**:内联返回归档里的 HTML 报告(前端「报告」按钮)。archive/ 无静态挂载,这是唯一入口;未归档 → 404 / 无 html → 404;多份时开文件名第一份 |
 | GET | `/api/scripts/{name}/params` | **读脚本声明的参数 schema**(跑 `--dump-params`,按 `(name, mtime)` 缓存) |
 | GET | `/api/sequences` | **ir_sequences/*.ini 列表** |
 | GET | `/api/sequences/{name}` | 读单个 .ini 内容 |
@@ -306,11 +314,178 @@ const state = {
 35. **子进程管道两端必须显式声明同一个编码 —— 且"读循环 + 收尾"不能共用同一个 `try`(v2.7.4,同事机器上必现)** —— `subprocess.Popen(text=True)` 不带 `encoding=` 时用 `locale.getpreferredencoding()`,中文 Windows 上是 **GBK**;而 `server_window.ps1` 给子进程设了 `PYTHONIOENCODING=utf-8`,于是**子进程写 UTF-8、服务端按 GBK 读**。脚本 stdout 里任意一个 GBK 非法字节对(实测 `top -n 1 -b` / `dumpsys window` 那几段最容易带出)就让 `proc.stdout.readline()` 抛 `UnicodeDecodeError`。**真正的灾难在于那个异常逃到了 `_stream_logs` 底部的兜底 `except`** —— 它只广播一条错误就 `return`,**把下面的收尾块整块跳过**(等退出 / `exit_code` / 终态 status / `_stop_captures` / `_archive_task` / `end` 帧)。症状因而极具误导性:脚本其实早跑完了,任务却**永远停在 `running`**、`exit_code=None`、不归档,日志以 task_id 命名孤零零留在 `logs/`。**两条独立教训:**① 凡是 `text=True` 就必须显式 `encoding=`(读 adb 输出的地方同理,`ir_runner.py` 3 处与 `_adb_reconnect_offline`、`/api/adb/reconnect` 已一并修);② **读取循环和收尾写在一个 `try` 里,等于让"读失败"吃掉"终态"** —— 收尾必须无条件执行。现在读取循环自带 `try`(失败 → 记原因 → 广播 → 终止子进程 → 离线程 `wait()`),任务**不可能停在半路**。A/B 实证与构造方法见 CHANGELOG v2.7.4。
 36. **串口能力 = 一个 pyserial,缺了它只表现为"COM 下拉框是空的"** —— 平台枚举 COM 口走 `serial.tools.list_ports.comports()`,它读的是 Windows 注册表 `HARDWARE\DEVICEMAP\SERIALCOMM` —— **和设备管理器同源**。所以不需要任何额外工具或驱动:**设备管理器能看到口,就证明驱动已经好了**,剩下的唯一变量是"跑服务端的那个 Python 里有没有 `pyserial`"。三个坑:① `import serial` 在 `_capture_serial` 和 `/api/serial/ports` 里都是**懒加载**的(为了让服务端在没 pyserial 时也能启动),所以**没装 pyserial 服务端照常启动、任务照常跑完,只有采集通道静默变成 `unavailable`**;② `/api/serial/ports` 明明返回了 `{"ports":[],"available":false}`,但前端 `refreshSerialPorts` **只取了 `ports`、把 `available` 丢了** → 用户看到的就是一个空的 `— COM —` 下拉框,**零解释**(2026-09-11 同事机器上实踩);③ 必须用**跑服务端的那个 Python** 装 —— `start.bat` 取的是 PATH 里第一个 `python`,不一定是你在 conda 里装过的那个。诊断一行(以服务端窗口打印的路径为准):`<那个python> -m serial.tools.list_ports -v`。
 
+37. **恒开的采集会干扰被采集的对象 —— logcat 改为人工开关(v2.7.5)** —— logcat 从 v2.6.0 起对每个任务**恒开**,这对短时压力测试是对的(崩溃现场就在里面)。但对 **8 小时级别的监控任务**是错的:① 一次 run ≈ **1GB**,没人会去看一份 1GB 的 logcat;② 更关键的是它**在压测已经把设备打满的时候再压一路 `adb logcat`** —— **监控任务等于自己干扰自己**,而 perf_monitor 要的恰恰是设备在自然状态下的表现。改为照 `serial_capture` 的形状加**人工开关**(设备卡 `device-row5`,请求字段 `logcat_capture`)。**三个设计要点**:① 字段默认 **True** 而不是 False —— 老前端不发这个字段时行为必须与今天完全一致,而且 logcat 的失败方向更危险(残留的 off 会**静默丢掉崩溃现场**);② 关掉时**不需要任何新分支**:`_stop_captures` 的"从未启动的通道"守卫天然跳过它,`_archive_task` 的 `if not srcp.exists(): continue` 也自然跳过;③ 勾选状态**不持久化是刻意的**(本次意图,同串口勾选)。**一般性教训:当采集器本身会改变被观测系统的行为时,"恒开"就是个错误的默认值 —— 长跑场景尤其。**
+
+38. **`fg_cpu` 死锁在 baseline —— 只被真机抓到的 bug(v2.8.0)** —— 「第一次读建立基线,第二次读才算差值」的写法里,基线推进条件写成了 `if self.fg_prev is not None: self.fg_prev = pstats`。**首次调用时 `fg_prev` 必然是 `None`,所以这个条件永远为假,基线永远建立不起来,`fg_cpu` 整场恒为 null**。真机 75s 跑出来才发现(`st` 全程是 `b`)。**为什么单测和假设备 harness 都没抓到**:① 断言只检查"状态字符合法",没检查"第二个 SLOW 周期之后必须出值";② 假设备喂的 `utime` 单调递增,看起来一切正常。**教训:"需要两个样本才能算出值"的指标,必须在测试里显式跑满两个周期并断言第二个周期**出值** —— 只断言形状合法等于没测。** 已补回归断言(第一次=baseline,第二次必须出值)。
+
+39. **`st` 列必须定宽,否则一次掉线就把后面所有列推歪 6 格(v2.8.0)** —— `st` 是 `<拍结果>:<9 个状态字符>`,9 个字符永远等宽,但结果词不等宽(`ok`/`error`/`timeout`/`offline`/`partial`)。第一版原样拼进去,于是 `ok:` → `offline:` 让分隔符从第 100 列跳到第 106 列。**这恰恰废掉了定宽列存在的唯一理由,而且恰在最需要竖读的时候(故障中)。** 改法:结果词 `padStart(7)` 右对齐,`st` 单元恒为 17 字符。**代价**:行前缀 82→105 字符,4MB 重放帽下 `chart.png` 完整区间 7.8h→**7.0h**(见 TODO §6.9)。**这条是 node 层渲染 harness 抓的,不是 `node --check`** —— 语法检查看不见列错位,只看得见语法。
+
+40. **判定的分母不能用"实测耗时",要用"拍序号"** —— 覆盖率写成 `ok_tick / (实测墙钟 // T)` 有两个问题:① **差一**(N 拍跨 (N-1)·T,于是覆盖率能算出 111%);② 更坏的是**自我满足** —— 设备越慢、墙钟越长、分母越大,把一个卡住的 run 也算成接近 100%。改用 `max(1, last_k + 1)`(`last_k` = 已发出的最大拍号,跳过的槽也计入),既没有差一,也让"漏拍"真实地压低覆盖率。
+
+41. **一个"坏拍"要把所有指标标成失败,而不是保留上一拍的值(v2.8.0)** —— 零阶保持(`h`)只适用于**没到期**的指标。真掉线那一拍如果还带着上一拍的值画出去,图上是一条平线,而**平线会被读成"设备稳下来了"** —— 正是 `-` 单元和 `gap_ms` 存在的意义。所以 `res ∈ {timeout, offline, error}` 时把所有非 `d` 指标的状态改成 `x`、值置空(前端 `connectNulls:false`,线自然断)。信息没丢:**最后一次真实读数在上一行 CSV 里**。连带的坑:这样会让坏拍**抬高所有指标的 `n_due`**(对覆盖率的分母是对的 —— 那个槽确实请求了也确实空着回来),但会让"通道到底通不通"的门误报(设备只是离线,根本没机会回答),所以另记了 `n_due_ok`(只数坏拍之外的到期次数)给 CPU 门用。
+
+42. **删掉一个开关时,把布尔谓词一起改写 = 整条通道静默失效,而且所有断言都看不见(v2.9.0)**
+    `--selftest` 的 60+ 条断言、假设备 harness、真机 60s 实跑**三层全绿**,报告的却是
+    `RESULT: OK` / 9 门全 pass / 覆盖率 100%,而**前台应用通道整轮一个值都没出过**
+    (`fg_pkg`/`fg_pid`/`fg_cpu` 全 null,状态字符恒为 `n`)。
+
+    **根因**:删 `track_foreground` 时,谓词原本是
+
+        name not in ("FOCUS", "FGPKG", "PIDSTAT") or self.track_fg
+
+    被压成了 `name not in (...)` —— **逻辑整个取反**。三个 section 从此永远不"到期"。
+
+    **为什么三层测试都没拦住**(比 bug 本身更值得记):
+
+    - 所有既有断言都是**形状**断言 —— CSV 是矩形、报告能往返、门是 9 道、版本号一致。
+      **没有一条问过「这个通道到底出过值没有」**。一个**死掉的通道**和一次**太短的运行**,
+      在形状上一模一样。
+    - 假设备 harness 照常合成 FOCUS section,协议层面完全看不出问题 —— 它测的是**解析**,
+      不是**这个 section 到底有没有被请求**。
+
+    **唯一看得出来的地方**:对着 `samples.csv` 逐拍看 `st` 列 —— SLOW 拍的状态字符是 `n`(从未到期)
+    而不是 `b`(基线)或 `f`/`h`。**状态串是最低成本的体检,养成看它的习惯。**
+
+    **修法与加固**(全是"让这类 bug 不可能静默"的形状):
+
+    - 谓词提到模块级 `section_due(name, secs, tiers, gpu_enabled)`,补 **6 条 selftest 断言**
+      (命令侧确实要求了该 section / 谓词侧接受 / 无 SLOW 时拒绝 / section 缺失时拒绝 / GPU 受 `gpu_enabled` 约束)。
+    - harness 新增 **`assert_channels_alive()`**:凡存在「有 SLOW 拍**成功返回过**」的运行,
+      `fg_pkg`/`fg_pid` 就必须至少产出一个值 —— 而且它读的是 `n_due_ok`(坏拍之外的到期次数),
+      所以"设备一直离线"的场景不会被误报。
+    - **已用一份把该 bug 重新注入的副本反向验证过这条断言确实会失败。**
+      **不会失败的回归测试等于没有测试** —— 修完必须让它先红一次。
+
+44. **「没出现过」和「出现过又消失」必须分开判 —— 否则同一个门既假绿又假红(v2.9.0)**
+     gate 9(APP)原判据是「前台包名 != `watch_pkg` 连续 2 拍就记一次丢失」。它在两个方向上都是错的:
+
+     - **假红**:脚本从桌面开始跑、或者选的包设备上根本没装 —— `watch_pkg` 从没上过前台,
+       2 拍之后照样记成"丢失"并 **FAIL**;
+     - **假绿**(更糟):app 崩了但窗口还没收 —— 前台包名**仍然等于** `watch_pkg`,判据完全看不见。
+       而这正是 `watch_pkg` 这个参数存在的唯一理由。
+
+     **两层教训**:
+
+     1. **注释不是代码。** 那段代码上方写着「`gone` requires the process to be missing from pidof
+        while it is still the focused package」,而代码做的是包名比较,一行 pidof 都没碰;真正记 pid 级
+        证据的 `fg_pid_lost` 在别处累加,**没有任何一道门读它**。读到"注释与实现一致"的错觉时,
+        **去看谁在读那个字段** —— 没人读的字段等于不存在。
+     2. **凡是"异常/正常"的二分判据,都要问一句「它区分得开哪两种状态吗」。** 这里的失败不是阈值不对,
+        是**判据本身无法区分**「从未出现」与「出现后消失」—— 同一个观测量(前台包名)对两种截然不同的
+        情况给出同一个值。修法是引入**第三个状态**(inconclusive),而不是调阈值。
+
+     加固:`--selftest` 用真 `Evidence` + 真 `judge` 跑五个场景,并**用重新注入旧判据的副本反向验证**
+     (旧逻辑挂 5 条、新逻辑 0 条)。**不能失败的回归测试等于没有测试。**
+
+43. **控制台块的最后一行是给机器认领报告的,新增行别撞上它(v2.9.0)**
+    `server.py` 的 `_sniff_report_path()` 靠一条**很土**的规则认领脚本报告:一行里同时含 `" : "` 和子串 `"report"`,
+    再把 `line.rsplit(" : ", 1)[1].strip()` 拿去 `.endswith(".json")`;**而且只取第一条命中的**。
+    所以 v2.9.0 新加的 HTML 行改用 `  html   = <path>`(**`=` 而不是 `:`**):
+    报告写在 `reports/` 下,**路径本身就含 `report` 子串**,只靠扩展名检查去拒绝它太脆。
+    **selftest 现在逐字复刻 server 的 sniff 规则**,断言「有且只有一行可认领,且它在最后一行」。
+    改判定块的渲染时**先跑那条断言**,别等平台把报告认成 HTML。
+
+45. **报告路径必须由引擎推导,别让调用方拼 stem(v2.10.0)**
+   `_companion_files()` 收编一个伴随文件的条件是「**同目录** + 文件名以 `<报告stem> + "."` 开头 + 后缀 ∈ `(.csv, .html)`」。
+   手拼 HTML 路径,**少一个字符就静默不进归档** —— 不报错、不告警,归档里就是少一个文件。
+   所以 `write_html_report(json_path, doc)` 的签名里**没有 html 路径参数**,它自己从 JSON 路径推导(`html_path_for()`)。
+   **这不是"少写一个参数",是让错误无法表达。** 新增脚本别自己 `os.path.splitext` 拼一份。
+
+46. **判断"这个值要不要转义",判据必须是数据的类型,不是数据长什么样(v2.10.0)**
+   引擎第一版的 `_cell(c)` 用 `str(c).startswith("<td")` 来决定"这个值是不是已经渲染好的 HTML" ——
+   于是**任何以 `<td` 开头的数据值都会绕过转义**。真机上没有这样的数据,所以它在测试里不会暴露。
+   修法:`_cell(c)` 返回 `(cls, inner_html)` **元组**,由调用方**无条件**拼出 `<td>`;`cls` 为 `None` 时不加 class。
+   **凡是想"看字符串长得像不像 markup 来决定要不要转义"的地方,都是同一个 bug 的变体。**
+
+
 ---
 
 ## 6. Recent design decisions (DO NOT REVERT)
 
 按时间倒序,这些是用户已经"批准"的设计选择:
+
+-3. **每个脚本的 Overall Result 都出一份中文 HTML 报告 + 报告引擎沉淀 (v2.10.0, 2026-09-16)**
+   用户四点要求:「1. 每个脚本 stdout 的 Overall Result 都需要生成 html 的报告 / 2. 参考 PerfMonitor 的生成逻辑 /
+   3. 当前已连接 adb 设备 / 4. 需要将 HTML 格式的 Overall Result 的架构和 Params 作为架构写入 md 文档沉淀」。
+   v2.9.0 时中文 HTML 是 perf_monitor **独占**的,这一版抽成共享引擎,8 个脚本接进去。
+
+   - **用户三项已批准决策(DO NOT REVERT)**:
+     ① **stdout 一个字不改** —— 三种汇总家族原样并存,只在末尾多一行 `  html   = <绝对路径>`
+        (用户原话「只加 HTML,stdout 一个字不改」)。理由:控制台是用户实时在看的东西。
+        **代价**:`rows` 要脚本手写(3~8 行),引擎不能从 print 语句反推 —— 换来的是两处显示的数不可能各算一遍。
+     ② **`ir_runner.py` 跳过** —— 它没有 `PARAMS`、没有 PASS/FAIL 语义,是 `.ini` 驱动的交互式序列执行器,
+        给它编一个不存在的结论是造假。
+     ③ **前端加「报告」按钮** —— 因此 server.py 加了一条只读路由(`archive/` 没有静态挂载)。
+   - **架构(详见 [REPORT_FORMAT.md](REPORT_FORMAT.md),那是这一轮的沉淀物)**:
+     脚本局部变量 → `rows`(与 print 块并排构建)→ `build_payload()` → `write_html_report(json_path, doc)` → `<报告同stem>.html`。
+     **引擎不渲染 stdout,平台也不解析 HTML** —— 两边唯一的接触面是文件系统上的 stem 配对。
+   - **归档零改动(已核实)**:`_companion_files` 只认「同目录 + 同 stem 前缀 + `.csv`/`.html`」,所以同 stem 同目录就自动带走。
+     归档时主报告改名 `report.json`,**伴随文件保留原名**。见踩坑 #45 —— 所以路径推导封在引擎里,不接受调用方拼串。
+   - **不碰现有 JSON 报告**:全库无消费者解析报告 JSON,保持原样 = 零回归。HTML 里有「完整数据」折叠区把 JSON
+     整体递归渲染进去,保证 `HTML ⊇ JSON`;`hide_keys`(如 Wi-Fi 的 `["password"]`)在**任意深度**按键名隐去。
+     **注意:这只管 HTML 渲染,归档的 `report.json` 仍含明文口令。**
+   - **Params 架构(用户点名要沉淀的第 4 点)** —— `render_params_table(values, schema)` 从 `PARAMS` 声明生成三列表
+     (参数 / 本次取值 / **来源**),**顺序遍历 schema 而非值的字典**,所以漏传的参数不会消失(回退声明默认值并注明「本次未传」)。
+     「来源」三态 = 本次未传 / 传入了与默认相同 / **已改(默认 X)** —— **"用户改没改过这个参数"在报告里直接看得见**,
+     不用翻 `summary.json`。`choices` 有**两种形状**(纯字符串列表 / `{value,label}` dict 列表,后者见 perf 的
+     `WATCH_PKG_CHOICES`),`_choice_label` 两种都吃,匹配不上时**原样显示该值而不是丢掉**(丢掉会让人以为参数没生效)。
+     bool 渲染 `是`/`否`,**绝不打 `True`/`False`**。
+   - **⚠ 硬约束:`report :` 行必须仍是最后一行**(见踩坑 #43)。新增的 `html =` 行**必须用 `=` 而不是 `:`**。
+     perf 的 `--selftest` 有断言守着,**其他脚本没有** —— 改 stdout 要人工过 REPORT_FORMAT.md §8 的自查清单。
+   - **实测(2026-09-16,真机 B0403374A2A508001F00,平台端到端)**:`wifi_switch_stress` 短任务 → 归档里
+     `report.json` + `<stem>.html` 都在,`summary.json` 的 `artifacts` 列出 html 且 `report_source` = `stdout_line`
+     (证明是嗅探命中,不是 mtime 兜底);`GET /api/tasks/{id}/report` → 200 `text/html`;
+     `wifi_reboot_stress` **首次产出报告并归档成功**;**中断门**:`wifi_reboot` 跑到第 2 轮时平台「中断」→
+     汇总照打、**报告 + html 照常写出并归档**、`report :` 仍是最后一行。
+     `perf_monitor --selftest` 0 failures。口令泄漏验证:三个 Wi-Fi 口令在 HTML 里全不在,SSID 仍在,`已隐去` 标记正常。
+   - **未证**:前端「报告」按钮在真实浏览器里的点击效果(与 §7 #4 同一残余);`wifi_onoff` / `sensor_reboot` /
+     `battery_inout` 三个脚本只过了静态门与 `--dump-params`,**没在真机上跑过**(收尾时 `wifi_onoff` 补跑了一次**中断**路径的端到端,跑满路径仍未验证)。
+   - **有意偏离计划(如实记录)**:`perf_monitor` **保留自己的渲染器**(它那 4 个区块 gates/通道分布/每门明细/链路事件
+     比通用引擎能表达的丰富,重写有风险要碰 `--selftest` 而无用户可见收益),只吸收参数表 —— 那才是它真正缺的。
+     另:`write_html_report` 失败返回 `""` 不是 `None`;常量叫 `SCHEMA` 不是 `REPORT_SCHEMA`;引擎 588 行(计划估 320)。
+- **中断门(用户 2026-09-16 裁决后已补齐)**:`wifi_onoff_stress.py` 的报告写入原先被 `if not interrupted:`
+  包着(脚本自身既有设计),而 `=== results ===` + `OVERALL` 在守卫**外**、中断时照打,于是中断时
+  **stdout 有 Overall Result 而 HTML 没有**。用户原话「中断时报告与 HTML 都写,报告简单注明一下吧」→
+  **守卫整条删除**(只补 HTML 不可能:同 stem 才能被归档收走,孤儿 HTML 会被 `_companion_files` 静默丢弃)。
+  判定**一个字不改**(控制台与页面因此不可能互相打架),中断进 `interrupted` / `interrupted_note`(恒在),
+  并渲染成页面横幅下那条黄条。真机实测:跑到第 2 轮点「中断」→ 归档里 json + html 都在、
+  `report.json` 带 `interrupted: true`、`report :` 仍是最后一行。
+
+-2. **perf_monitor v2.9.0:参数面收敛 + 判定块自解释 + 中文 HTML 报告 (2026-09-14)**
+   用户跑完第一份真机短样本后的四项确认。**这一轮我自己引入并修掉了一个通道级静默失效**,先说它。
+
+   - **gate 9(APP)两个方向都判反了,已修(v2.9.0)** —— 判据原是「前台包名 != `watch_pkg`
+     连续 2 拍」,于是「从没出现过」被当成丢失(**假 fail**:脚本从桌面开始跑、或选了设备上没装的包),
+     而「窗口还在但进程没了」**看不见**(**假绿**:前台包名仍等于 `watch_pkg`)。代码注释倒是写着
+     「`gone` requires the process to be missing from pidof」—— **注释是意图,代码是另一件事**;
+     真正记 pid 级证据的 `fg_pid_lost` 在累加,但**没有门读它**。修法:`watch_seen`(先健康过才算丢失)
+     + `watch_pid_dead`(就地死掉,直接证据)+ 按事件计数;gate 9 三出口 = fail / inconclusive / pass。
+     **详见踩坑 #44。**
+   - **删掉 `track_foreground` 开关,前台采集恒开** —— 原话「采集前台 APP 感觉没必要做开关吧」。理由:「被压测的 app 挂了 / 掉到后台」是长跑里最该被看见的故障,`fg_*` 是唯一能看见它的信号;关掉只省一次 `dumpsys window` + `pidof` + `/proc/<pid>/stat`,不值一个开关。连带删 `Evidence.track_fg`、CSV 前导的 `track_foreground=`、报告 `config` 的同名字段。**别再把它加回来 —— 见踩坑 #42,删它的时候我把谓词写反了。**
+   - **`watch_pkg` 由自由文本改 `type:"select"` 下拉** —— 用户原话「关注包名这个我建议是预留几个选项就行了,后面我把常用的那几个压测的提供给你」。**清单已由用户 2026-09-14 定稿,不再是占位**:YouTube TV / Netflix / Prime Video / 本地媒体播放器
+   (+"不关注"),共 5 项,要增删改 `WATCH_PKG_CHOICES` 一处。
+   **包名从真机读的办法**:`adb shell cmd package query-activities -a android.intent.action.MAIN -c
+   android.intent.category.LEANBACK_LAUNCHER`;**别用 `pm list packages -3`** —— YouTube TV 与 Netflix
+   在这台设备上是系统应用,`-3` 会把它们滤掉。
+   ⚠ **加条目之前先确认设备上真有这个包**:`watch_pkg` 设了而该包从没上过前台,gate 9 报的是
+   **LOSS(FAIL)**,不是 inconclusive —— 等于自己造一个假异常。理由:自由文本里一个拼错的包名会**静默废掉**唯一依赖它的 gate 9(APP)。
+   - **`interval_sec` / `duration_sec` 保留** —— 用户问「采样间隔在之前的架构里面你不是说会做分级采样吗」。**答案:它是基准拍周期 T,MED/SLOW 的周期由 T *推导*(目标固定 5s/30s),分级采样不等于「不需要采样间隔」。**同时明确:**阈值不进 params**(沿用 v2.8.0 的否决)。
+   - **判定块自带解释** —— 原话「我希望在释出这些指标的时候能带简单解释,排版也可以做好一点」。→ 块尾 `--- what these mean ---`,每行一条英文解释;**控制台与 HTML 同源渲染**(`verdict_rows()` 一张共享 row 表),两者不可能各说各话。**stdout 仍然全 ASCII。**
+   - **新增中文 HTML 报告** —— 原话「或者说输出一版 html 的 overall result 做成表格样式,然后带点指示描述,html 的可以带中文的,这个之前就讲过,前端显示的东西可以带中文,后续给人看 html 比较直观」。→ `perf_<设备>_<时间>.html`,与 `report.json` **同名同目录、同一份 payload 渲染**(它**不是第二份判定**,写失败只是少个附件,不改变结论)。四张表 + 四色横幅 + 未标定告警条;**自包含**(内联 CSS、无 JS、无图表库),目标是能拷出归档目录、在没装过 PPTP 的机器上、几年后打开还看得懂。平台侧 `_companion_files()` 认领扩展名 `.csv` → `.csv` + `.html`。
+
+-1. **perf_monitor v2:分级采样 + 证据累积 + 收尾判定 (v2.8.0)**
+   完整设计见 [PERF_MONITOR_V2.md](PERF_MONITOR_V2.md),**§12 是权威**(与 §3–§5 冲突时以 §12 为准)。落地范围 = P2–P5。用户批准过的几条硬约束:
+
+   1. **判定在收尾异步打印一次,不是"离线再算一遍"** —— 用户原话「我没有定收尾离线算一次 / 我指的是报告输出在后面输出一份」。实时流保持是流,结论只出现一次。
+      → 实现:`judge(evidence)` 纯函数,`--selftest` 断言 `judge(report["evidence"]) == report["verdict"]`。
+   2. **监控逻辑做进 perf_monitor 本身** —— 原话「反正要把监控逻辑做进我的 perf 监控,目前我的 perf 仅仅只做了数据打印的活」。**不要**在平台侧另起一套判定。
+   3. **采样要省机器** —— 原话「采样逻辑看怎么设计对机器消耗更小」。→ 三层分级 + 一拍一次 adb(占空比 9.06%)。**"常驻 adb shell"这个显然的优化被否掉了**(见设计文档 §12)。
+   4. **事件与判定分开,允许中途预警** —— 原话「采集通道的『事件』和『判定』应该分开 … 可以,中途可以增加监控预警和提示,你全权负责即可」。→ 事件走 stdout(限流 60s),判定只在收尾。**仍然禁止 banner / toast / 状态条**(沿用 v2.7.2 的否决)。
+   5. **归档不限制文件类型,只要求"归档在一起 + 统一命名"** —— 原话「归档的文件类型不局限在那几样,唯一约束是需要归档在一起且统一命名」。→ 扁平命名 `perf_<设备>_<时间>.<json|html|samples.csv|events.csv>`(v2.9.0 起加 `.html`),平台侧 `_companion_files()` 按**报告 stem 前缀**配对认领。
+   6. **不做磁盘空间监测**(用户明确否决)、**阈值不做成 params**、**logcat 保留人工开关**(见踩坑 #37)。
+   7. **未知 PERF 类型绝不回显原始 JSON** —— 前端 `handlePerfLine` 的兜底分支只打一行 `(unrecognized record type: X)`。理由:console 每次 WS 重连都会重放 stdout,回显等于把原始 JSON 反复刷屏;而且一个新记录类型刚上线时就会触发。
+
+   **判定阈值全部未标定**(`CALIBRATED=False` → `judge_version=v1-uncalibrated`)。健康报告也会显示未标定,**这是刻意的**:避免假信心。标定需要一次健康的 8 小时基线跑。残余风险清单见 [TODO.md](../TODO.md) §6。
 
 0. **掉线容忍:三条链路自动接回 (v2.7.2)**
    - **背景**:用户明确"perf_monitor 这种,当存在设备重启或者 adb 掉线时是正常的",并要求「设备重启完成后需要能自动连接上之前的日志,且能自动连接上 adb 和串口」。
@@ -394,7 +569,7 @@ const state = {
 
 4. **性能监控脚本 perf_monitor + 前端实时图表 (v2.4.0 → v2.4.1 修复 → v2.4.2 长时检测)**
    - **⚠ v2.4.1 根因修复(用户 3 症状齐发)**:图表实时不出线 + 横轴无时间点 + 导出只剩 txt —— 全部源自脚本 sample 行的 `emit` dict **漏了 `"type":"sample"` 字段**(docstring 写了 `type:sample`,代码没实现)。前端 `handlePerfLine` 以 `obj.type === "sample"` 分发,sample 被当未知类型丢弃 → `perfPending` 永远空 → 图表无数据 → `perfSamples[taskId]` 空 → 导出只剩 txt。**修复 = emit 补 `type:"sample"` + 新增 `clock`(wall-clock epoch ms);前端分发逻辑一行没改**。教训见 5.5.5 #17
-   - **脚本** `scripts/perf_monitor.py`:平台契约全套;`PARAMS` = `interval_sec`(默认2.0,min0.5)/ `duration_sec`(0=手动停止)/ `track_foreground`(默认 true);`--probe` 独立探测节点(不入 PARAMS)
+   - **脚本** `scripts/perf_monitor.py`:平台契约全套;`PARAMS` **v2.9.0 起只剩三个** = `interval_sec`(基准拍周期 T,默认2.0,min1.0)/ `duration_sec`(0=手动停止)/ `watch_pkg`(**select 下拉**,预置 `WATCH_PKG_CHOICES`);**前台采集恒开,已无 `track_foreground`**;`--probe` 独立探测节点(不入 PARAMS)
    - **PERF 采样协议(v2.4.1 起)**:脚本每采样打一行 `PERF|{"type":"sample","clock":<epoch_ms>,"t":...,"cpu":...,"gpu":...,"mem":...,"fg_cpu":...,"fg_pkg":...,"gpu_clk":...}`,启动打 `PERF|{"type":"meta","sources":{...}}`(`json.dumps ensure_ascii=True`)。stdout 经现有 WS `/ws/logs/{task_id}` 原样流转,**服务端流式零改动**;前端在 `appendLogLine` 拦截 `PERF|` 前缀。**`type` 与 `clock` 是前端分发的硬依赖字段,缺一即断链**
    - **MT9676 数据源(真机 2026-08-25 探明,注意:用户以为 MT9660,实为 MT9676 —— `ro.soc.model=MT9676 / ro.hardware=mt5896 / egl=mali.mt5873`)**:
      - CPU% `/proc/stat` 差值(免 root);mem% `/proc/meminfo` MemAvailable/MemTotal(系统整体,免 root,本机仅 ~1.75GB)
@@ -524,7 +699,10 @@ const state = {
    - 如果涉及 WiFi 脚本,看 `scripts/wifi_*.py`(共用契约:`--device` + `--params` + `--dump-params` + `su 0` 调 adb)
    - 如果涉及传感器脚本,看 `scripts/sensor_reboot_stress.py`(PARAMS 只留 `sensor`/`iterations`/`reboot_timeout`;读取走"裸 su"交互式适配链)
    - 如果涉及 APP 冷热启动脚本,看 `scripts/app_launch_stress.py`(`APP_PRESETS` 列表硬编码顶部,内置 Netflix/Prime Video/YouTube TV 三个一起跑;PARAMS 含 `mode` select 下拉框 + p95 阈值;冷启动 force-stop 校验 + 热启动 HOME 流程;`am start -W` TotalTime 主指标 + logcat Displayed 交叉验证;每 APP 一份报告,整体全过才 PASS)
-   - 如果涉及性能监控脚本,看 `scripts/perf_monitor.py`(PARAMS: interval_sec/duration_sec/track_foreground;`PERF|` 采样协议 meta+sample;数据源见 §6 设计决策第 4 条;`--probe` 探测节点) + **§5.5.4/§5.5.5**(前端图表绑定与踩坑)
+    - 如果涉及性能监控脚本,看 `scripts/perf_monitor.py`(PARAMS: interval_sec/duration_sec/watch_pkg;`PERF|` 采样协议 meta+sample;判定块 `format_result_lines()` + 中文报告 `format_result_html()`;数据源见 §6 设计决策第 4 条;`--probe` 探测节点;`--selftest` 60+ 断言) + **§5.5.4/§5.5.5**(前端图表绑定与踩坑)
+      ⚠ **该文件已被 E-SafeNet 包上密文壳(2026-09-14):Read/Grep 静默失效,Grep 直接 0 命中。一律用 Python + 断言改,见 [TODO.md](../TODO.md) §5。** 2026-09-16 收尾盘点确认带壳的还有 `server.py` / `scripts/_pptp_report.py` / `scripts/wifi_onoff_stress.py` / `scripts/battery_inout_stress.py`,且**带壳与否不可预测**(同一批文件里有的被 Python 改过却仍是明文)—— **每个文件碰之前单独用 Read `limit: 2` 实测**,别用字节扫描(会假阳性)。
+   - 如果涉及**报告 / HTML / 参数表**,看 [REPORT_FORMAT.md](REPORT_FORMAT.md)(真源)+ `scripts/_pptp_report.py`。
+     **改任何脚本的 stdout 前先读它的 §8「stdout 契约」** —— `report :` 行必须仍是最后一行。
    - 如果涉及电池充放电压测,看 `scripts/battery_inout_stress.py`(全英文 ASCII;PARAMS: mode/serial_port/interval_sec/temp_warn_c/full_hold_sec;串口开 health 轮询 + 每 5 分钟保活;dumpsys battery 解析;单次中止 = 100% 稳定 或 关机;跳变/温控检测;数据源见 §6 设计决策第 3 条 + 踩坑 #18)
 2. **列影响面**:
    - 后端 → server.py 哪个 route / 函数
@@ -551,6 +729,11 @@ const state = {
 - [ ] state 持久化(如有):改 → F5 → 应保持
 - [ ] 没有"上一版的旧实现"残留在文件中(grep 一下"// TODO"、"// 废弃"等注释)
 - [ ] 没有改到 §7 列的"不存在的特性"
+- [ ] **改了脚本 stdout** → 过一遍 [REPORT_FORMAT.md](REPORT_FORMAT.md) §8 自查清单:
+      `report :` 仍是最后一行、`html =` 用 `=`、`--dump-params` 仍只吐一行 JSON、
+      `reports/stress-test/<模块>/` 下 `.json` 与 `.html` 同 stem 成对且无孤儿
+- [ ] 改了 `_pptp_report.py` / 报告渲染 → `perf_monitor.py --selftest` 必须仍 0 failures
+      (尤其 `exactly one sniffable report path, on the last line` 与 `html line is not sniffable`)
 
 ---
 
@@ -580,7 +763,7 @@ const state = {
 - `_archive_dir_for()` L2103 / `api_archive_artifact()` L2124 / `api_archive_reveal()` L2175 / `api_archive_reveal_root()` L2198 / `api_archive_stats()` L2214(含分模块统计)
 - `_forget_task()` L2261 — **只移除内存条目,刻意不动磁盘**
 - `ws_logs()` L2367 — 订阅 + 分源重放(**前端只订阅 stdout**)
-- ⚠ **行号会漂**,以搜索为准。另:本机有 E-SafeNet 透明加密,曾把 server.py 包成密文,导致 Read/Grep 读到乱码(Edit 若照写会毁文件)。用户 2026-09-11 已解密,但若**再遇到某文件搜不到/读出来是乱码**,立刻改用 Python 脚本读写+断言,别 Edit。详见 [TODO.md](../TODO.md) 第 5 节。
+- ⚠ **行号会漂**,以搜索为准。另:本机有 E-SafeNet 透明加密,曾把 server.py 包成密文,导致 Read/Grep 读到乱码(Edit 若照写会毁文件)。用户 2026-09-11 已解密,但若**再遇到某文件搜不到/读出来是乱码**,立刻改用 Python 脚本读写+断言,别 Edit。详见 [TODO.md](../TODO.md) 第 5 节(2026-09-16 已盘点出完整清单 + 逐文件实测方法)。
 
 **Frontend (static/app.js,2317 行)**:
 - `state` L14(含 `perfMeta`/`perfSamples`/`deviceSerialCapture`/`deviceSerialPort`/`serialPorts`/**`archiveStats`/`chartPosted`**)。**没有** `activeSource`/`captureCounts`/`CHANNELS`/`TABS_ENABLED`(v2.7.0 删)
@@ -723,12 +906,19 @@ curl http://127.0.0.1:8000/api/sequences
 
 ---
 
-**最后更新**: 2026-09-11(v2.7.4:**修复"脚本在同事机器上无法结束"(stdout 管道两端编码不一致)** —— 同事机器上 `perf_monitor` 跑起来永远不结束,日志先是一个空行再 `[error] 'gbk' codec can't decode byte 0xaa`。**根因**:`server_window.ps1` 给子进程设了 `PYTHONIOENCODING=utf-8`(写 UTF-8),而 server.py 的 `Popen(text=True)` **没写 `encoding=`**(读 GBK)—— 脚本 stdout 里任意一个 GBK 非法字节对就让 `readline()` 抛 `UnicodeDecodeError`。**症状之所以是"无法结束"而不是"报错"**:那个异常逃到了 `_stream_logs` 底部的兜底 handler(只广播一条错误就 `return`),**把下面的收尾块整块跳过**(等退出 / `exit_code` / 终态 / `_stop_captures` / 归档 / `end` 帧)。三层修复:① 管道两端都钉死 UTF-8 + `errors="replace"`(含 `child_env["PYTHONIOENCODING"]`,这样不经 `server_window.ps1` 直接启服务也一致);② **读取循环自带 `try`**,失败则记原因 + 广播 + 终止子进程 + 离线程 `wait()`,收尾**无条件**执行 → 任务不可能停在半路;③ 同类隐患一并修(`ir_runner.py` 3 处、`_adb_reconnect_offline`、`/api/adb/reconnect`)。**真做了 A/B**(不是推断):回退这两处造出 pre-fix 副本,同一根探针脚本 —— 修复前 `status=running`/`exit_code=None`/**永不结束且不归档**、日志孤儿留在 `logs/`;修复后 `finished`/`0`/已归档且 `stdout.log` 逐字节完整。**注意:`locale.getpreferredencoding()` 本机同样是 `cp936`,不是"同事环境特殊",只是触发取决于脚本输出里有没有 GBK 非法字节。** 踩坑新增 #35。承 v2.7.3:**串口勾选高亮 + 任务面板排版 + reports/ 不再堆积** —— 串口行开启时整行高亮(淡蓝底+蓝边框+主题色加粗;padding/border 常驻以免勾选时卡片跳高);删掉任务面板里那个**死节点** `task-hint`(HTML 写死、JS 零引用,白占 70px 把 300px 宽的面板挤爆),`.panel-header` 加 gap + wrap、按钮组 `margin-left:auto` 保证换行后仍右对齐;**报告改为"搬"不是"复制"**(先 copy 再 unlink,删失败不丢唯一副本),`reports/` 变成几秒钟的暂存区、不再累积,并且一个任务的多份报告(`app_launch` 每个 APP 一份)全部归档为 `report.json`/`report-2.json`,不再把其余的永远留在 `reports/`。承 v2.7.2:**掉线容忍** —— 串口从"一次性"改成受监督重连循环(`_serial_attempt`,连续失败预算 60、收到数据清零、每次重试换新线程/新 Event、写可见 marker);新增 `_device_watchdog` 每 20s 发一次 **`adb reconnect offline`**(只影响离线设备,**绝不 `kill-server`**,不影响在线设备上的其它脚本);"临时离线"合成卡补上 `interrupting`;`_broadcast` 发送超时后**真正 `ws.close()`**(否则前端 `onclose` 不触发 → 浏览器握着死 socket 永远收不到日志)。顺带修复 v2.7.0 删 2s 心跳时连带删掉的 `t["captures"]` 刷新(加 `_announce_captures`,**只在状态迁移时发**以免churn 渲染键)。**探查先于实现**:用户 5 条需求里 2 条其实已满足(monitor 脚本的 `adb_shell` 从不抛异常;任务卡从不会消失),没有重复造。**明确不做**:monitor 脚本泛化、新增离线提醒 UI、自动 `kill-server`。踩坑新增 #30-#32。**未证**:串口重连成功路径与 watchdog 真触发(都需要动硬件)。承 v2.7.1:用户试用反馈的四点 —— ① **存档按模块分类** `archive/<模块>/<时间>_<脚本>_<设备>/`(`ARCHIVE_MODULES` 显式映射,与 `reports/stress-test/<模块>/` 对齐,根目录下只有模块文件夹);② **存档入口提到顶栏**(全局功能放全局位置)+ 占用徽标 hover 看分模块占用;③「清空已完成」改名「**清空已完成的卡片**」;④ **修复报告误归属**:兜底 mtime 扫描曾把前一个任务的报告算给当前任务(同设备背靠背跑时),三重收紧 —— 只扫登记脚本 / mtime ≥ 开始时间 / `_CLAIMED_REPORTS` 唯一认领。另 `_archive_dir()` 对旧扁平布局回退(升级期间老任务仍可读)。已清理 `logs/` 48 个历史日志 + `reports/` 59 个报告 + 测试存档(**两个目录本身不能删**:`logs/` 是运行期工作区 + 服务日志,`reports/` 是脚本契约,用户只需看 `archive/`)。**reboot 脚本的假 PASS 问题已记录进 [TODO.md](../TODO.md),本轮不改。** 承 v2.7.0:**任务结束自动存档 + 日志前端方案收敛** —— 每个任务终态把三份日志 `move` + 脚本报告 `copy` 进 `archive/<时间>_<脚本>_<设备>/` 并写 `summary.json` 清单;`chart.png` 由浏览器渲染后 POST 回传(服务端**不引入绘图库**),浏览器没开则如实缺图;`logs/` 降级为运行期临时区;**`×`/「清空已完成」只移除列表条目,存档永久保留**(`_forget_task`);任务卡新增「存档」按钮 + 任务面板显示总占用;导出按钮隐藏(代码保留)。同轮**删掉** v2.6.0 预埋的 logcat/串口前端显示方案(`CHANNELS`/`TABS_ENABLED`/`activeSource`/`captureCounts`/计数 pills/`#channel-bar`/服务端 2s 计数心跳)—— 用户要求"稳定简单为主导",前端只保留 stdout,logcat/串口仅服务端采集归档;保留 console 里**一行** `[archive]` 摘要作为串口失败的唯一信号。另修复对抗审查发现的四条采集隐患:logcat 重启预算改为**连续**计数(旧的终身 5 次会让 100 轮重启压测在第 6 轮永久停采)、收尾不再覆盖通道自己的 `failed/unavailable/capped` 诊断、串口读线程死后可见、串口加 512MB 上限;重启回读 2000 行以回填开机日志。踩坑新增 #27-#30。**未证:前端实际渲染效果(无真实浏览器)。** 承 v2.6.0:**每任务三源实时日志采集** —— logcat 恒开 + 串口按任务勾选,服务端采集(9 个脚本零改动),WS 按源订阅过滤(`WS_SUBS`,无人订阅的源零成本)+ 5s 发送超时;logcat 自动重启循环(adb kill-server / 设备重启后 ≤2s 恢复,写可见 marker)、256MB 上限(`PPTP_LOGCAT_MAX_MB`)、**永不 `logcat -c`**;串口走守护线程 + 丢最旧队列,`script_owns_port` 仲裁让位 battery 脚本;日志文件名改为 **`<task_id>_<时间>_<脚本>_<设备>.<源>`**(服务器下发确切名,前端不重建路径);`GET /api/tasks/{id}/log?source=` 一律尾部读 + 非法源 400;新增 `GET /api/serial/ports`;导出改为多源下载 + 导出名含设备/脚本/时间;**前端仅展示 stdout**(`TABS_ENABLED=false`,数据层/WS/渲染路由已按通道就位,`#channel-bar` 预留节点在 `#log-info` 外)。踩坑新增 #22-#26。**未证:串口数据通路**(端口开合正常、无副作用,但"读到字节"未被观测到 —— 开机后空闲 console 无输出属合理表现)。承 v2.5.2:新增重启蓝牙音箱回连压测脚本 `bt_reboot_stress.py` —— 仿 wifi_reboot_stress(reboot → 上线 → 轮询 A2DP 回连),回连判定 = 适配器开 + A2DP `mConnectionState: CONNECTED`,只测重启回连不测开关回连(蓝牙开关未开放给用户);真机验证边界行为:刚连上立即重启回连失败、手动重连一次后 ~6s 自动回连。承 v2.5.1:前端 log console 全英文/ASCII + 折线图 x 轴从 2min 刻度改为固定 1h 滚动窗口 6×10min 刻度,perf/battery 同步;删除 STATUS_ZH/JUMP_TYPE_ZH 中文映射、时间戳走 fmtClock 强制 24h、移除 dataZoom;放电/电池测试结束设备关机后卡片不再消失,合成"放电关机"专用卡(仿临时离线);**导出的 chart.png 改为全程图**(`exportFullChartDataUrl` 从 perfSamples 全量渲染,不受 1h 实时窗口限制),**横轴 0.5h 一个刻度**。承 v2.5.0:新增电池充放电压测脚本 battery_inout_stress —— 串口开 health 轮询拿实时电量/温度、mode 充/放电单次只跑一个、100% 稳定或关机自动停、跳变/温控检测保留、前端 perfKind 泛化出电量+温度双线曲线与三件套导出、脚本全英文/前端中文。踩坑新增 #18 电池只能走串口/#19 PERF kind 注册/#20 log ASCII/#21 1h 窗口与 dataZoom 互斥)
+**最后更新**: 2026-09-16(v2.10.0:**每个脚本都出一份中文 HTML 报告 + 报告引擎沉淀** —— 承用户四点要求(每个脚本 stdout 的 Overall Result 都要出 HTML / 参考 perf 的生成逻辑 / 真机已连 / **把 HTML 的架构和 Params 写成 md 沉淀**)。v2.9.0 时中文 HTML 是 perf **独占**的,这一版抽成共享引擎 `scripts/_pptp_report.py`(588 行,下划线开头 → 平台不当可跑脚本;纯 stdlib、import 无副作用),**8 个脚本接进去**(bt/wifi_reboot **顺带补出此前根本不存在的 JSON 报告**),`ir_runner` 跳过(无判定语义)。**用户三项已批准决策**:① **stdout 一个字不改**(三种汇总家族原样并存,只在末尾多一行 `  html   = <路径>`;代价是 `rows` 要脚本手写 —— 换来两处显示的数不可能各算一遍);② `ir_runner` 跳过;③ 前端加「报告」按钮(故 server.py 新增只读路由 `GET /api/tasks/{id}/report`,因为 `archive/` 没有静态挂载)。**归档零改动**(已核实):`_companion_files` 只认「同目录 + 同 stem 前缀 + `.csv`/`.html`」,所以只要 HTML 与 JSON 同 stem 同目录就自动带走;归档时主报告改名 `report.json`,伴随文件保留原名。**路径推导封在引擎里** —— `write_html_report(json_path, doc)` 的签名里没有 html 路径参数,**让拼错无法表达**(踩坑 #45)。**不碰现有 JSON 报告**(全库无消费者解析它),HTML 用「完整数据」折叠区把 JSON 整体递归渲染进去保证 `HTML ⊇ JSON`,`hide_keys` 在**任意深度**按键名隐去 Wi-Fi 口令(**只隐 HTML,归档 JSON 仍含明文**)。**Params 架构**(用户点名沉淀的第 4 点):`render_params_table()` 从 `PARAMS` 声明生成三列表(参数 / 本次取值 / **来源**),**顺序遍历 schema 而非值的字典**,「来源」三态 = 本次未传 / 传入了与默认相同 / **已改(默认 X)** —— **"用户改没改过这个参数"在报告里直接看得见**;**`choices` 两种形状都要吃**(纯字符串列表 / `{value,label}` dict 列表,后者见 perf 的 `WATCH_PKG_CHOICES`),匹配不上时**原样显示而不是丢掉**;bool 渲染 `是`/`否` **绝不打 `True`/`False`**。**真机端到端实测**(B0403374A2A508001F00):`wifi_switch_stress` 短任务 → 归档里 `report.json` + `<stem>.html` 都在、`summary.json` 的 `artifacts` 列出 html 且 `report_source` = `stdout_line`(是嗅探命中不是 mtime 兜底);路由 → 200 `text/html`;`wifi_reboot_stress` **首次产出报告并归档成功**;**中断门**:跑到第 2 轮时平台「中断」→ 汇总照打、**报告 + html 照常写出并归档**;`perf_monitor --selftest` 0 failures;口令泄漏验证通过(三个 Wi-Fi 口令在 HTML 里全不在)。**有意偏离计划**:`perf_monitor` **保留自己的渲染器**(4 个区块比通用引擎丰富,重写有风险要碰 `--selftest`),只吸收参数表。**沉淀物** [docs/REPORT_FORMAT.md](REPORT_FORMAT.md)(13 节);**两条新踩坑 #45/#46**(#46:判断"要不要转义"必须看**数据类型**,不能看**数据长什么样** —— 第一版用 `str(c).startswith("<td")` 判 markup,任何以 `<td` 开头的值都会绕过转义)。**未证**:前端「报告」按钮的真实浏览器点击;`wifi_onoff`/`sensor_reboot`/`battery_inout` 只过了静态门与 `--dump-params`,**没在真机上跑过**。承 v2.9.0:**perf_monitor 参数面收敛 + 判定块自解释 + 中文 HTML 报告** —— 承用户跑完第一份真机短样本后的四项确认。参数面 `PARAMS` 从四个减到**三个**:删 `track_foreground`(前台采集**恒开** —— 「被压测的 app 挂了 / 掉到后台」是长跑里最该被看见的故障,`fg_*` 是唯一能看见它的信号)、`watch_pkg` 由自由文本改 **`type:"select"` 下拉**(预置清单 `WATCH_PKG_CHOICES` 是**占位**,用户后续给正式压测应用清单,届时只改这一处;理由:自由文本里一个拼错的包名会**静默废掉**唯一依赖它的 gate 9)、`interval_sec` 与 `duration_sec` 保留 —— **`interval_sec` 是基准拍周期 T,MED/SLOW 的周期由 T 推导(目标固定 5s/30s),分级采样不等于「不需要采样间隔」**(用户原话就是问这个)。输出面:判定块改为从**一张共享 row 表** `verdict_rows() 渲染,块尾新增 `--- what these mean ---` 每行一条英文解释(coverage / cadence 怎么算、`delta` 与 `slope` 为什么「打架」是设计如此、`STABLE|CHANGED|GONE` 的区别、`duty` 是监控自身加的负载);**stdout 仍然全 ASCII**。新增**中文 HTML 报告** `perf_<设备>_<时间>.html`:与 `report.json` **同名同目录、同一份 payload 渲染**(**不是第二份判定** —— 写失败只是少个附件,不改变结论),四张表(①指标判定 ②通道分布 含「采到 N 拍 / 应采 M 拍」③9 道检查门明细 未通过原因写在行内 ④链路事件)+ 四色结果横幅 + 未标定告警条,**自包含**(内联 CSS、无 JS、不拉图表库)以便拷出归档目录后在没装过 PPTP 的机器上仍可读;平台 `_companion_files()` 认领扩展名 `.csv` → `.csv` + `.html`。**⚠ 这一轮我自己引入并修掉了一个通道级静默失效**:删开关时把 `due_sec()` 的布尔谓词一起改写,`name not in (...) or self.track_fg` 被压成 `name not in (...)`,**逻辑整个取反**,`FOCUS`/`FGPKG`/`PIDSTAT` 三个 section 从此永远不「到期」—— **前台通道整轮零数据,而 `--selftest` 60+ 断言 / 假设备 harness / 真机 60s 实跑三层全绿**,报的是 `RESULT: OK`、9 门 pass、覆盖率 100%;唯一可见处是 samples.csv 里 SLOW 拍的状态字符恒为 `n` 而非 `b`/`f`。**根因是测试** —— 所有既有断言都是**形状**断言(CSV 矩形、报告可往返、9 道门),**没有一条问过「这个通道到底出过值没有」**,于是死掉的通道与太短的运行在形状上一模一样。修法:谓词提到模块级 `section_due()` + 6 条 selftest 断言 + harness 新增 `assert_channels_alive()`(读 `n_due_ok` 以免「设备一直离线」误报,**并用重新注入该 bug 的副本反向验证过它确实会失败**)。详见踩坑 #42。另有踩坑 #43:`server.py` 的 `_sniff_report_path()` 靠「含 `" : "` 且含 `report` 且以 `.json` 结尾、只取第一条命中」这么土的规则认领报告,所以新增的 HTML 行改用 `  html   = <path>`(`=` 而非 `:`,因为报告路径本身含 `report` 子串);selftest 现在**逐字复刻** server 的 sniff 规则断言「有且只有一行可认领且在最后一行」。件 `scripts/perf_monitor.py` 现已被 **E-SafeNet 包上密文壳**(Read/Grep 静默失效,Grep 直接 0 命中),此后一律用 Python + 断言改,见 [TODO.md](../TODO.md) §5。承 v2.8.0:**perf_monitor v2 落地(P2–P5)** —— 设计全文见 [PERF_MONITOR_V2.md](PERF_MONITOR_V2.md),**§12 权威**。数据面:三层分级采样(FAST 每拍 / MED 每 `ceil(5/T)` 拍 / SLOW 嵌套 `med*ceil(30/(med*T))` 拍,嵌套周期保证不出现「SLOW 到期而 MED 没到期」的畸形拍)、时间基准改**整数毫秒**(浮点秒在 T=1.1/2.2 上让 `ceil()` 病态)、**一拍一次 adb**(8 个 section 用 nonce 帧拼进同一条复合命令,设备杂音撕不开边界;**T=2s 实测占空比 9.06%**,设计预测 9.07%;「常驻 adb shell」这个显然优化被否)、**零阶保持**(没到期带上一拍的值 = `h`,不是 null —— 否则前端 `showSymbol:false` + `connectNulls:false` 会让稀疏序列**整条消失**、归档 `chart.png` 空白)。判定面:`judge(evidence)` 纯函数,9 道门 + 时长不足的 INCONCLUSIVE 地板,合并序 `INCONCLUSIVE > FAIL > WARN > OK`;`--selftest` 断言 `judge(report["evidence"]) == report["verdict"]` 对每份报告成立。输出面:实时行加 `st` 列(**必须定宽**,踩坑 #39);中途事件走 stdout(`!`告警 / `i`信息 / `?`未知,限流在脚本侧);前端加 `event` 分支并**删掉未知类型的 raw-JSON 回显**(否则新类型在每次 WS 重连刷满 console);归档新增 `samples.csv`(28 列 + 注释块)+ `events.csv`,平台 `_companion_files()` 按报告 stem 前缀配对认领(踩坑 #39 的列对齐同理:定宽是为了竖读,配对是为了不错认)。**真机实跑 40s/75s 两次**(MT9676 `B0403374A2A508001F00`):`RESULT: OK`、全门通过、覆盖率 100%、cadence 1.0x、占空比 9.06%、自测 adb 往返 55–62ms(**实测比设计文档里的 110–140ms 低得多 —— 那是另一条链路,所以往返基线改为启动自测而非硬编码常数**)。**实跑抓到一个单测与假设备 harness 两层都没抓到的 bug:`fg_cpu` 整场恒为 null**(基线推进条件写反,见踩坑 #38 —— 两个样本才能算值的指标,必须断言**第二个周期出值**,只断言形状合法等于没测)。**未标定**:所有判定阈值仍是设计假设,`judge_version=v1-uncalibrated`,**健康报告也会显示未标定**(刻意,避免假信心);标定需要一次健康的 8 小时基线跑;残余风险见 [TODO.md](../TODO.md) §6。**未验证**:真实浏览器观感(用户已同意后续实跑确认)。承 v2.7.6:**perf 实时行改定宽列** —— 用户原话「文字都挤在一起,很难观察到我需要的内容」。关键定位:**那行不是脚本打的,是前端 [`handlePerfLine`](static/app.js) 渲染的**,所以是纯前端改动。三条规则:① 每格定宽(pct 6 / secs 8 / MHz 7 字符),**缺值也占满自己的列**,否则后面全部左移、竖读就断;② **`null` 渲染成同宽 `-`** —— 掉线那一拍是一排短横,**永远不会被误读成"GPU 真的是 0.0%"**(直接对应踩坑 #14:本板视频硬解时 GPU≈0 是正确的 —— 一排零值必须是不可能被误撞出来的形状);③ **`pkg=` 挪到行尾**(包名长度不定,放中间会推歪后面每一列)。另去掉重复墙钟(`flushLogBuffer` 已在行首加 `[HH:MM:SS]`),列恒在(序列被禁用时输出一排短横,自解释且对齐)。**验证用 node 跑渲染逻辑**(`node --check` 测不出对齐):`pkg=` 之前前缀长度**恒为 82**,六行覆盖首拍/正常/GPU真0/4位秒/整拍掉线/无包名,列位置逐列一致。已知边界:`t` 超 27.7h 溢出 1 格(24h 包络内,不处理)。**未验证**:真实浏览器观感(用户已同意后续实跑)。承 v2.7.5:**logcat 人工开关** —— 起因是为 perf_monitor v2 做设计时发现的:logcat 对每个任务**恒开**,一次 8 小时 run ≈1GB 且没人看,更关键的是它**在压测已把设备打满时再压一路 `adb logcat`**,而监控任务要的恰恰是设备的自然状态 —— **采集器本身改变了被观测系统**。改为照 `serial_capture` 的形状加人工开关:设备卡 `device-row5` 一行 `☑ logcat 日志`,请求字段 `logcat_capture` **默认 True**(老前端不发则行为与今天完全一致),勾选状态**不持久化**(同串口,本次意图)。关掉时**零新分支**:`_stop_captures` 的"从未启动的通道"守卫与 `_archive_task` 的 `if not srcp.exists()` 天然跳过。真机串行验证三例:关 → 归档只有 `stdout.log`;开 → `logcat.log` + `stdout.log`;**不传字段 → 与开一致(向后兼容)**。踩坑新增 #37。perf_monitor v2 的完整设计见 [docs/PERF_MONITOR_V2.md](PERF_MONITOR_V2.md)(实测把单拍成本从 863ms 压到 82/194/306ms,并否掉了"常驻 adb shell"这个显然优化)。承 v2.7.4:**修复"脚本在同事机器上无法结束"(stdout 管道两端编码不一致)** —— 同事机器上 `perf_monitor` 跑起来永远不结束,日志先是一个空行再 `[error] 'gbk' codec can't decode byte 0xaa`。**根因**:`server_window.ps1` 给子进程设了 `PYTHONIOENCODING=utf-8`(写 UTF-8),而 server.py 的 `Popen(text=True)` **没写 `encoding=`**(读 GBK)—— 脚本 stdout 里任意一个 GBK 非法字节对就让 `readline()` 抛 `UnicodeDecodeError`。**症状之所以是"无法结束"而不是"报错"**:那个异常逃到了 `_stream_logs` 底部的兜底 handler(只广播一条错误就 `return`),**把下面的收尾块整块跳过**(等退出 / `exit_code` / 终态 / `_stop_captures` / 归档 / `end` 帧)。三层修复:① 管道两端都钉死 UTF-8 + `errors="replace"`(含 `child_env["PYTHONIOENCODING"]`,这样不经 `server_window.ps1` 直接启服务也一致);② **读取循环自带 `try`**,失败则记原因 + 广播 + 终止子进程 + 离线程 `wait()`,收尾**无条件**执行 → 任务不可能停在半路;③ 同类隐患一并修(`ir_runner.py` 3 处、`_adb_reconnect_offline`、`/api/adb/reconnect`)。**真做了 A/B**(不是推断):回退这两处造出 pre-fix 副本,同一根探针脚本 —— 修复前 `status=running`/`exit_code=None`/**永不结束且不归档**、日志孤儿留在 `logs/`;修复后 `finished`/`0`/已归档且 `stdout.log` 逐字节完整。**注意:`locale.getpreferredencoding()` 本机同样是 `cp936`,不是"同事环境特殊",只是触发取决于脚本输出里有没有 GBK 非法字节。** 踩坑新增 #35。承 v2.7.3:**串口勾选高亮 + 任务面板排版 + reports/ 不再堆积** —— 串口行开启时整行高亮(淡蓝底+蓝边框+主题色加粗;padding/border 常驻以免勾选时卡片跳高);删掉任务面板里那个**死节点** `task-hint`(HTML 写死、JS 零引用,白占 70px 把 300px 宽的面板挤爆),`.panel-header` 加 gap + wrap、按钮组 `margin-left:auto` 保证换行后仍右对齐;**报告改为"搬"不是"复制"**(先 copy 再 unlink,删失败不丢唯一副本),`reports/` 变成几秒钟的暂存区、不再累积,并且一个任务的多份报告(`app_launch` 每个 APP 一份)全部归档为 `report.json`/`report-2.json`,不再把其余的永远留在 `reports/`。承 v2.7.2:**掉线容忍** —— 串口从"一次性"改成受监督重连循环(`_serial_attempt`,连续失败预算 60、收到数据清零、每次重试换新线程/新 Event、写可见 marker);新增 `_device_watchdog` 每 20s 发一次 **`adb reconnect offline`**(只影响离线设备,**绝不 `kill-server`**,不影响在线设备上的其它脚本);"临时离线"合成卡补上 `interrupting`;`_broadcast` 发送超时后**真正 `ws.close()`**(否则前端 `onclose` 不触发 → 浏览器握着死 socket 永远收不到日志)。顺带修复 v2.7.0 删 2s 心跳时连带删掉的 `t["captures"]` 刷新(加 `_announce_captures`,**只在状态迁移时发**以免churn 渲染键)。**探查先于实现**:用户 5 条需求里 2 条其实已满足(monitor 脚本的 `adb_shell` 从不抛异常;任务卡从不会消失),没有重复造。**明确不做**:monitor 脚本泛化、新增离线提醒 UI、自动 `kill-server`。踩坑新增 #30-#32。**未证**:串口重连成功路径与 watchdog 真触发(都需要动硬件)。承 v2.7.1:用户试用反馈的四点 —— ① **存档按模块分类** `archive/<模块>/<时间>_<脚本>_<设备>/`(`ARCHIVE_MODULES` 显式映射,与 `reports/stress-test/<模块>/` 对齐,根目录下只有模块文件夹);② **存档入口提到顶栏**(全局功能放全局位置)+ 占用徽标 hover 看分模块占用;③「清空已完成」改名「**清空已完成的卡片**」;④ **修复报告误归属**:兜底 mtime 扫描曾把前一个任务的报告算给当前任务(同设备背靠背跑时),三重收紧 —— 只扫登记脚本 / mtime ≥ 开始时间 / `_CLAIMED_REPORTS` 唯一认领。另 `_archive_dir()` 对旧扁平布局回退(升级期间老任务仍可读)。已清理 `logs/` 48 个历史日志 + `reports/` 59 个报告 + 测试存档(**两个目录本身不能删**:`logs/` 是运行期工作区 + 服务日志,`reports/` 是脚本契约,用户只需看 `archive/`)。**reboot 脚本的假 PASS 问题已记录进 [TODO.md](../TODO.md),本轮不改。** 承 v2.7.0:**任务结束自动存档 + 日志前端方案收敛** —— 每个任务终态把三份日志 `move` + 脚本报告 `copy` 进 `archive/<时间>_<脚本>_<设备>/` 并写 `summary.json` 清单;`chart.png` 由浏览器渲染后 POST 回传(服务端**不引入绘图库**),浏览器没开则如实缺图;`logs/` 降级为运行期临时区;**`×`/「清空已完成」只移除列表条目,存档永久保留**(`_forget_task`);任务卡新增「存档」按钮 + 任务面板显示总占用;导出按钮隐藏(代码保留)。同轮**删掉** v2.6.0 预埋的 logcat/串口前端显示方案(`CHANNELS`/`TABS_ENABLED`/`activeSource`/`captureCounts`/计数 pills/`#channel-bar`/服务端 2s 计数心跳)—— 用户要求"稳定简单为主导",前端只保留 stdout,logcat/串口仅服务端采集归档;保留 console 里**一行** `[archive]` 摘要作为串口失败的唯一信号。另修复对抗审查发现的四条采集隐患:logcat 重启预算改为**连续**计数(旧的终身 5 次会让 100 轮重启压测在第 6 轮永久停采)、收尾不再覆盖通道自己的 `failed/unavailable/capped` 诊断、串口读线程死后可见、串口加 512MB 上限;重启回读 2000 行以回填开机日志。踩坑新增 #27-#30。**未证:前端实际渲染效果(无真实浏览器)。** 承 v2.6.0:**每任务三源实时日志采集** —— logcat 恒开 + 串口按任务勾选,服务端采集(9 个脚本零改动),WS 按源订阅过滤(`WS_SUBS`,无人订阅的源零成本)+ 5s 发送超时;logcat 自动重启循环(adb kill-server / 设备重启后 ≤2s 恢复,写可见 marker)、256MB 上限(`PPTP_LOGCAT_MAX_MB`)、**永不 `logcat -c`**;串口走守护线程 + 丢最旧队列,`script_owns_port` 仲裁让位 battery 脚本;日志文件名改为 **`<task_id>_<时间>_<脚本>_<设备>.<源>`**(服务器下发确切名,前端不重建路径);`GET /api/tasks/{id}/log?source=` 一律尾部读 + 非法源 400;新增 `GET /api/serial/ports`;导出改为多源下载 + 导出名含设备/脚本/时间;**前端仅展示 stdout**(`TABS_ENABLED=false`,数据层/WS/渲染路由已按通道就位,`#channel-bar` 预留节点在 `#log-info` 外)。踩坑新增 #22-#26。**未证:串口数据通路**(端口开合正常、无副作用,但"读到字节"未被观测到 —— 开机后空闲 console 无输出属合理表现)。承 v2.5.2:新增重启蓝牙音箱回连压测脚本 `bt_reboot_stress.py` —— 仿 wifi_reboot_stress(reboot → 上线 → 轮询 A2DP 回连),回连判定 = 适配器开 + A2DP `mConnectionState: CONNECTED`,只测重启回连不测开关回连(蓝牙开关未开放给用户);真机验证边界行为:刚连上立即重启回连失败、手动重连一次后 ~6s 自动回连。承 v2.5.1:前端 log console 全英文/ASCII + 折线图 x 轴从 2min 刻度改为固定 1h 滚动窗口 6×10min 刻度,perf/battery 同步;删除 STATUS_ZH/JUMP_TYPE_ZH 中文映射、时间戳走 fmtClock 强制 24h、移除 dataZoom;放电/电池测试结束设备关机后卡片不再消失,合成"放电关机"专用卡(仿临时离线);**导出的 chart.png 改为全程图**(`exportFullChartDataUrl` 从 perfSamples 全量渲染,不受 1h 实时窗口限制),**横轴 0.5h 一个刻度**。承 v2.5.0:新增电池充放电压测脚本 battery_inout_stress —— 串口开 health 轮询拿实时电量/温度、mode 充/放电单次只跑一个、100% 稳定或关机自动停、跳变/温控检测保留、前端 perfKind 泛化出电量+温度双线曲线与三件套导出、脚本全英文/前端中文。踩坑新增 #18 电池只能走串口/#19 PERF kind 注册/#20 log ASCII/#21 1h 窗口与 dataZoom 互斥)
+**2026-09-16 补记(用户裁决)**:`wifi_onoff_stress.py` **中断时也写报告 + HTML** —— 用户原话「中断时报告与 HTML 都写,报告简单注明一下吧」。原先报告写入被 `if not interrupted:` 包着而 `=== results ===` + `OVERALL` 在守卫外,中断时 stdout 有 Overall Result 却零产物;现**守卫整条删除**(只补 HTML 不可能:同 stem 才能被归档收走,孤儿 HTML 会被静默丢弃)。**判定一个字不改**,中断进 `interrupted` / `interrupted_note` 并渲染成 HTML横幅下那条黄条。真机实测通过,细节见 [CHANGELOG.md](../CHANGELOG.md) 的 v2.10.0「中断时报告与 HTML 都写」。
+
 **会话状态**: 完整运行中,所有改动已通过端到端验证
 **未完成需求**:
 - **v2.7.0 前端从未在真实浏览器里跑过** —— 服务端全部逐路径验证通过,DOM id 也做了交叉校验,但"按钮长什么样、点下去对不对"没人看过。**下次开浏览器先 Ctrl+F5**,重点看:任务卡 `存档` 按钮、任务面板占用数字、跑完那次 `[archive]` 摘要行、以及图表回传是否真的落进 `archive/*/chart.png`。
 - **`wifi_reboot_stress.py` 会把失败的 reboot 记成 PASS(已报用户,未改)**:`adb reboot` 的 `rc` 被丢弃,而"设备已上线"的轮询对一个**从未重启**的设备同样成立 → 若 `adb reboot` 中途开始失败(ADB/USB 抖动、瞬时 offline、固件不允许),100 轮仍会全部 PASS 并打印 100% 通过率。**对压测平台来说假绿是最坏的输出**,建议先向用户确认再改。
 - 同上脚本:第一轮迭代完成前中断会打印 `passed: 0 / 0` + `success rate: 0.0%` + exit 1,**读起来像彻底失败**,而实际上什么都没测。
+- **`wifi_onoff_stress.py` 中断时不写报告 —— 已于 2026-09-16 修复(用户裁决)**。守卫 `if not interrupted:` 整条删除,
+  中断时 JSON 与 HTML 都写,报告里带 `interrupted` / `interrupted_note`,HTML 的黄条里能看到那句注;
+  判定一个字不改。真机实测过(跑到第 2 轮点「中断」)。见上一条与 [CHANGELOG.md](../CHANGELOG.md)。
+- **`wifi_onoff` / `sensor_reboot` / `battery_inout` 三个脚本的报告没在真机上跑过**(v2.10.0)—— 只过了静态门与 `--dump-params`。
+  下次跑真机时优先补这三个。
 - **串口停止时最后半行必丢**(见 §5.5.5 #30)—— 已确认,刻意不修。
 - sensor_reboot_stress 待连真机验证读取方式与 PASS 判定(脚本已就绪)
 - app_launch_stress **冷启动已真机验证通过**(三个 APP 各 1 轮,TotalTime 正常、LaunchState=COLD、Displayed 交叉验证 1/1 命中);**热启动(hot)模式还没真机验证**——等跑一轮确认 HOME 退后台 → 拉起流程与 WARM/HOT 语义校验

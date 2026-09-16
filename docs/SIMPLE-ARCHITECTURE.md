@@ -1,10 +1,11 @@
 # PPTP 架构总览
 
-> **本文档描述 PPTP 平台当前的真实架构(v2.7.3,2026-09-11)。**
+> **本文档描述 PPTP 平台当前的真实架构(v2.10.0,2026-09-16)。**
 > 代码级细节(函数行号 / 数据模型 / 设计决策 / 踩坑)以 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 为准;
 > 本文是"系统长什么样、数据怎么流、契约是什么"的速览。改代码前先看 HANDOFF。
 
-> 版本:v2.7.3 | 维护规则:架构变动随版本更新;README / CHANGELOG / HANDOFF 同步。
+> 版本:v2.10.0 | 维护规则:架构变动随版本更新;README / CHANGELOG / HANDOFF 同步。
+> 报告(HTML)的格式与参数架构单独沉淀在 [REPORT_FORMAT.md](REPORT_FORMAT.md)。
 
 ---
 
@@ -85,6 +86,7 @@
 | GET | `/api/tasks/{id}/log?source=` | 单通道日志**尾部读**(默认 `stdout`;非法 source → 400;归档后从 `archive/` 读) |
 | POST | `/api/tasks/cleanup` | 从列表移除已结束任务(**存档保留**) |
 | GET | `/api/serial/ports` | 本机 COM 口列表(pyserial 缺失 → 空列表) |
+| GET | `/api/tasks/{id}/report` | 内联返回该次运行归档里的 HTML 报告(任务卡「报告」按钮;**archive/ 没有静态挂载**,这是唯一入口。多份报告时开文件名第一份) |
 | POST | `/api/tasks/{id}/archive/artifact` | 浏览器回传图表 PNG 进存档(白名单 + 8MB 上限) |
 | POST | `/api/tasks/{id}/archive/reveal` · `/api/archive/reveal` | 资源管理器打开任务存档 / 存档根目录 |
 | GET | `/api/archive/stats` | 存档总数与总占用 |
@@ -148,6 +150,8 @@
         ├─▶ _archive_task(task_id, reason)    ← 幂等、同步、绝不抛
         │      ├─ 三份日志 Path.replace() 进 archive/<名字>/
         │      ├─ report.json ← stdout 嗅探到的路径(兜底 mtime 扫描),必须落在 reports/ 内
+        │      ├─ <报告stem>.html ← _companion_files 按「同目录+同stem+.html」自动收走
+        │      │    (v2.10.0 起每个脚本都有;主报告改名为 report.json,伴随文件保留原名)
         │      └─ summary.json ← 参数/状态/各文件 bytes+lines/report_source/notes
         ├─▶ WS end 帧(带 archive 字段)
         └─▶ console 一行 [archive] 摘要(串口采到没有就靠这一行)
@@ -155,8 +159,23 @@
 
 图表由**浏览器**在任务结束时渲染后 POST 到 `/api/tasks/{id}/archive/artifact` —— 服务端**故意不引入绘图库**(ECharts 只存在于页面里)。代价:结束时浏览器没开就没有 `chart.png`,由 `summary.json` 如实反映。
 
+### 4.5 报告生成(脚本侧,与平台解耦)
+
+```
+脚本已有的局部变量 ──┬──▶ 现有 print(...)        ★ 平台只显示 stdout,一字不改
+                     └──▶ rows=[row(...), ...]   ★ 值表达式抄旁边那一句
+                                └─▶ build_payload() ─▶ write_html_report(json_path, doc)
+                                                              └─▶ <报告同stem>.html
+```
+
+**引擎不渲染 stdout,平台也不解析 HTML** —— 两边唯一的接触面是文件系统上的 stem 配对(见 4.3)。
+所以报告能力**对平台是零改动的**:`_pptp_report` 是纯 stdlib、import 无副作用、下划线开头(opts out of 脚本发现)。
+
+**接口**:stdout 里 `report :` 行仍是可嗅探的最后一行;新增 `html =` 行用 `=` 所以不会被误认。
+完整契约、参数表模型、新脚本接入清单 → [REPORT_FORMAT.md](REPORT_FORMAT.md)。
+
 ### 4.4 中断 / 硬停
-- **中断**:`POST /api/stop/{id}` → 子进程发 CTRL_BREAK(Windows)→ 脚本 `SIGBREAK→KeyboardInterrupt` → 打印已完成汇总 → 退出 → 状态 `interrupted`。**刻意不杀采集** —— 停机/收尾日志最有价值,由 `_stream_logs` 在真正 EOF 时统一收
+- **中断**:`POST /api/stop/{id}` → 子进程发 CTRL_BREAK(Windows)→ 脚本 `SIGBREAK→KeyboardInterrupt` → 打印已完成汇总 → **报告与 HTML 照常写出**(2026-09-16 起,中断不再跳过报告;报告里注明本次被中断)→ 退出 → 状态 `interrupted`。**刻意不杀采集** —— 停机/收尾日志最有价值,由 `_stream_logs` 在真正 EOF 时统一收
 - **硬停**:`POST /api/tasks/force-stop-by-device/{serial}` → `proc.kill()`(SIGKILL)+ 就地归档(SIGKILL 没有 EOF 可等)
 
 ---
@@ -167,7 +186,11 @@
 2. **自描述参数**:可选模块级 `PARAMS` 列表 + `--dump-params` 打印 schema(`int/float/bool/str/select`);前端自动渲染参数弹窗
 3. **SIGBREAK → KeyboardInterrupt**:平台"中断"按钮能优雅打断并输出已完成汇总
 4. **ASCII-only stdout**:不打印非 ASCII,避免 Windows 控制台乱码 / WS 编码问题
-5. **报告落盘**:`reports/stress-test/<模块>/<name>_<dev>_<ts>.json`(已 gitignore)
+5. **报告落盘**:`reports/stress-test/<模块>/<name>_<dev>_<ts>.json`(已 gitignore)。
+   **v2.10.0 起每个脚本还要写一份同 stem 的中文 HTML** —— 走共享引擎 `_pptp_report.write_html_report(json_path, doc)`,
+   路径由引擎从 JSON 路径推导(**不要自己拼串**:stem 逐字相同是归档能收到它的唯一条件)。
+   stdout 里 `report :` 行必须**仍是最后一行**(`_sniff_report_path` 只取第一行命中);新增的 `html =` 行必须用 `=`。
+   完整规则见 [REPORT_FORMAT.md](REPORT_FORMAT.md);`ir_runner.py` 无报告(无 PASS/FAIL 语义)。
 6. **退出码**:0 = PASS / 手动结束,非 0 = FAIL
 7. **日志采集不归脚本管**(v2.6.0):脚本**不需要**也不应该自己抓 logcat / 开串口 —— 平台在服务端统一采集。唯一例外是脚本**业务本身**需要串口(`battery_inout_stress.py` 的 `serial_port`),此时平台按其参数声明**自动让位**(`skipped`/`script_owns_port`),不抢口
 
@@ -179,7 +202,7 @@
 | `wifi_switch_stress.py` | 多网络循环切换(预置 `WIFI_NETWORKS`) | cycles/use_su |
 | `sensor_reboot_stress.py` | 重启 + gsensor/ToF 回连压测 | sensor/iterations/reboot_timeout |
 | `app_launch_stress.py` | APP 冷/热启动耗时(APP_PRESETS 内置 3 APP 一起跑) | mode/iterations/p95_threshold |
-| `perf_monitor.py` | CPU/GPU/内存% + 前台APP CPU%(PERF| 流 → 前端图表) | interval/duration/track_foreground |
+| `perf_monitor.py` | CPU/GPU/内存% + 前台APP CPU%(PERF| 流 → 前端图表);跑完出 `report.json` + 中文 HTML(**保留自己的渲染器**,4 个区块比通用引擎丰富;参数表走共享引擎) | interval/duration/watch_pkg |
 | `battery_inout_stress.py` | 电池充/放电压测(电量/温度/电压,串口开 health 轮询,100% 稳定或关机自动停) | mode/serial_port/interval/temp_warn/full_hold |
 | `bt_reboot_stress.py` | 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询音箱回连,判定=适配器开 + A2DP CONNECTED) | iterations/wait_sec/bt_reconnect_timeout/back_online_timeout |
 
@@ -206,19 +229,20 @@ ProjectorPressureTest/
 ├── server.py              # FastAPI 单文件(2491 行)
 ├── start.bat / stop.bat / server_window.ps1   # 一键启停 + 服务窗口
 ├── README.md / CHANGELOG.md
-├── docs/                  # 给 agent 的文档(见 §8)
+├── docs/                  # 给 agent 的文档(见 §8);REPORT_FORMAT.md = 报告格式与参数架构真源
 ├── static/
 │   ├── index.html         # 单页(155 行)
 │   ├── app.js             # 前端逻辑 IIFE(2317 行)
 │   ├── style.css          # 暗色主题(872 行)
 │   └── vendor/echarts.min.js  # ECharts 5.5.1 本地化(~1MB)
-├── scripts/               # 9 个压测脚本(平台契约,§5)
+├── scripts/               # 9 个压测脚本(平台契约,§5) + _pptp_report.py 报告引擎(下划线开头 → 不当可跑脚本)
 ├── ir_sequences/          # IR 序列 .ini + KEY_REFERENCE.md 按键速查
 ├── reports/stress-test/   # 脚本报告原始落点(脚本契约;平台复制一份进 archive/,gitignore)
 ├── archive/               # ★ 任务存档(永久保留,**按模块分类**)
 │   └── <模块>/{wifi,perf,battery,sensor,app-launch,ir,bt,other}/
 │        └── <时间>_<脚本>_<设备>/{stdout,logcat,serial}.log
 │            + report.json + chart.png + summary.json
+│            + <报告stem>.html   ← v2.10.0 起每个脚本都有(伴随文件,不改名)
 └── logs/                  # 运行期临时工作区(任务结束内容搬进 archive/)
                            #   server.out/err.log + <task_id>_<时间>_<脚本>_<设备>.*
 ```
@@ -231,6 +255,8 @@ ProjectorPressureTest/
 |---|---|---|
 | [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) | **真源**:API / 数据模型 / 前端交互模型 / 踩坑清单 / 设计决策 | 活跃(逐版本维护) |
 | [SIMPLE-ARCHITECTURE.md](SIMPLE-ARCHITECTURE.md) | 本文:架构总览 / 数据流 / 脚本契约 | 活跃 |
+| [REPORT_FORMAT.md](REPORT_FORMAT.md) | **报告格式真源**:HTML 架构 / row 模型 / payload schema / **Params 表** / 归档配对 / stdout 契约 / 接入清单 | 活跃(v2.10.0 新增) |
+| [PERF_MONITOR_V2.md](PERF_MONITOR_V2.md) | perf_monitor v2 的判定模型(judge / gates / ROW_SPEC) | 活跃 |
 | [FRONTEND_UX.md](FRONTEND_UX.md) | 前端"为什么这样设计" + 交互决策时间线 | 活跃 |
 | [SIMPLE-PRD.md](SIMPLE-PRD.md) | v2.0 初版 PRD(历史) | 已归档 |
 | [SIMPLE-PLAN.md](SIMPLE-PLAN.md) | v2.0 初版实施计划(历史) | 已归档 |

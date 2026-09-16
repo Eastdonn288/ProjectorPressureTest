@@ -8,7 +8,7 @@
 **铁律:纯本地/单机、无远程、无鉴权、单用户。** 技术栈:FastAPI 单文件 server.py + 原生 JS(static/app.js) + ECharts 本地 vendor(无构建步骤)。
 
 ## 文档纪律(Context 预算铁律,最重要)
-- **docs/HANDOFF_PROMPT.md 是真源(2026-09-11 v2.7.4)**,但**永远懒加载**:任务涉及哪个模块,就 `grep`/`Read` 对应章节;**严禁从 §1 开始通读全文档,严禁 `cat` 整个文件**。
+- **docs/HANDOFF_PROMPT.md 是真源(2026-09-14 v2.7.6)**,但**永远懒加载**:任务涉及哪个模块,就 `grep`/`Read` 对应章节;**严禁从 §1 开始通读全文档,严禁 `cat` 整个文件**。
 - docs/SIMPLE-ARCHITECTURE.md(架构速览)、docs/FRONTEND_UX.md(前端决策)、README.md(用户向)、CHANGELOG.md(版本沿革)同理按需读。
 - **会话启动 auto-load 面阈值**:CLAUDE.md + auto-memory 索引合计 **<5K tokens**;CLAUDE.md 本身 **<100 行**。新增长期事实 → 写进 memory 目录(每文件一条事实),**不要**堆进本文件。
 - 新会话:记忆索引 MEMORY.md 已自动载入,需要细节再按 `[[slug]]` 读对应记忆文件。

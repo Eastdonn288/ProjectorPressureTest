@@ -48,6 +48,12 @@ import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/app_launch_stress.py`. See
+# docs/REPORT_FORMAT.md.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
@@ -55,6 +61,8 @@ if hasattr(signal, "SIGBREAK"):
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # App(s) under test — HARD-CODED (per user, NOT a frontend param).
@@ -547,11 +555,87 @@ def main() -> int:
                 if s["note"]:
                     print(f"  note #{s['attempt']}: {s['note']}")
 
+            # The Chinese HTML twin of this app's report, for reading
+            # afterwards. One report per app (a run tests three apps), so this
+            # is one page per app, each paired to its own JSON by filename stem.
+            # The same values the block above printed, so they cannot disagree.
+            judged = len(valid) > 0 and p95_threshold_ms > 0 and not stopped
+            doc = _pptp_report.build_payload(
+                script="app_launch_stress.py",
+                script_version=SCRIPT_VERSION,
+                test_name=f"APP {'冷' if mode == 'cold' else '热'}启动压测"
+                          f" - {preset['label']}",
+                device_id=args.device,
+                result=("PASS" if passed else "FAIL") if judged else None,
+                level=("ok" if passed else "fail") if judged else "inconclusive",
+                count_zh=(f"{len(valid)} 个有效样本" if len(valid)
+                          else "没有有效样本"),
+                warn_zh=("本次不判定(p95 阈值为 0 或运行被中断)" if not judged
+                         else ("" if passed else
+                               f"p95 {p95}ms 超过阈值 {p95_threshold_ms}ms")),
+                rows=[
+                    _pptp_report.row(
+                        "overall", "总体结果",
+                        ("PASS" if passed else "FAIL") if judged else "—",
+                        ("ok" if passed else "fail") if judged
+                        else "inconclusive",
+                        (f"p95 {p95}ms <= 阈值 {p95_threshold_ms}ms"
+                         if p95_threshold_ms > 0
+                         else "阈值为 0,本次不判定")),
+                    _pptp_report.row("valid", "有效样本数", len(valid),
+                                     "info",
+                                     f"计划 {iterations},完成 {len(samples)}"),
+                    _pptp_report.row("failed", "启动失败次数", failed,
+                                     "ok" if failed == 0 else "warn",
+                                     "am start 未报 TotalTime 或启动未完成"),
+                    _pptp_report.row(
+                        "range", "最小 / 平均 / 最大",
+                        (f"{min(valid)} / {sum(valid) / len(valid):.1f} / "
+                         f"{max(valid)} ms") if valid else "—", "info",
+                        "仅统计有效样本"),
+                    _pptp_report.row(
+                        "pct", "p50 / p90 / p95 / p99",
+                        (f"{stats.get(50)} / {stats.get(90)} / "
+                         f"{stats.get(95)} / {stats.get(99)} ms")
+                        if stats else "—", "info",
+                        f"判定门限为 p95 <= {p95_threshold_ms}ms"),
+                    _pptp_report.row(
+                        "xcheck", "Displayed 交叉校验",
+                        (f"{len(close)}/{len(both)} 在 "
+                         f"{DISPLAYED_TOLERANCE_MS}ms 内") if both else
+                        ("不适用(热启动通常无 Displayed)" if mode == "hot"
+                         else "—"), "info",
+                        "am start 的 TotalTime 与 logcat Displayed 互校"),
+                ],
+                params_schema=PARAMS,
+                params_values={"mode": mode, "iterations": iterations,
+                               "p95_threshold_ms": p95_threshold_ms},
+                sections=[
+                    _pptp_report.section_list(
+                        "notes", "异常样本备注",
+                        [f"第 {s['attempt']} 次:{s['note']}" for s in samples
+                         if s["note"]],
+                        sub_zh="只列出有备注的样本",
+                        empty_zh="本次没有异常样本"),
+                ],
+                detail={"app_label": preset["label"],
+                        "app_package": preset["package"],
+                        "app_activity": comp, "mode": mode,
+                        "iterations_planned": iterations,
+                        "iterations_completed": len(samples),
+                        "stopped_early": stopped, "failed_launches": failed,
+                        "p95_threshold_ms": p95_threshold_ms,
+                        "stats_ms": stats, "passed": bool(passed),
+                        "samples": samples})
+
             try:
                 report_path = save_report(
                     args.device, mode, preset["label"], preset["package"], comp,
                     iterations, len(samples), stopped, failed, samples, stats,
                     p95_threshold_ms, passed)
+                html_path = _pptp_report.write_html_report(report_path, doc)
+                if html_path:
+                    print(f"  html            = {html_path}")
                 print(f"  report          : {report_path}")
             except Exception as e:
                 print(f"[warn] failed to save report: {e}")

@@ -44,6 +44,11 @@ import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/sensor_reboot_stress.py`.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
@@ -51,6 +56,8 @@ if hasattr(signal, "SIGBREAK"):
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
 
 # ---- sensor device nodes & read tuning (internal, not frontend params) ----
 GSENSOR_NODE = "/dev/gsensor"
@@ -500,12 +507,106 @@ def main() -> int:
             if not r["ok"]:
                 print(f"    #{r['attempt']}: {r.get('error', 'sensor no data')}")
 
+    # The Chinese HTML twin of the report printed above, built from the same
+    # local values as that block so the two cannot disagree. This script prints
+    # NO overall verdict line when the run was interrupted, so there is nothing
+    # to mirror: `passed` only exists on the branch that prints it, and an
+    # early-stopped run stays result=None - the page then says the run is not
+    # judged instead of inventing a PASS out of a partial run.
+    verdict = None if stopped_early else ("PASS" if passed else "FAIL")
+    verdict_level = "inconclusive" if verdict is None else (
+        "ok" if passed else "fail")
+
+    warn_zh = ""
+    if stopped_early:
+        warn_zh = (f"运行提前结束(手动停止或中断),计划 {iterations} 轮,"
+                   f"实际完成 {total_valid} 轮 - 本次不做通过/不通过判定")
+    elif not passed:
+        warn_zh = (f"成功率 {success_rate:.2f}% 低于达标线 "
+                   f"{PASS_THRESHOLD:.1f}%,共 {failure_count} 轮重启后"
+                   f"未能读到 {sensor} 数据")
+
+    doc = _pptp_report.build_payload(
+        script="sensor_reboot_stress.py",
+        script_version=SCRIPT_VERSION,
+        test_name=f"重启投影仪{sensor_cn}回连测试",
+        device_id=args.device,
+        result=verdict,
+        level=verdict_level,
+        count_zh=(f"提前结束:完成 {total_valid}/{iterations} 轮"
+                  if stopped_early
+                  else f"{success_count}/{total_valid} 轮读到有效数据"),
+        warn_zh=warn_zh,
+        rows=[
+            _pptp_report.row("overall", "总体判定",
+                             verdict if verdict else "未判定", verdict_level,
+                             (f"达标线:成功率 >= {PASS_THRESHOLD:.1f}%"
+                              if verdict else "运行提前结束,未做判定")),
+            _pptp_report.row("planned", "计划轮次", iterations, "info",
+                             f"每轮:重启 -> 等待上线 -> 轮询 {sensor}"),
+            _pptp_report.row("completed", "实际完成轮次", total_valid, "info",
+                             "提前结束,未跑满计划" if stopped_early
+                             else "按计划跑满"),
+            _pptp_report.row("ok", "成功次数", success_count,
+                             "ok" if total_valid and success_count == total_valid
+                             else "info",
+                             f"{POLL_COUNT} 次轮询内读到有效数据即算成功"),
+            _pptp_report.row("ng", "失败次数", failure_count,
+                             "fail" if failure_count else "info",
+                             "见下方失败明细" if failure_count else "无失败"),
+            _pptp_report.row("rate", "成功率",
+                             f"{success_rate:.2f}%" if total_valid else None,
+                             verdict_level, f"达标线 {PASS_THRESHOLD:.1f}%"),
+            _pptp_report.row("boot", "平均开机耗时", f"{avg_boot:.1f}s", "info",
+                             (f"{len(boot_times)} 次成功上线参与平均"
+                              if boot_times else "本次无成功上线记录")),
+            _pptp_report.row("cycle", "平均单轮耗时", f"{avg_cycle:.1f}s", "info",
+                             "从发起重启到本轮读数结束"),
+        ],
+        params_schema=PARAMS,
+        params_values={"sensor": sensor, "iterations": iterations,
+                       "reboot_timeout": reboot_timeout},
+        sections=[
+            _pptp_report.section_table(
+                "failures", "失败明细", ["轮次", "原因"],
+                [[r["attempt"], r.get("error", "sensor no data")]
+                 for r in test_results if not r["ok"]],
+                sub_zh="与 stdout 的 failed attempts 列表同源",
+                empty_zh="本次无失败轮次"),
+        ],
+        # Same keys as the JSON report written below, so the page and the file
+        # describe one run identically. Nothing secret in here, so there is no
+        # hide_keys.
+        detail={
+            "total_attempts": iterations,
+            "actual_completed": total_valid,
+            "stopped_early": stopped_early,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "success_rate": round(success_rate, 2),
+            "pass_threshold": PASS_THRESHOLD,
+            "sensor": sensor,
+            "sensor_config": {
+                "gsensor_node": GSENSOR_NODE,
+                "gsensor_min_samples": GSENSOR_MIN_LINES,
+                "tof_node": TOF_NODE,
+                "reboot_timeout_sec": reboot_timeout,
+                "sensor_window_sec": SENSOR_WINDOW,
+                "poll_count": POLL_COUNT,
+                "poll_interval_sec": POLL_INTERVAL,
+            },
+            "test_results": test_results,
+        })
+
     # Report is always saved (even on early stop), matching the original test.
     try:
         report_path = save_report(
             args.device, sensor, sensor_cn, iterations, total_valid,
             stopped_early, success_count, failure_count, success_rate,
             reboot_timeout, test_results)
+        html_path = _pptp_report.write_html_report(report_path, doc)
+        if html_path:
+            print(f"  html          = {html_path}")
         print(f"  report        : {report_path}")
     except Exception as e:
         print(f"[warn] failed to save report: {e}")

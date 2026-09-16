@@ -31,8 +31,12 @@ NOTE on wpa_cli + root:
 
 Stop handling: PPTP platform sends CTRL_BREAK (SIGBREAK on Windows), which the
 platform turns into KeyboardInterrupt here. The loop then falls through to a
-summary of the completed iterations (report is only saved on full completion,
-matching the original test's behavior).
+summary of the completed iterations, and the report is written anyway: an
+interrupted run prints an Overall Result, so it owes a report too. The report
+carries `interrupted: true` + `interrupted_note`, and the HTML twin shows that
+note in a warning bar under the banner, so a partial run cannot read as a full
+one. (Until v2.10.0 the report was skipped on interrupt, matching the original
+test's behavior.)
 """
 import argparse
 import json
@@ -43,6 +47,12 @@ import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/wifi_onoff_stress.py`. See
+# docs/REPORT_FORMAT.md.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
@@ -50,6 +60,8 @@ if hasattr(signal, "SIGBREAK"):
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
 
 # Frontend-configurable params (declared for the PPTP platform).
 # The platform renders a config modal from this list and passes the chosen
@@ -185,8 +197,14 @@ def scan_wifi_networks(serial: str, iface: str = "wlan0", use_su: bool = True,
 def save_report(device: str, planned: int, actual: int, expected_ssid: str,
                 wifi_ok: int, network_ok: int, count_ok: int,
                 count_abnormal: int, count_details: list[dict],
-                wifi_rate: float, network_rate: float, count_rate: float) -> str:
-    """Write the JSON report under reports/stress-test/wifi/. Returns path."""
+                wifi_rate: float, network_rate: float, count_rate: float,
+                interrupted: bool = False, interrupted_note: str = "") -> str:
+    """Write the JSON report under reports/stress-test/wifi/. Returns path.
+
+    Written on every run, interrupted ones included. Both `interrupted` and
+    `interrupted_note` are always present, so the shape does not depend on how
+    the run ended.
+    """
     ts = time.strftime("%Y%m%d_%H%M%S")
     report_dir = os.path.join(PROJECT_ROOT, "reports", "stress-test", "wifi")
     os.makedirs(report_dir, exist_ok=True)
@@ -197,6 +215,8 @@ def save_report(device: str, planned: int, actual: int, expected_ssid: str,
         "test_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "planned_attempts": planned,
         "actual_attempts": actual,
+        "interrupted": interrupted,
+        "interrupted_note": interrupted_note,
         "expected_ssid": expected_ssid,
         "wifi_success_count": wifi_ok,
         "wifi_success_rate": round(wifi_rate, 2),
@@ -371,16 +391,128 @@ def main() -> int:
                   f"(ratio {d['ratio']:.2f})")
     print(f"  OVERALL           : {'PASS' if overall_passed else 'FAIL'}")
 
-    if not interrupted:
-        try:
-            report_path = save_report(
-                args.device, iterations, actual, current_ssid,
-                wifi_ok, network_ok, count_ok, count_abnormal, count_details,
-                wifi_rate, network_rate, count_rate,
-            )
-            print(f"  report            : {report_path}")
-        except Exception as e:
-            print(f"[warn] failed to save report: {e}")
+    # An interrupted run still printed an Overall Result above, so it still owes
+    # a report. `actual` counts the iteration that was in flight when the stop
+    # arrived, and that one never contributed to the per-check counters - so the
+    # note has to say the ratios only cover what actually finished, otherwise a
+    # half-run reads as a bad run.
+    interrupted_note = ""
+    if interrupted:
+        if actual == 0:
+            interrupted_note = ("本次运行在开始任何一轮之前被中断,"
+                                "下面的比率与结论不成立")
+        else:
+            interrupted_note = (f"本次运行被中断:已开始 {actual}/{iterations} 轮"
+                                f"(其中最后开始的 1 轮未跑完),"
+                                f"下面的比率与结论只覆盖这些已开始的轮次")
+    warn_parts = []
+    if interrupted_note:
+        warn_parts.append(interrupted_note)
+    if not overall_passed:
+        warn_parts.append(
+            "以下检查未达标:"
+            + "、".join(name for name, ok in (
+                ("Wi-Fi 回连", wifi_passed),
+                ("网络连通(ping)", network_passed),
+                ("扫描数量", count_passed)) if not ok)
+            + f";达标线 Wi-Fi 回连 {wifi_rate_threshold:.0f}%、"
+              f"网络连通 {network_rate_threshold:.0f}%、"
+              f"扫描数量 {count_rate_threshold:.0f}%")
+
+    # The Chinese HTML twin of the report below, for reading afterwards. Built
+    # from the same local values as the block just printed, so the two cannot
+    # disagree. It is written on the same path as the JSON because the archive
+    # pairs the two files by filename stem - an HTML twin of a JSON that was
+    # never written would be orphaned.
+    # No hide_keys here: unlike wifi_switch_stress.py, this report holds no
+    # credentials (only the expected SSID and scan counts).
+    doc = _pptp_report.build_payload(
+        script="wifi_onoff_stress.py",
+        script_version=SCRIPT_VERSION,
+        test_name="WiFi 开关回连测试",
+        device_id=args.device,
+        result="PASS" if overall_passed else "FAIL",
+        level="ok" if overall_passed else "fail",
+        count_zh=(f"{actual} 轮中 Wi-Fi 回连 {wifi_ok} 次、网络连通 {network_ok} 次、"
+                  f"扫描数量达标 {count_ok} 次"),
+        warn_zh="; ".join(warn_parts),
+        rows=[
+            _pptp_report.row("overall", "总体结果",
+                             "PASS" if overall_passed else "FAIL",
+                             "ok" if overall_passed else "fail",
+                             f"三项检查全达标:Wi-Fi 回连 {wifi_rate_threshold:.0f}%、"
+                             f"网络连通 {network_rate_threshold:.0f}%、"
+                             f"扫描数量 {count_rate_threshold:.0f}%"),
+            _pptp_report.row("planned", "计划轮次", iterations, "info",
+                             "每轮:关 Wi-Fi -> 开 Wi-Fi -> 查连接 -> ping -> 扫描计数"),
+            _pptp_report.row("actual", "实际轮次", actual, "info",
+                             "中途中断,未跑满计划" if actual < iterations
+                             else "按计划跑满"),
+            _pptp_report.row("wifi", "Wi-Fi 回连成功",
+                             f"{wifi_ok}/{actual} = {wifi_rate:.2f}%",
+                             "ok" if wifi_passed else "fail",
+                             f"达标线 {wifi_rate_threshold:.0f}%,"
+                             f"失败 {actual - wifi_ok} 轮"),
+            _pptp_report.row("network", "网络连通(ping)",
+                             f"{network_ok}/{actual} = {network_rate:.2f}%",
+                             "ok" if network_passed else "fail",
+                             f"达标线 {network_rate_threshold:.0f}%,"
+                             f"目标 {ping_target},失败 {actual - network_ok} 轮"),
+            _pptp_report.row("count", "扫描数量达标",
+                             f"{count_ok}/{actual} = {count_rate:.2f}%",
+                             "ok" if count_passed else "fail",
+                             f"达标线 {count_rate_threshold:.0f}%,"
+                             f"基线 {initial_count} 个,阈值比例 {count_threshold}"),
+            _pptp_report.row("abnormal", "扫描数量异常", count_abnormal,
+                             "ok" if count_abnormal == 0 else "warn",
+                             f"{actual} 轮中 {count_abnormal} 轮扫描数量"
+                             f"低于基线的比例阈值"),
+        ],
+        params_schema=PARAMS,
+        params_values={"iterations": iterations,
+                       "off_sec": off_sec,
+                       "on_sec": on_sec,
+                       "scan_sec": scan_sec,
+                       "count_threshold": count_threshold,
+                       "use_su": use_su},
+        sections=[
+            _pptp_report.section_table(
+                "abnormal", "扫描数量异常明细",
+                ["轮次", "本次数量", "基线数量", "比例"],
+                [[d["attempt"], d["current_count"], d["previous_count"],
+                  f"{d['ratio']:.2f}"] for d in count_details],
+                sub_zh="只列出低于阈值的轮次", empty_zh="本次没有异常轮次"),
+        ],
+        detail={"planned_attempts": iterations, "actual_attempts": actual,
+                "interrupted": interrupted,
+                "interrupted_note": interrupted_note,
+                "expected_ssid": current_ssid,
+                "wifi_success_count": wifi_ok,
+                "wifi_success_rate": round(wifi_rate, 2),
+                "network_success_count": network_ok,
+                "network_success_rate": round(network_rate, 2),
+                "wifi_count_success_count": count_ok,
+                "wifi_count_success_rate": round(count_rate, 2),
+                "wifi_count_abnormal_count": count_abnormal,
+                "wifi_count_abnormal_details": count_details})
+
+    # Always, interrupted or not. The `html` line stays above the `report` line,
+    # and `report` stays last: _sniff_report_path() in server.py claims the first
+    # stdout line shaped `<something> : <something>.json`, so the machine-readable
+    # line has to be unambiguous and final. See docs/REPORT_FORMAT.md section 8.
+    try:
+        report_path = save_report(
+            args.device, iterations, actual, current_ssid,
+            wifi_ok, network_ok, count_ok, count_abnormal, count_details,
+            wifi_rate, network_rate, count_rate,
+            interrupted, interrupted_note,
+        )
+        html_path = _pptp_report.write_html_report(report_path, doc)
+        if html_path:
+            print(f"  html              = {html_path}")
+        print(f"  report            : {report_path}")
+    except Exception as e:
+        print(f"[warn] failed to save report: {e}")
 
     return 0 if (actual > 0 and overall_passed) else 1
 

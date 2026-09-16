@@ -29,15 +29,32 @@ Notes on ADB outages during the script:
 """
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/wifi_reboot_stress.py`. See
+# docs/REPORT_FORMAT.md.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
+
+# reports/stress-test/<module>/ - must match ARCHIVE_MODULES in server.py, which
+# groups the archive tree the same way. Shares the "wifi" module with the two
+# other wifi scripts; the filename prefix is what tells them apart.
+REPORT_MODULE = "wifi"
 
 # Frontend-configurable params (declared for the PPTP platform).
 # The platform renders a config modal from this list and passes the chosen
@@ -117,6 +134,46 @@ def wait_for_device_online(serial: str, timeout_sec: int) -> bool:
         time.sleep(2)
     print(f"[wait] TIMEOUT after {timeout_sec}s")
     return False
+
+
+def save_report(device: str, iterations: int, wait_sec: int,
+                wifi_settle_sec: int, back_online_timeout: int,
+                results: list[bool]) -> str:
+    """Write the JSON report under reports/stress-test/wifi/. Returns the path.
+
+    The filename MUST contain the short device id (`dev_short`): server.py's
+    fallback scan, used when the stdout sniffer missed the `report :` line,
+    matches candidates on that substring. Without it a hard-killed run loses
+    its report silently.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    report_dir = os.path.join(PROJECT_ROOT, "reports", "stress-test",
+                              REPORT_MODULE)
+    os.makedirs(report_dir, exist_ok=True)
+
+    total = len(results)
+    passed = sum(results)
+    rate = (passed / total * 100) if total > 0 else 0.0
+    data = {
+        "test_name": "重启+WiFi回连测试",
+        "device_id": device,
+        "test_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "iterations_planned": iterations,
+        "iterations_run": total,
+        "passed": passed,
+        "failed": total - passed,
+        "success_rate": round(rate, 2),
+        "per_iteration": ["PASS" if r else "FAIL" for r in results],
+        "config": {
+            "wait_sec": wait_sec,
+            "wifi_settle_sec": wifi_settle_sec,
+            "back_online_timeout": back_online_timeout,
+        },
+    }
+    dev_short = device.replace(":", "_").replace(".", "_")
+    json_path = os.path.join(report_dir, f"wifi_reboot_{dev_short}_{ts}.json")
+    _pptp_report.atomic_write_json(json_path, data)
+    return json_path
 
 
 def main() -> int:
@@ -199,6 +256,71 @@ def main() -> int:
         print(f"  success rate: {rate:.1f}%")
         if results:
             print(f"  per-iteration: {' '.join('P' if r else 'F' for r in results)}")
+
+        # The Chinese HTML twin of the report below, written here in the
+        # `finally` so an interrupted run still leaves a readable page behind.
+        # A run that never completed an iteration has no verdict to report, so
+        # it says so instead of borrowing the FAIL that main() returns.
+        judged = total > 0
+        all_passed = judged and passed == total
+        doc = _pptp_report.build_payload(
+            script="wifi_reboot_stress.py",
+            script_version=SCRIPT_VERSION,
+            test_name="重启 + WiFi 回连压测",
+            device_id=args.device,
+            result=("PASS" if all_passed else "FAIL") if judged else None,
+            level=("ok" if all_passed else "fail") if judged else "inconclusive",
+            count_zh=f"{passed}/{total} 轮 WiFi 成功回连" if judged
+                     else "未完整跑完任何一轮",
+            warn_zh=("" if (all_passed or not judged) else
+                     f"{total - passed} 轮重启后 WiFi 未连上,"
+                     f"成功率 {rate:.1f}%"),
+            rows=[
+                _pptp_report.row("overall", "总体结果",
+                                 ("PASS" if all_passed else "FAIL") if judged
+                                 else "—",
+                                 ("ok" if all_passed else "fail") if judged
+                                 else "inconclusive",
+                                 "全部轮次 WiFi 正常回连" if all_passed else
+                                 ("存在失败轮次" if judged
+                                  else "本次运行没有可判定的轮次")),
+                _pptp_report.row("passed", "通过 / 总轮次",
+                                 f"{passed} / {total}",
+                                 ("ok" if all_passed else "fail") if judged
+                                 else "inconclusive",
+                                 f"计划 {iterations} 轮"),
+                _pptp_report.row("rate", "WiFi 回连成功率", f"{rate:.1f}%",
+                                 ("ok" if all_passed else "fail") if judged
+                                 else "inconclusive",
+                                 "每轮上线并稳定后检查 WiFi 是否已关联"),
+            ],
+            params_schema=PARAMS,
+            params_values={"iterations": iterations, "wait_sec": wait_sec,
+                           "wifi_settle_sec": wifi_settle_sec,
+                           "back_online_timeout": back_online_timeout},
+            sections=[
+                _pptp_report.section_list(
+                    "per_iteration", "逐轮结果",
+                    [f"第 {i} 轮:{'PASS' if r else 'FAIL'}"
+                     for i, r in enumerate(results, 1)],
+                    sub_zh="与 stdout 里的 P/F 串一一对应", empty_zh="无"),
+            ],
+            detail={"iterations_planned": iterations, "iterations_run": total,
+                    "passed": passed, "failed": total - passed,
+                    "success_rate": round(rate, 2),
+                    "per_iteration": ["PASS" if r else "FAIL" for r in results]})
+
+        try:
+            report_path = save_report(args.device, iterations, wait_sec,
+                                      wifi_settle_sec, back_online_timeout,
+                                      results)
+            html_path = _pptp_report.write_html_report(report_path, doc)
+            if html_path:
+                print(f"  html             = {html_path}")
+            print(f"  report           : {report_path}")
+        except Exception as e:
+            print(f"[warn] failed to save report: {e}")
+
         # Return 0 if all passed, non-zero otherwise (CI-friendly)
         return 0 if (total > 0 and passed == total) else 1
 

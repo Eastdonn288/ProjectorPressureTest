@@ -55,6 +55,12 @@ import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/battery_inout_stress.py`. See
+# _pptp_report.py for the payload contract.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
@@ -62,6 +68,8 @@ if hasattr(signal, "SIGBREAK"):
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
 
 # Serial console / health polling config (probed on the actual device).
 SERIAL_BAUD = 115200
@@ -326,6 +334,20 @@ def _summary(values):
             "p95": round(pct(95), 1)}
 
 
+def _stat_text(stat, unit):
+    """One _summary() result as a single line for the HTML report.
+
+    The engine renders a row value as one escaped string, so min/avg/max/p95
+    have to be folded here. An empty summary (no valid sample for that metric)
+    says so instead of rendering as an empty cell. Only the returned string is
+    Chinese - it is data for a human reader, same as the PARAMS labels.
+    """
+    if not stat:
+        return "无有效样本"
+    return (f"{stat['min']} / {stat['avg']} / {stat['max']} "
+            f"(p95 {stat['p95']}) {unit}")
+
+
 def save_report(device, cfg, sources, stopped_early, samples, stop_reason):
     """Write the JSON report under reports/stress-test/battery/. Returns path."""
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -587,9 +609,83 @@ def main() -> int:
             print(f"  jump [{jt}] x{c}")
     else:
         print("  jumps       : none")
+    # The Chinese HTML twin of the report above, for reading afterwards. Built
+    # from the same local values as the block just printed, so the two cannot
+    # disagree. This script has NO pass/fail semantics - it samples until a stop
+    # condition fires and always exits 0 - so `result` stays None and the page
+    # shows the neutral "no verdict" banner rather than a verdict this run never
+    # produced. Nothing in this report is sensitive (no credentials, unlike the
+    # wifi scripts), so no hide_keys is needed.
+    level_stat = _summary([x["level"] for x in samples
+                           if x.get("level") is not None])
+    temp_stat = _summary([x["temp"] for x in samples
+                          if x.get("temp") is not None])
+    volt_stat = _summary([x["voltage_mv"] for x in samples
+                          if x.get("voltage_mv") is not None])
+    stop_reason_zh = {"manual": "手动停止(平台停止按钮 / Ctrl+C)",
+                      "full": "充电完成(电量 100% 且满足满电判定)",
+                      "power_off": "设备连续两次读取失败(疑似断电 / 掉线)"}.get(
+        stop_reason, stop_reason)
+    temp_note = f"告警阈值 {temp_warn_c}C"
+    if temp_stat and temp_stat["max"] >= temp_warn_c:
+        temp_note += ",本次有样本达到阈值,脚本已告警"
+    jump_text = ("无" if not jump_counts else
+                 "、".join(f"{jt} x{c}"
+                          for jt, c in sorted(jump_counts.items())))
+    # Same shape as the dict save_report() writes, so the page's raw-data
+    # section matches the JSON report file (test_time is shown in the header).
+    report_detail = {
+        "test_name": "Battery charge/discharge stress",
+        "device_id": args.device,
+        "config": cfg,
+        "sources": sources,
+        "stopped_early": bool(stopped),
+        "sample_count": len(samples),
+        "summary": {"level": level_stat, "temp": temp_stat,
+                    "voltage_mv": volt_stat, "jump_counts": jump_counts,
+                    "stop_reason": stop_reason},
+        "samples": samples,
+    }
+    doc = _pptp_report.build_payload(
+        script="battery_inout_stress.py",
+        script_version=SCRIPT_VERSION,
+        test_name="电池充放电压力测试",
+        device_id=args.device,
+        result=None,
+        level="info",
+        count_zh=f"本次采集 {len(samples)} 个样本",
+        warn_zh=("设备连续两次读取电池失败(疑似断电 / ADB 掉线),"
+                 "本次压测提前结束" if stop_reason == "power_off" else ""),
+        rows=[
+            _pptp_report.row("samples", "采样点数", len(samples), "info",
+                             "手动停止,未跑满计划时长" if stopped
+                             else "由停止条件结束"),
+            _pptp_report.row("stop_reason", "停止原因", stop_reason, "info",
+                             stop_reason_zh),
+            _pptp_report.row("level", "电量 LEVEL", _stat_text(level_stat, "%"),
+                             "info", "min / avg / max / p95,单位 %"),
+            _pptp_report.row("temp", "温度 TEMP", _stat_text(temp_stat, "C"),
+                             "info", temp_note),
+            _pptp_report.row("voltage", "电压 VOLT",
+                             _stat_text(volt_stat, "mV"), "info",
+                             "min / avg / max / p95,单位 mV"),
+            _pptp_report.row("jumps", "电量跳变", jump_text, "info",
+                             "脚本按实际 status 判定方向,"
+                             "异常跳变已逐条打印告警"),
+        ],
+        params_schema=_params(),
+        params_values={"mode": mode, "serial_port": serial_port,
+                       "interval_sec": interval_sec, "temp_warn_c": temp_warn_c,
+                       "full_hold_sec": full_hold_sec},
+        detail=report_detail,
+    )
+
     try:
         report_path = save_report(args.device, cfg, sources, stopped, samples,
                                   stop_reason)
+        html_path = _pptp_report.write_html_report(report_path, doc)
+        if html_path:
+            print(f"  html        = {html_path}")
         print(f"  report      : {report_path}")
     except Exception as e:
         print(f"[warn] failed to save report: {e}")

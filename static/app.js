@@ -58,6 +58,11 @@
     deviceSerialCapture: {},   // { [serial]: bool }
     deviceSerialPort: {},      // { [serial]: "COM9" }
     serialPorts: [],           // cached COM port list from /api/serial/ports
+    // Per-device logcat opt-OUT (v2.7.5): absent or true = capture, only an
+    // explicit false turns it off. Deliberately NOT persisted, for the same
+    // reason as the serial checkbox - it is a per-run intent, and a stale "off"
+    // would silently cost the crash trail on the next stress run.
+    deviceLogcatCapture: {},   // { [serial]: false } = opted out
     // Archive occupancy for the tasks panel header (GET /api/archive/stats).
     archiveStats: null,        // { count, bytes }
     // Task ids we have already tried to POST a rendered chart for, so the 2s
@@ -161,6 +166,7 @@
       serialCapture: state.deviceSerialCapture,
       serialPort: state.deviceSerialPort,
       serialPorts: state.serialPorts,
+      logcatCapture: state.deviceLogcatCapture,
       scriptMap: Object.fromEntries(state.scripts.map((s) => [s.filename, s.name])),
     });
   }
@@ -489,6 +495,25 @@
           </select>
         </div>`;
 
+      // Logcat opt-out (v2.7.5). Capture is the default and the control shows
+      // the CURRENT intent, so an off-by-accident is visible on the card rather
+      // than only discoverable from a missing log after the run.
+      const wantLogcat = state.deviceLogcatCapture[d.serial] !== false;
+      const logcatTitle = notSelected ? `先点击设备 ${d.serial} 选中它`
+        : running ? "任务运行中,logcat 设置已锁定"
+        : isOffline ? "设备离线"
+        : wantLogcat
+          ? "本设备的下一次任务会采集 logcat。压力测试建议保持开启(崩溃现场就在里面)"
+          : "已关闭:本次任务不采集 logcat。长时间监控建议关闭 —— 一次 8 小时约 1GB,且没人会看";
+      const logcatHtml = `
+        <div class="device-row5">
+          <label class="serial-opt" title="${esc(logcatTitle)}">
+            <input type="checkbox" class="logcat-cap" data-serial="${esc(d.serial)}"
+                   ${wantLogcat ? "checked" : ""} ${dropdownDisabled ? "disabled" : ""}>
+            <span${wantLogcat ? "" : ' class="muted"'}>logcat 日志</span>
+          </label>
+        </div>`;
+
       let btnHtml = "";
       // Run button moved to the script card. Device card just shows status:
       // online/offline/running + (when a script is selected) the chip in
@@ -524,6 +549,7 @@
           </div>
           <div class="device-row3">${dropdownHtml}</div>
           ${serialHtml}
+          ${logcatHtml}
           <div class="device-actions">${btnHtml}</div>
         </div>`;
     }).join("");
@@ -565,6 +591,17 @@
       });
       cb.addEventListener("click", (e) => e.stopPropagation());
     });
+    // Logcat opt-out control. Not persisted (see state.deviceLogcatCapture), so
+    // no savePersistedState() here - the intent is per run.
+    el.querySelectorAll(".logcat-cap").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        e.stopPropagation();
+        state.deviceLogcatCapture[cb.dataset.serial] = cb.checked;
+        renderDevices();
+      });
+      cb.addEventListener("click", (e) => e.stopPropagation());
+    });
+
     el.querySelectorAll(".serial-port").forEach((sel) => {
       sel.addEventListener("change", (e) => {
         e.stopPropagation();
@@ -581,6 +618,23 @@
         onSelectDevice(c.dataset.serial);
       });
     });
+  }
+
+  // The Chinese HTML report(s) a finished run archived, read straight off the
+  // archive manifest (t.archive.files, server.py). Offered only when one
+  // actually exists: an archived run predating v2.10.0 has none, and a button
+  // that opens a 404 is worse than no button.
+  function htmlReports(t) {
+    return ((t.archive && t.archive.files) || [])
+      .filter((f) => String(f).toLowerCase().endsWith(".html"));
+  }
+
+  function reportTitle(t) {
+    const files = htmlReports(t);
+    if (files.length <= 1) return `阅读本次运行的中文报告 ${files[0] || ""}`;
+    // app_launch tests three apps and writes one report each. The route opens
+    // the first, so say how many there are rather than implying there is one.
+    return `阅读本次运行的中文报告(共 ${files.length} 份,此处打开第一份 ${files[0]})`;
   }
 
   // ---------------- Render: Tasks ----------------
@@ -602,6 +656,9 @@
           <div class="task-row1">
             <span class="device-name" title="${esc(t.device)}">${esc(t.device)}</span>
             <span class="task-row1-right">
+              ${htmlReports(t).length
+                ? `<button class="task-open task-report" data-report="${esc(t.task_id)}" title="${esc(reportTitle(t))}">报告</button>`
+                : ""}
               ${t.archive
                 ? `<button class="task-open" data-open="${esc(t.task_id)}" title="打开存档文件夹 archive/${esc(t.archive.module || "")}/${esc(t.archive.dir)}/">存档</button>`
                 : ""}
@@ -628,6 +685,12 @@
       b.addEventListener("click", (e) => {
         e.stopPropagation();
         onRevealArchive(b.dataset.open);
+      });
+    });
+    el.querySelectorAll(".task-report").forEach((b) => {
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        window.open(`/api/tasks/${b.dataset.report}/report`, "_blank");
       });
     });
     el.querySelectorAll(".task-del").forEach((b) => {
@@ -779,6 +842,19 @@
     return perfKind(taskId) !== null;
   }
 
+  // Perf event severity, mirroring the kinds perf_monitor.py can emit.
+  //   alert = the data for this stretch is compromised, or the device is gone
+  //   info  = a state change back to normal, or a plain fact worth dating
+  //   (absent) = unknown kind; still shown, flagged with "?" - the script may
+  //              ship a new kind before this table is updated, and silently
+  //              dropping it would be worse than showing it unlabelled.
+  const PERF_EVENT_LEVEL = {
+    offline_start: "alert", timeout: "alert", misparse: "alert",
+    frame_error: "alert", src_degraded: "alert",
+    offline_end: "info", src_recovered: "info", reboot: "info",
+    rollover: "info", pid_change: "info",
+  };
+
   // Parse a PERF| line. Returns the human-readable line to show in the console
   // (the raw JSON is consumed). Malformed PERF lines return the original text.
   // The log console must stay ASCII/English (v2.5.1): no Chinese in what gets
@@ -797,6 +873,28 @@
       s += ` [!] jump[${obj.jump_type}]${prev != null ? ` ${prev}->${obj.level}%` : ""}`;
     }
     return s;
+  }
+
+  // One fixed-width cell of a perf sample line. Constant width is the whole
+  // point: a missing value must still occupy its column, otherwise every
+  // following cell shifts left and the columns stop lining up.
+  function padCell(v, unit, width, digits) {
+    if (v == null) return "-".padStart(width);
+    return (v.toFixed(digits) + unit).padStart(width);
+  }
+
+  // Per-metric state cell, "<tick result>:<9 state chars>". The result word
+  // varies in length (ok / error / timeout / offline / partial) while the nine
+  // state chars never do, so the result is right-aligned to 7 and the whole cell
+  // is 7+1+9 = 17 wide. Without this a single offline tick shifts every column
+  // after it by 6 and the vertical scan breaks - which is the one thing the
+  // fixed-width form exists to prevent, and it breaks exactly when a fault is
+  // happening and the columns matter most.
+  function padSt(raw) {
+    if (!raw) return "-".padStart(17);
+    const i = raw.indexOf(":");
+    if (i < 0) return String(raw).padStart(17);
+    return raw.slice(0, i).padStart(7) + raw.slice(i);
   }
 
   function handlePerfLine(line) {
@@ -827,16 +925,52 @@
     if (obj.type === "sample") {
       perfPending.push(obj);   // flushed to the chart on the next rAF log flush
       if (kind === "battery") return readableBattLine(obj);
-      const t = obj.t != null ? `${obj.t.toFixed(1)}s` : "-";
-      const fmt = (v) => (v == null ? "-" : `${v.toFixed(1)}%`);
-      const clk = obj.clock != null ? fmtClock(obj.clock) : fmtClock(perfX(obj));
-      let s = `[perf] ${clk} (${t}) cpu=${fmt(obj.cpu)} gpu=${fmt(obj.gpu)} mem=${fmt(obj.mem)}`;
-      if (obj.fg_pkg) s += ` fg=${obj.fg_pkg} ${fmt(obj.fg_cpu)}`;
-      if (obj.gpu_clk != null) s += ` gpu_clk=${obj.gpu_clk}MHz`;
+      // Fixed-width cells, so a long run can be scanned VERTICALLY - the eye
+      // finds a trend break by column position instead of re-parsing each line.
+      // Three rules, each load-bearing:
+      //   - null renders as a same-width "-", so an offline tick reads as a row
+      //     of dashes and is never mistaken for a real 0.0%. (Pitfall #14: on
+      //     this board GPU ~= 0 while a video plays is CORRECT, so a row of
+      //     zeroes must not be reachable by accident.)
+      //   - pkg= goes LAST: package names have no fixed length and would push
+      //     every following column out of alignment.
+      //   - no wall clock: flushLogBuffer already prefixes [HH:MM:SS], and a
+      //     second timestamp adds width without adding information.
+      // Columns are always emitted even when a series is disabled (gpu without
+      // root, fg with track_foreground off) - a dashed column stays aligned and
+      // is self-explanatory, whereas a sometimes-present column is not.
+      let s = `[perf] t=${padCell(obj.t, "s", 8, 1)}`
+            + ` | cpu=${padCell(obj.cpu, "%", 6, 1)}`
+            + ` | gpu=${padCell(obj.gpu, "%", 6, 1)}`
+            + ` | mem=${padCell(obj.mem, "%", 6, 1)}`
+            + ` | fg=${padCell(obj.fg_cpu, "%", 6, 1)}`
+            + ` | clk=${padCell(obj.gpu_clk, "MHz", 7, 0)}`
+            + ` | st=${padSt(obj.st)}`;
+      if (obj.fg_pkg) s += ` | pkg=${obj.fg_pkg}`;
       return s;
     }
 
-    return line;  // unknown PERF| type - show raw
+    // v2: mid-run events. These are FACTS observed during the run (the device
+    // went offline, a counter rolled over), never conclusions - the verdict is
+    // printed once, at the end. Rate limiting and de-duplication happen in the
+    // script (it owns the clock), so whatever arrives here is worth one line.
+    // Rendered as text, never as raw JSON: the console is replayed from stdout
+    // on every WS reconnect, so a raw record would be re-shown in full each time.
+    if (obj.type === "event") {
+      const t = obj.t != null ? `${obj.t.toFixed(1)}s` : "-";
+      const lvl = PERF_EVENT_LEVEL[obj.kind];
+      const tag = lvl === "alert" ? "!" : (lvl === "info" ? "i" : "?");
+      let s = `[perf] t=${t.padStart(8)} | [${tag}] ${obj.kind}`
+            + (obj.reason ? `: ${obj.reason}` : "");
+      if (obj.detail) s += ` (${obj.detail})`;
+      return s;
+    }
+
+    // An unknown PERF| record must NOT be echoed. It is machine data, it can be
+    // arbitrarily long, and it is re-sent on every reconnect - so a future
+    // record type would flood the console with raw JSON the moment it ships.
+    // One short notice is enough to make the gap visible without the payload.
+    return `[perf] (unrecognized record type: ${String(obj.type || "?")})`;
   }
 
   // Append a sample to the per-task buffer, deduping on t (WS replay re-sends
@@ -1551,6 +1685,7 @@
           device: serial, script, params,
           serial_capture: wantSerial,
           serial_port: wantSerial ? serialPort : null,
+          logcat_capture: state.deviceLogcatCapture[serial] !== false,
         }),
       });
       await refreshTasks();

@@ -45,6 +45,12 @@ import subprocess
 import sys
 import time
 
+# Shared HTML report engine. A sibling module, resolved via sys.path[0] -
+# CPython puts the script's own directory there, so this works both under the
+# platform and for a plain `python scripts/wifi_switch_stress.py`. See
+# docs/REPORT_FORMAT.md.
+import _pptp_report
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a summary line.
 if hasattr(signal, "SIGBREAK"):
@@ -52,6 +58,8 @@ if hasattr(signal, "SIGBREAK"):
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+SCRIPT_VERSION = "1.0.0"
 
 # Pre-configured Wi-Fi networks to cycle through (NOT a frontend param).
 WIFI_NETWORKS = [
@@ -244,9 +252,60 @@ def main() -> int:
     print(f"  success          : {success}/{actual} = {success_rate:.2f}%")
     print(f"  OVERALL          : {'PASS' if passed else 'FAIL'} (>= 98%)")
 
+    # The Chinese HTML twin of the report above, for reading afterwards. Built
+    # from the same local values as the block just printed, so the two cannot
+    # disagree. NOTE: `wifi_networks` in the report holds plaintext passwords,
+    # and this page is meant to be handed to someone else - hence hide_keys.
+    doc = _pptp_report.build_payload(
+        script="wifi_switch_stress.py",
+        script_version=SCRIPT_VERSION,
+        test_name="WiFi 循环连接测试",
+        device_id=args.device,
+        result="PASS" if passed else "FAIL",
+        level="ok" if passed else "fail",
+        count_zh=f"{success}/{actual} 次连接成功",
+        warn_zh=("" if passed else
+                 f"成功率 {success_rate:.2f}% 低于达标线 98%,"
+                 f"共 {actual - success} 次连接未匹配到预期 SSID"),
+        rows=[
+            _pptp_report.row("overall", "总体结果",
+                             "PASS" if passed else "FAIL",
+                             "ok" if passed else "fail",
+                             "达标线:成功率 >= 98%"),
+            _pptp_report.row("planned", "计划连接次数", planned, "info",
+                             f"{len(networks)} 个网络 × {cycles} 轮"),
+            _pptp_report.row("actual", "实际连接次数", actual, "info",
+                             "中途中断,未跑满计划" if actual < planned
+                             else "按计划跑满"),
+            _pptp_report.row("success", "连接成功次数", success,
+                             "ok" if success == actual and actual else "info",
+                             f"失败 {actual - success} 次"),
+            _pptp_report.row("rate", "连接成功率", f"{success_rate:.2f}%",
+                             "ok" if passed else "fail", "达标线 98.00%"),
+        ],
+        params_schema=PARAMS,
+        params_values={"cycles": cycles,
+                       "connect_wait_sec": connect_wait_sec,
+                       "switch_gap_sec": switch_gap_sec,
+                       "use_su": use_su},
+        sections=[
+            _pptp_report.section_table(
+                "networks", "参与轮换的网络", ["SSID", "加密方式"],
+                [[n["ssid"], n.get("security", "wpa2")] for n in networks],
+                sub_zh="口令不在本页显示"),
+        ],
+        detail={"total_cycles": cycles, "wifi_networks": networks,
+                "planned_attempts": planned, "actual_attempts": actual,
+                "success_count": success,
+                "success_rate": round(success_rate, 2), "passed": bool(passed)})
+    doc["hide_keys"] = ["password"]
+
     try:
         report_path = save_report(args.device, cycles, networks, planned, actual,
                                   success, success_rate, passed)
+        html_path = _pptp_report.write_html_report(report_path, doc)
+        if html_path:
+            print(f"  html             = {html_path}")
         print(f"  report           : {report_path}")
     except Exception as e:
         print(f"[warn] failed to save report: {e}")
