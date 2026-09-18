@@ -3,7 +3,28 @@
 本地化、轻量级的 ADB 投影仪压测平台。
 通过浏览器控制多台投影仪设备,实时运行压测脚本并查看日志。
 
-> 维护笔记:本文档描述当前已实现的能力。架构、数据模型、最近设计决策、什么不存在等更详细的信息,见 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md)。其他 SIMPLE-* 文档是初版设计记录,已归档为历史参考。
+> **铁律:纯本地、单机、无远程、无鉴权、单用户。** 平台不联网、不对外服务、没有账号体系 —— 一台机器上的一个人用。本文档是**用户向**的:怎么跑、每个脚本干什么、坏了怎么办。
+
+**先读哪**:刚接手 / 要查细节 → [docs/START-HERE.md](docs/START-HERE.md)(入口 + SOP);系统形状与契约 → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);踩过的坑与规矩 → [docs/PITFALLS.md](docs/PITFALLS.md);不可回退的设计决策 → [docs/DECISIONS.md](docs/DECISIONS.md)。
+
+---
+
+## 文档地图
+
+| 文件 | 回答什么 |
+|---|---|
+| `README.md` | 用户向:怎么跑、每个脚本干什么、坏了怎么办(本文档) |
+| `CLAUDE.md` | 会话规则(自动载入) |
+| `CHANGELOG.md` | 版本编年 |
+| `TODO.md` | 已知未决问题 |
+| `docs/START-HERE.md` | 我刚接手、先读哪、SOP |
+| `docs/ARCHITECTURE.md` | 系统形状、契约、不存在的东西 |
+| `docs/FRONTEND.md` | UI 交互模型 |
+| `docs/PITFALLS.md` | 踩过的坑与规矩 |
+| `docs/DECISIONS.md` | 已批准、不可回退的设计决策 |
+| `docs/REPORT_FORMAT.md` | 报告契约 |
+| `docs/PERF_MONITOR_V2.md` | perf_monitor 的采样 / 判定模型 |
+| `ir_sequences/KEY_REFERENCE.md` | 按键名 ↔ 键码 |
 
 ---
 
@@ -11,23 +32,9 @@
 
 一个能让你在浏览器里点几下,就在 N 台投影仪上跑压测脚本的小工具。
 
-- 设备列表:自动显示当前 ADB 设备,3 秒刷新
-- 脚本管理:把 .py 丢进 scripts/,前端自动出现
-- 实时日志:每台设备的 stdout 实时推送到浏览器
-- 任务控制:运行 / 中断 / 硬停 / 重置,所见即所得(硬停立即把任务记为终态 `interrupted` 并归档,**那台设备马上可以起新任务**)
-- **IR 序列**:ir_sequences/ 下的 .ini 文件定义按键顺序,前端 modal 选取并绑定到设备
-- **双通道按键注入**:`KEY_*` 走 sendevent 直写 event 设备(需 userdebug/root);`KEYCODE_*` 走上层 `adb shell input keyevent`(**user 版固件可用**,含 23 个厂商键 + 26 个安卓原生键 + 透传)
-- **脚本参数前端可配**:脚本用 `PARAMS` 自描述可配置项(循环次数、等待时长、传感器序列等),前端自动识别并弹出配置窗口,支持 `select` 下拉框类型,按 **设备 × 脚本** 独立保存到 localStorage
-- **WiFi 压测脚本**:wifi_onoff / wifi_reboot / wifi_switch 三个独立脚本,覆盖开关、重启重连、多网络循环切换
-- **蓝牙回连压测脚本**:bt_reboot_stress — 重启投影仪后检测**蓝牙音箱 A2DP 是否自动回连**(连好音箱后跑),判定 = 蓝牙适配器已开启 + 音箱真正连上;仿 wifi_reboot,可配循环次数/回连超时
-- **传感器压测脚本**:sensor_reboot_stress — 重启投影仪后检测 gsensor / ToF 回连,可配置选哪种传感器、循环次数与设备上线超时(采集窗口/检测次数/通过阈值硬编码)
-- **APP 冷热启动压测脚本**:app_launch_stress — 冷/热启动耗时压测(冷:force-stop 后测冷启动;热:HOME 退到后台后测回到前台),主指标 `am start -W` TotalTime + logcat Displayed 交叉验证,可按 p95 阈值判定(被测 APP 硬编码脚本顶部 `APP_PRESETS`,**内置 Netflix / Prime Video / YouTube TV 三个一起跑**)
-- **性能监控脚本(实时曲线)**:perf_monitor — CPU/GPU/内存% + 前台APP CPU% 实时监控,日志面板顶部实时曲线图,一键导出 log.txt + csv + png
-- **电池充放电压测脚本(实时曲线)**:battery_inout_stress — **充电/放电分开跑**,电量/温度/电压实时监控(电量靠串口开启 health 轮询),前端电量+温度双曲线,保留跳变/温控检测,**充到 100% 稳定或设备关机自动停**
-- **中文 HTML 报告(每个脚本都有,v2.10.0)**:跑完自动写一份**自包含**的中文报告(无外部 CSS/JS/字体,
-  拷走单独打开也完整),含结果总览 / 本次参数(标明默认还是已改)/ 完整数据折叠区;任务卡 **`报告`** 按钮直接打开。
-  `ir_runner.py` 除外(它没有通过/不通过的概念)。见 [docs/REPORT_FORMAT.md](docs/REPORT_FORMAT.md)
-- **每任务三源日志采集(v2.6.0)**:每次跑脚本,**服务端自动**同时采集 **stdout**(脚本输出)+ **logcat**(设备系统日志,恒开);设备卡勾选后**额外**采集**串口 console**(COM 口)。三份日志自动落盘并归档,**脚本不用做任何事**(前端只显示 stdout)
+- 设备列表(自动显示当前 ADB 设备,3 秒刷新)· 脚本列表(把 .py 丢进 scripts/,前端自动出现)· 实时日志(每台设备的 stdout 实时推送到浏览器)
+- 任务控制:运行 / 中断 / 硬停 / 重置(硬停立即把任务记为终态 `interrupted` 并归档,**那台设备马上可以起新任务**);每个任务**服务端自动**采 stdout + logcat(+ 可选串口),跑完自动归档
+- **九个压测脚本,每个一节**(见下文):WiFi 三件套(wifi_onoff / wifi_reboot / wifi_switch)、蓝牙音箱回连(bt_reboot_stress)、传感器回连(sensor_reboot_stress)、APP 冷热启动(app_launch_stress)、性能监控实时曲线(perf_monitor)、电池充放电实时曲线(battery_inout_stress)、红外序列(ir_runner)。每个脚本都用 `PARAMS` 自描述可配置项(前端自动弹配置窗口),跑完都出一份中文 HTML 报告
 
 后端 + 前端 + 脚本合计约 **9800 行代码**(server.py 2528 + app.js 2317 + style.css 872 + index.html 155 + ir_runner.py 617 + wifi_* 854 + sensor_reboot_stress.py 521 + app_launch_stress.py 599 + perf_monitor.py 513 + battery_inout_stress.py 601 + bt_reboot_stress.py 225)。
 
@@ -82,7 +89,7 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 5. **右列"任务状态"** 显示每个任务的开始/结束/状态/耗时
 6. 点击设备卡 → 该设备被"选中",对应的脚本卡变高亮、可点
 7. 在设备卡的下拉框选脚本 → 脚本卡绑定关系建立
-8. 点 ir_runner 卡上的 `▶ 跑` 按钮 → 跑该脚本(要先点设备卡使其"选中",否则按钮隐藏)
+8. 点脚本卡上的 `▶ 跑` 按钮 → 跑该脚本(要先点设备卡使其"选中",否则按钮隐藏)
 
 ---
 
@@ -98,7 +105,7 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 
 ### 怎么看
 
-**日志栏只显示 stdout**,永远如此 —— logcat 和串口体量太大,不做前端展示(用户 2026-09-11 决定)。它们只在后台采集 + 归档。
+**日志栏只显示 stdout**,永远如此 —— logcat 和串口体量太大,不做前端展示(用户 2026-09-11 决定),只在后台采集 + 归档。
 
 任务结束时,日志栏最后会出现**一行归档摘要**,告诉你存到哪了、每个通道采了多少行:
 
@@ -112,19 +119,13 @@ D:\Conda_Environments\dev_env\python.exe -m uvicorn server:app --host 127.0.0.1 
 
 设备卡上有 **`串口日志` 勾选框 + COM 口下拉框**:
 
-1. 插好 USB 转串口线,下拉框会自动列出电脑上的 COM 口(如 `COM9`);下拉框为空说明没装 `pyserial` 或没插线
+1. 插好 USB 转串口线,下拉框自动列出电脑上的 COM 口(如 `COM9`;为空 = 没装 `pyserial` 或没插线)
 2. 勾上 `串口日志`,选好 COM 口 → **该设备的下一次任务**会同时采集串口
-3. 选中的 COM 口会被记住(下次打开还在),**勾选状态不会记住**(避免下次误开)
-4. 任务运行中控件会锁定,改不了
+3. COM 口会被记住(下次打开还在),**勾选状态不会记住**(避免下次误开);任务运行中控件锁定,改不了
 
 > **注意**:如果某个脚本**自己要用串口**(目前只有 `battery_inout_stress`),勾选框会**自动禁用**并提示"平台串口抓取已自动让位"。这是故意的 —— 抢口会让电池保活失败、电量曲线变平。
 
-设备卡上还有一个 **`logcat 日志` 勾选框**(v2.7.5),**默认勾选**:
-
-1. 默认每个任务都采集 logcat —— 崩溃现场就在里面,压力测试不该关
-2. **长时间监控(如 8 小时的 `perf_monitor`)建议取消勾选**:一次 run 的 logcat 约 1GB,没人会看,
-   而且它会和监控本身抢设备 —— 采集行为会干扰被采集的对象
-3. 和串口勾选一样:**只对下一次任务生效,不记住**(避免残留的"关"让下一次压测静默丢掉崩溃现场)
+设备卡上还有一个 **`logcat 日志` 勾选框**,**默认勾选**:默认每个任务都采集(崩溃现场就在里面,压力测试不该关),但**长时间监控(如 8 小时的 `perf_monitor`)建议取消勾选** —— 一次 run 的 logcat 约 1GB,没人会看,而且采集行为会干扰被采集的对象。和串口勾选一样:**只对下一次任务生效,不记住**(避免残留的"关"让下一次压测静默丢掉崩溃现场)。
 
 **logcat 默认上限 1GB**(长测保护),超了会在文件末尾写明并停止采集。想调整:`PPTP_LOGCAT_MAX_MB=2048` 后再启动服务。参考量级:**空闲时约 1.6 行/秒,但一次重启的开机风暴就有约 1.3MB**(相差两个数量级)—— 三个重启类脚本默认 100 轮,约 128MB。
 
@@ -182,15 +183,10 @@ archive/
 
 ### 关于清理
 
-- **不做任何自动删除**,存档永久保留,磁盘占用在界面上可见
+- **不做任何自动删除**,存档永久保留,磁盘占用在界面上可见;想真正删就去 `archive/` 目录手动删
 - 任务卡上的 `×` 和「**清空已完成的卡片**」**只从列表移除卡片,不动存档** —— 这是故意的,避免一次误点把要保留的数据删掉
-- 想真正删:去 `archive/` 目录手动删
 
-> **`logs/` 和 `reports/` 不用管,也不能删**:
-> `logs/` 是运行期暂存区(日志和报告先落这里,任务结束**搬进** `archive/`)+ 服务自身日志
-> (`server.out.log`/`server.err.log`);`reports/` 是**脚本契约** —— 脚本脱离平台用命令行单独跑时也写
-> 这里。**走平台跑的话这两个目录平时都是空的** —— 东西全被搬进 `archive/` 了。
-> **你要找的东西永远在 `archive/` 里**,这两个是实现细节。
+> **`logs/` 和 `reports/` 不用管,也不能删**:`logs/` 是运行期暂存区(日志和报告先落这里,任务结束**搬进** `archive/`)+ 服务自身日志(`server.out.log`/`server.err.log`);`reports/` 是**脚本契约** —— 脚本脱离平台用命令行单独跑时也写这里。**走平台跑时这两个目录平时都是空的**,你要找的东西永远在 `archive/` 里。
 
 ### 导出按钮呢
 
@@ -200,25 +196,18 @@ archive/
 
 **每个脚本跑完,除了 stdout 里那段汇总,还会写出一份中文 HTML 报告。** 任务卡的 **`报告`** 按钮直接打开它。
 
-报告和 JSON 报告**同目录、同文件名前缀**:
-
-```
-reports/stress-test/wifi/wifi_cycle_B0403374A2A508001F00_20260916_092136.json   ← 脚本写的报告
-reports/stress-test/wifi/wifi_cycle_B0403374A2A508001F00_20260916_092136.html   ← 中文报告
-```
+报告和 JSON 报告**同目录、同文件名前缀**:`..._20260916_092136.json`(脚本写的报告)与 `..._20260916_092136.html`(中文报告)。
 
 任务一结束,归档会把**两份一起**搬进 `archive/<模块>/<时间>_.../`(主报告改名为 `report.json`,HTML 保留原文件名)。
 
 ### 报告里有什么
 
-| 区块 | 内容 |
-|---|---|
-| 顶部横幅 | 综合结论大字(PASS / FAIL / `—` 不做判定)+ 中文等级 |
-| **结果总览** | 一行一个结论:指标 / 结论 / 取值 / 说明。结论分**通过 / 注意 / 异常 / 样本不足 / 信息**五档 |
-| **本次参数** | 这次实际生效的参数值,并标明每个是**默认**还是**已改** |
-| 脚本自述区块 | 各脚本自己的明细(参与的网络 / 每个 APP 的 p95 / 每轮 P-F 串 …) |
-| **完整数据** | 折叠区,把 JSON 报告的内容全部递归展开 —— **HTML 不会比 JSON 少东西** |
-| 页脚 | 脚本名+版本 · 报告引擎版本 · 退出码 · 来源文件名 |
+- **顶部横幅**:综合结论大字(PASS / FAIL / `—` 不做判定)+ 中文等级
+- **结果总览**:一行一个结论 —— 指标 / 结论 / 取值 / 说明;结论分**通过 / 注意 / 异常 / 样本不足 / 信息**五档
+- **本次参数**:这次实际生效的参数值,并标明每个是**默认**还是**已改**
+- 脚本自述区块:各脚本自己的明细(参与的网络 / 每个 APP 的 p95 / 每轮 P-F 串 …)
+- **完整数据**:折叠区,把 JSON 报告的内容全部递归展开 —— **HTML 不会比 JSON 少东西**
+- 页脚:脚本名+版本 · 报告引擎版本 · 退出码 · 来源文件名
 
 ### 三个要点
 
@@ -263,10 +252,8 @@ reports/stress-test/wifi/wifi_cycle_B0403374A2A508001F00_20260916_092136.html   
 ### 使用流程
 
 1. 把 .ini 放进 `ir_sequences/`(或复制现有 .ini 修改)
-2. 在 ir_runner 脚本卡上点击 → 弹出 modal 选序列
-3. 选中一个 → 状态保存到 localStorage
-4. 同一台设备重启平台后选择保留
-5. `scripts/ir_runner.py` 是默认的序列执行脚本(无限循环 + 长按 + 单按)
+2. 在 ir_runner 脚本卡上点击 → 弹出 modal 选序列 → 状态保存到 localStorage(同一台设备重启平台后保留)
+3. `scripts/ir_runner.py` 是默认的序列执行脚本(无限循环 + 长按 + 单按)
 
 ---
 
@@ -276,18 +263,12 @@ reports/stress-test/wifi/wifi_cycle_B0403374A2A508001F00_20260916_092136.html   
 
 ```python
 import argparse, time
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--device", required=True)
     p.add_argument("--params", default="{}")
     args = p.parse_args()
-
     print(f"run on {args.device}")
-    for i in range(3):
-        print(f"step {i}")
-        time.sleep(1)
-
 if __name__ == "__main__":
     main()
 ```
@@ -312,12 +293,7 @@ PARAMS = [
 ]
 ```
 
-字段键:`name` / `label` / `type` / `default` / `min` / `max`。`type` 支持 `int` / `float` / `bool` / `str`,以及 **`select`(下拉框)**——下拉框需配 `choices` 列表(字符串或 `{value, label}` 对象),例如传感器序列选择:
-
-```python
-{"name": "sensor", "label": "传感器序列", "type": "select",
- "choices": ["gsensor", "tof"], "default": "gsensor"}
-```
+字段键:`name` / `label` / `type` / `default` / `min` / `max`。`type` 支持 `int` / `float` / `bool` / `str`,以及 **`select`(下拉框)**——下拉框需配 `choices` 列表(字符串或 `{value, label}` 对象),例如传感器序列选择:`{"name": "sensor", "label": "传感器序列", "type": "select", "choices": ["gsensor", "tof"], "default": "gsensor"}`。
 
 配置值按 **设备 × 脚本** 独立保存,互不干扰。平台通过跑 `python 脚本.py --dump-params` 读取这份自描述 schema,缓存按 `(脚本名, mtime)` 失效。
 
@@ -406,7 +382,7 @@ PARAMS = [
 
 ## 性能监控脚本(perf_monitor)
 
-手工测试 / 播放 APP 时,实时监控设备 **CPU / GPU / 内存** 使用率 + **前台 APP 的 CPU%**。选脚本后点设备卡上的"▶ 跑",**日志面板顶部会切出一块实时曲线图**(200px,和日志一起随任务绑定;切走不残留,切回来从重放重建)。**跑完会打印一份判定块**(见下)。
+手工测试 / 播放 APP 时,实时监控设备 **CPU / GPU / 内存** 使用率 + **前台 APP 的 CPU%**。选脚本后点设备卡上的"▶ 跑",**日志面板顶部会切出一块实时曲线图**(200px,和日志一起随任务绑定;切走不残留,切回来从重放重建)。跑完在 stdout 打印一份**判定块**,并写出一份中文 HTML 报告。
 
 | 可配参数 | 说明 | 默认 |
 |---|---|---|
@@ -415,190 +391,63 @@ PARAMS = [
 | `watch_pkg` | 关注的应用(**下拉选择**);选「不关注」= 只看前台是谁,选了就额外记"该 app 掉出前台/崩溃"事件 | *(不关注)* |
 | `key_ini` | **长跑时定时发按键**(下拉选择);选一个 `ir_sequences/*.ini`,后台就按这个 ini 反复发按键 —— 用来压掉播放类 app 的「还在看吗」空闲提示 | *(不发送按键)* |
 
-> **`interval_sec` 不是分级采样的替代品**:它是**基准拍周期 T**,MED/SLOW 两层的周期都**由 T 推导**(目标固定 5s / 30s)。所以调它 = 同时调三层,而不是关掉某一层。
->
-> **前台 APP 采集恒开,没有开关**:「被压测的 app 挂了 / 掉到后台」是长跑里最该被看见的故障,而 `fg_*` 是唯一能看见它的信号;关掉只省一次 `dumpsys window` + `pidof` + `/proc/<pid>/stat`。
->
-> **`watch_pkg` 为什么是下拉而不是填包名**:拼错一个字符会**静默废掉**唯一依赖它的那道门(APP),而报告看起来一切正常。
-> 预置五个选项(改 `WATCH_PKG_CHOICES` 一处即可增删):「不关注」/ **YouTube TV** `com.google.android.youtube.tv` /
-> **Netflix** `com.netflix.ninja` / **Prime Video** `com.amazon.amazonvideo.livingroom` /
-> **本地媒体播放器** `com.mediatek.wwtv.mediaplayer`。
->
-> **选错了不会误报异常,会告诉你"样本不足"**:`watch_pkg` 设了、但该应用整场没上过前台 → APP 门判
-> **INCONCLUSIVE**,并在原因里写明(没装?没打开?)。**只有两种情况算真异常**:
-> ① 它**先出现过**,之后掉出前台;② 它**仍在前台,但进程已经没了**(窗口还挂着 = 崩溃)。
+配置前必须知道的几条:
 
-> **`key_ini` 的节奏写在 ini 里,不在参数表里**:ini 中每个 step 的 `delay_ms` 既是「同一 step 内重复的间隔」,
-> 也是「一轮跑完后的间隔」,所以**单步 ini 的 `delay_ms` 就是按键周期**。要改节奏就改文件,不再多一个数字对不上。
-> 仓库附了一份模板 `ir_sequences/idle_keepalive.ini`(`KEYCODE_MEDIA_PLAY` 短按 @30 分钟)——**随便选、随便改**。
-> (往 `ir_sequences/` **新加**文件后,下拉框要等重启服务或脚本改动才会出现;改已有 ini 的内容随时生效。)
->
-> **它永远不会改变结论**:ini 路径写错、按键名不认识、设备掉线,都只记进报告的 `key_status`,判定块照常。
-> 发送线程是 daemon —— 任务停止(包括「硬停」)时它随进程一起消失,**不会留下一个还在按键的进程**。
-> 报告 `config` 里能看到 `key_sent`(真按下去几次)/ `key_failed` / `key_status`,长跑时这就是「keepalive 活着没有」的那一眼。
+- **`interval_sec` 不是分级采样的替代品**:它是**基准拍周期 T**,MED / SLOW 两层的周期都**由 T 推导**(目标固定 5s / 30s)。所以调它 = 同时调三层,而不是关掉某一层。
+- **前台 APP 采集恒开,没有开关**:「被压测的 app 挂了 / 掉到后台」是长跑里最该被看见的故障,而 `fg_*` 是唯一能看见它的信号;关掉只省一次 `dumpsys window` + `pidof` + `/proc/<pid>/stat`。
+- **`watch_pkg` 为什么是下拉而不是填包名**:拼错一个字符会**静默废掉**唯一依赖它的那道门(APP),而报告看起来一切正常。预置五个选项(改 `WATCH_PKG_CHOICES` 一处即可增删):「不关注」/ **YouTube TV** `com.google.android.youtube.tv` / **Netflix** `com.netflix.ninja` / **Prime Video** `com.amazon.amazonvideo.livingroom` / **本地媒体播放器** `com.mediatek.wwtv.mediaplayer`。
+- **选错了不会误报异常,会告诉你"样本不足"**:`watch_pkg` 设了、但该应用整场没上过前台 → APP 门判 **INCONCLUSIVE**,并在原因里写明(没装?没打开?)。**只有两种情况算真异常**:① 它**先出现过**,之后掉出前台;② 它**仍在前台,但进程已经没了**(窗口还挂着 = 崩溃)。
+- **`key_ini` 的节奏写在 ini 里,不在参数表里**:ini 中每个 step 的 `delay_ms` 既是「同一 step 内重复的间隔」,也是「一轮跑完后的间隔」,所以**单步 ini 的 `delay_ms` 就是按键周期**。要改节奏就改文件,不再多一个数字对不上。仓库附了一份模板 `ir_sequences/idle_keepalive.ini`(`KEYCODE_MEDIA_PLAY` 短按 @30 分钟)——**随便选、随便改**。(往 `ir_sequences/` **新加**文件后,下拉框要等重启服务或脚本改动才会出现;改已有 ini 的内容随时生效。)
+- **它永远不会改变结论**:ini 路径写错、按键名不认识、设备掉线,都只记进报告的 `key_status`,判定块照常。发送线程是 daemon —— 任务停止(包括「硬停」)时它随进程一起消失,**不会留下一个还在按键的进程**。报告 `config` 里能看到 `key_sent`(真按下去几次)/ `key_failed` / `key_status`,长跑时这就是「keepalive 活着没有」的那一眼。
 
-**四条曲线(颜色区分):** CPU 蓝 / GPU 绿 / MEM 黄 / 前台APP 红。GPU 或前台系列不可用(节点读不到)时自动隐藏对应曲线 —— **前台跟踪恒开,没有开关**。
+**曲线**:四条 —— CPU 蓝 / GPU 绿 / MEM 黄 / 前台APP 红(读不到的系列自动隐藏)。**X 轴 = 固定 1h 滚动窗口**(墙钟时间,约 6 个 10min 刻度,右缘跟随最新样本,超窗点自动剔除;**不支持手动缩放**)。**Y 轴两根**:左侧主轴 0-100% 给 CPU / GPU / MEM;前台APP 用右侧独立轴 0-400% —— 前台 CPU% 是"每秒消耗的 CPU 秒数",**多核时可以超过 100%**(上限 = 核数 × 100%;YouTube TV 播放实测 88.2%)。**采样缓冲上限 86400**(24h@2s 全量保留),完整历史供导出使用。
 
-- **X 轴 = 固定 1h 滚动窗口(墙钟时间)**:标签 HH:MM:SS;始终显示最近 1 小时、约 6 个 10min 刻度(`interval:10min` + `splitNumber:6` + `hideOverlap`),右缘跟随最新样本滚动,超窗数据点自动剔除。完整历史仍保留在缓冲里供 CSV 导出与**全程图 PNG 导出**。**不支持手动缩放**(固定窗口与 dataZoom 互斥)
-- **Y 轴分两根**:左侧主轴 0-100% 给 CPU / GPU / MEM;前台APP 用右侧独立轴 0-400% —— 前台 CPU% 是"每秒消耗的 CPU 秒数",**多核时可以超过 100%**(上限 = 核数 × 100%;YouTube TV 播放实测 88.2%)。原需求本就允许"Y 轴可以不同"
-- **长时检测友好**:采样缓冲上限 86400(24h@2s 全量保留);**导出的 chart.png 是全程图**(时间轴 = 任务从开始到结束的完整范围,横轴 0.5h 一个刻度),不再受屏幕 1h 实时窗口限制
+**数据源(MT9676 真机探明;本机实为 MT9676,`ro.soc.model=MT9676 / ro.hardware=mt5896 / egl=mali.mt5873`):**
 
-**数据源(MT9676 真机探明;需说明:本机实为 MT9676,`ro.soc.model=MT9676 / ro.hardware=mt5896 / egl=mali.mt5873`):**
-
-- **CPU%** `/proc/stat` 累计计数器差值(免 root)
-- **内存%** `/proc/meminfo` `MemAvailable/MemTotal`(系统整体,免 root;本机仅 ~1.75GB RAM,此指标很有意义)
-- **GPU%** `/sys/kernel/debug/mali0/dvfs_utilization` `busy_time/idle_time` 差值(**需 root**,`su 0 <cmd>`)
-- **GPU 频率**(附带) `mali0/gpu_clock`
+- **CPU%** `/proc/stat` 累计计数器差值(免 root);**内存%** `/proc/meminfo` `MemAvailable/MemTotal`(系统整体,免 root;本机仅 ~1.75GB RAM)
+- **GPU%** `/sys/kernel/debug/mali0/dvfs_utilization` `busy_time/idle_time` 差值(**需 root**,`su 0 <cmd>`);附带 **GPU 频率** `mali0/gpu_clock`
 - **前台 APP CPU%** `dumpsys window` 取包名 → `pidof` 取 pid → `/proc/<pid>/stat` 的 `utime+stime` 差值。**不是 `top`**(本板一次 `top` 581ms,且它报的瞬时 %CPU 不可重复:同一包连读三次是 85.0 / 26.4 / 19.6),**也不是 `dumpsys cpuinfo`**(本机是 5 分钟滑动平均)
 
-### 分级采样(为什么采集本身不拖累设备)
+**采集本身不能拖累设备**:按代价分三层读数 —— FAST 每拍读 `/proc/stat` / 进程数 / `/proc/uptime`,MED 周期 5s 读 `/proc/meminfo` 与 GPU 计数器,SLOW 周期 30s 读 `dumpsys window` + `pidof` + `/proc/<pid>/stat`;而且**一拍只起一个 adb 进程**(八个 section 拼进同一条复合命令,用随机 nonce 做帧标记),T=2s 实测占空比 **9.06%**。
 
-不是每拍都读全部节点,而是按代价分三层。**下面表里的 T 就是 `interval_sec`** —— 分级的对象是「每一拍读哪些节点」,不是「还要不要有一个采样间隔」:
+### 判定块与事件
 
-| 层 | 周期 | 读什么 |
-|---|---|---|
-| FAST | 每拍 | `/proc/stat`、进程数、`/proc/uptime` |
-| MED | 每 `ceil(5/T)` 拍 | `/proc/meminfo`、GPU 计数器 |
-| SLOW | 每 `med*ceil(30/(med*T))` 拍 | `dumpsys window` + `pidof` + `/proc/<pid>/stat` |
-
-**一拍只起一个 adb 进程**:八个 section 拼进同一条复合命令,用随机 nonce 做帧标记,设备侧的杂音撕不开 section 边界。T=2s 实测占空比 **9.06%**。PC 侧超时预算由设备实测代价自适应,不是硬编码常数。
-
-没到期的指标**带上一拍的值**(前端的 `st` 列会显示 `h` = held),不是留空 —— 否则稀疏序列会从图上整条消失。**真掉线那一拍才是空的**,图上会真的断线。
-
-### 收尾判定块
-
-跑完在 stdout 打印一次(纯 ASCII,除最后一行外不出现 `report` 字面量):
+跑完在 stdout 打印一次纯 ASCII 判定块(节选):
 
 ```
 === perf verdict (judge v1-uncalibrated) ===
 RESULT : OK
 RUN    : ticks=39 ok=39 coverage=100% cadence=1.0x
-DATA   : samples.csv=perf_..._183055.samples.csv events=0 judge_version=v1-uncalibrated
-DEVICE : B0403374A2A508001F00 (B0403374A2A508001F00)
 MEMORY : NO LEAK  delta=-0.7%  slope=-51.875%/h  blocks=7/7  n=13  avail_min=670.4MB
-CPU    : avg=52.3%  p95=60.3%  max=62.8%  >=90% for 0.0s (load, not a fault)
-APP    : STABLE  switches=0  pkgs=1  gone=0  pid_lost=0  pid_dead=0  watch=com.google.android.youtube.tv
-EVENTS : timeout=0 offline=0 reboot=0 other=0
 GATES  : all pass
 COST   : cost_median=141ms duty=10.45%
-STAT cpu     : min=44.3 avg=52.3 p50=50.8 p90=58.3 p95=60.3 max=62.8 n=38
-STAT procs   : min=382.0 avg=384.0 p50=385.0 p90=385.0 p95=385.0 max=385.0 n=39
-STAT mem     : min=61.3 avg=61.8 p50=61.6 p90=62.3 p95=62.7 max=62.7 n=13
-STAT gpu     : min=0.0 avg=0.0 p50=0.0 p90=0.0 p95=0.0 max=0.0 n=12
-STAT gpu_clk : min=552.0 avg=552.0 p50=552.0 p90=552.0 p95=552.0 max=552.0 n=13
-STAT fg_cpu  : min=57.2 avg=57.2 p50=57.2 p90=57.2 p95=57.2 max=57.2 n=2
-
---- what these mean --------------------------------------------------------
-RESULT   worst status across all gates. OK=all passed, WARN=suspicious but not
-         a fault, FAIL=a gate failed, INCONCLUSIVE=too little data to have an
-         opinion
-RUN      coverage = ticks that returned data / ticks attempted (>=80% is
-         healthy). cadence = median interval / the interval you asked for;
-         1.0x is on time
-DATA     the per-tick data file this run wrote, plus the threshold-set version
-         it was judged with
-DEVICE   adb serial; the short form is what the archived folder is named after
-MEMORY   delta = first block -> last block. slope = %/h fitted over the whole
-         run. A leak needs BOTH over threshold, so the two are supposed to
-         disagree sometimes
-CPU      share of all cores. Sustained high CPU is the point of a stress test,
-         never a fault
-APP      STABLE = one foreground app throughout. CHANGED = it switched
-         (navigation and screen savers do that). GONE = the app you set as
-         watch_pkg disappeared - the one case worth chasing
-EVENTS   timeout/offline/reboot are faults in the PC<->device link, not faults
-         in the device
-GATES    every gate that did not pass; 'all pass' means nothing was flagged
-COST     cost_median = what one sample cost the PC. duty = that as a share of
-         the interval, i.e. the load this monitor adds
-
-  html   = <abs path>.html
-  report : <abs path>.json
 ```
 
-**每一行下面为什么是这些字**,都印在块尾的 `--- what these mean ---` 里 —— 不用回文档翻。
-两个看起来"自相矛盾"的地方是**设计如此**:
+`RESULT` ∈ `OK / WARN / FAIL / INCONCLUSIVE`(全过 / 可疑但不算故障 / 有门没过 / 数据太少不下结论);**每一行为什么是这些字,都印在块尾的 `--- what these mean ---` 里**,不用回文档翻。`MEMORY : NO LEAK delta=-0.7% slope=-51.875%/h` 这种"自相矛盾"是**设计如此**:判定要求 `delta` 与 `slope` **同时**越限,短跑里 `slope` 只在 15 秒的窗口上拟合,抖到 -51%/h 完全正常,**单看它没有意义**。
 
-- `MEMORY : NO LEAK delta=-0.7% slope=-51.875%/h` —— 判定要求 `delta` 与 `slope` **同时**越限;
-  短跑里 `slope` 只在 15 秒的窗口上拟合,抖到 -51%/h 完全正常,**单看它没有意义**。
-- `STAT gpu : min=0.0 avg=0.0` 而 YouTube 正在播 —— 见本节末尾那条。
-
-`RESULT` ∈ `OK / WARN / FAIL / INCONCLUSIVE`。中途只发**事件**(事实),判定只在收尾给一次 —— 两者是分开的通道。中途事件行长这样:
-
-```
-[perf] t=   32.0s | [!] offline_start: device unreachable
-[perf] t=   44.0s | [i] offline_end: device reachable again
-```
-
-`!` = 告警级(掉线/超时/错帧/GPU 读不到),`i` = 信息级(恢复/重启/计数回退/前台 pid 变化),`?` = 未知类型(脚本可能先上新类型)。
-
-跑的过程中每个采样周期还会打一行实时概览(前端曲线图就吃这一行)。**注意这行不是脚本打的,是前端从 `PERF|` JSON 渲染出来的**(表格里的空格是**定宽对齐**用的:缺值也占满自己的格子,不然某一拍掉线会让后面每一列整体左移、竖着读就断了):
+**中途只发事件(事实),判定只在收尾给一次** —— 两者是分开的通道:`!` = 告警级(掉线/超时/错帧/GPU 读不到),`i` = 信息级(恢复/重启/计数回退/前台 pid 变化),`?` = 未知类型。跑的过程中每个采样周期还会打一行实时概览(前端曲线图就吃这一行;**不是脚本打的**,是前端从 `PERF|` JSON 渲染的):
 
 ```
 [perf] t= 272.0s | cpu= 49.0% | gpu=  0.0% | mem= 64.0% | fg= 57.3% | clk= 552MHz | st=     ok:fffhhhhhh | pkg=com.google.android.youtube.tv
 ```
 
-| 字段 | 含义 |
-|---|---|
-| `t` | 距开跑的秒数 |
-| `cpu` `gpu` `mem` `fg` | 本拍四个指标的**瞬时值**,`fg` = 前台 APP 的 CPU%(>100% 正常,它是多核累加) |
-| `clk` | **GPU 频率**(MHz),从 `mali0/gpu_clock` 读;不是使用率。GPU 使用率是 `gpu` 那一栏 |
-| `st` | **逐指标状态串**,`<本拍结果>:<9 个字符>`,顺序固定 `cpu,procs,up,mem,gpu,gpu_clk,fg_pkg,fg_pid,fg_cpu` |
-| `ok` | 本拍结果,∈ `ok / partial / timeout / offline / error` |
-| `pkg` | 本拍读到的前台应用包名 |
+`t` 距开跑秒数;`cpu` `gpu` `mem` `fg` 本拍瞬时值(`fg` = 前台 APP CPU%,**多核累加可 >100%**);`clk` = **GPU 频率**(MHz,不是使用率);`pkg` 本拍前台包名;`st` = **逐指标状态串** `<本拍结果>:<9 个字符>`,顺序固定 `cpu,procs,up,mem,gpu,gpu_clk,fg_pkg,fg_pid,fg_cpu`,字符 `f`=新值 / `h`=沿用保持值 / `n`=无值可沿用 / `b`=首拍基线 / `x`=采失败 / `a`=无此节点 / `d`=已禁用,本拍结果 ∈ `ok / partial / timeout / offline / error`。**看状态串是成本最低的体检**:一长串 `samples.csv` 里如果 SLOW 拍**永远是 `n`、从没出现过 `b`/`f`/`h`**,说明那条通道根本没在工作,而覆盖率、门限这些**形状类**指标看不出来。
 
-**逐字对照:** 前三位是 FAST 层,每拍都真读 —— 除了第一拍的差分基线(`b`),恒为 `f`(本拍新值);`f f f` = CPU / 进程数 / uptime。后六位是 MED 层(mem / gpu / gpu_clk)与 SLOW 层(fg_pkg / fg_pid / fg_cpu),它们**不是每拍都读**,所以本拍要么 `h`,要么 `n`。这一行六个全是 `h`,因为跑到 272 秒时 MED 和 SLOW 早就答过话了,**值一直在被沿用**。
+### 中文 HTML 报告与导出
 
-| 字符 | 含义 |
-|---|---|
-| `f` | 本拍**新采到**了值 |
-| `h` | 本拍未到期,沿用上一拍的**保持值**(零阶保持) |
-| `n` | 本拍未到期,**且还没有任何可沿用的值**(该通道至今没答过话) |
-| `b` | 该指标的第一拍基线 |
-| `x` | 本拍**采失败**(掉线 / 超时 / 错帧),值置空 |
-| `a` | 设备上**没有这个节点**(比如没 root 读不到 GPU) |
-| `d` | 该指标被禁用 |
+同一份结论还会写成 `perf_<设备>_<时间>.html` **给人看**:结构与其它脚本一致(见上文"中文 HTML 报告"),perf 特有的几处是 —— 顶部**四色结果横幅**(通过绿 / 注意黄 / 异常红 / 样本不足灰,未标定时压一条告警条);**检查门明细**把 **9 道门全列**(没过的原因写在行内);**链路事件**每条都带墙钟时刻(如 `18:39:12`);APP 那行的结论有 `STABLE` / `CHANGED` / `GONE`(真坏)/ `NEVER SEEN`(整场没出现)四种。它**不是第二份判定**(与 `report.json` 同一份 payload 渲染,写失败只是少个附件)。
 
-> 看状态串是**最低成本的体检**:一长串 `samples.csv` 里如果 SLOW 拍**永远是 `n`、从没出现过 `b`/`f`/`h`**,说明那条通道根本没在工作 —— 而覆盖率、门限这些**形状类**指标全都看不出来。v2.9.0 修掉的就是这么一个 bug。
+**一键导出三件**:点"导出"按钮 = log.txt(含原始 `PERF|` 采样行)+ **perf.csv**(可进 Excel,含 `t_sec` + `t_wall` 墙钟列)+ **chart.png**(深色底 2x 图,**全程时间轴,0.5h 一个刻度** —— 不受屏幕 1h 实时窗口限制)。Chrome/Edge 单次点击允许多个下载;Firefox 可能拦截后两个,届时分次导出。无性能数据的任务只导出 log.txt。
+
+**归档**:任务结束时把**四件**一起收进 `archive/perf/<时间>_perf_monitor_<设备>/`:`perf_<设备>_<时间>` 打头的 **`.json`**(判定报告,机器读)、**`.html`**(中文报告,人读)、**`.samples.csv`**(28 列 + 注释块,**全分辨率原始逐拍转储**)、**`.events.csv`**(链路事件)。判定只依赖内存里的证据,不读 CSV —— **即使 samples.csv 被 Excel 独占打开而写不进去**,脚本会降级到 `csv_degraded` 继续跑,判定仍然成立(丢的是原始转储,不是结论)。
+
+> **wire 契约**:每拍一行 `PERF|{...}` JSON(另有 `meta` / `event` 两种 `type`),完整字段定义见 **[docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md)**;前端按 `type` 分发,未知类型只打印一行提示。
+
+> 播放视频时 GPU% 通常接近 0:视频解码走硬件专用解码器,CPU/GPU 主核都处于空闲,这是正常现象,不是监控失效。同理 **`fg_cpu` 也可以是**真的 **0.0**:本地媒体播放器停在界面上时,进程的 `utime+stime` 十分钟都不动(2026-09-14 实测:10 秒内 delta=0 ticks)—— **0.0% 不代表读不到**,要区分"读不到"和"真为 0"看 `st`(`f`/`h`=读到了,`x`=读失败,`a`=设备上没有这个节点)。**低 CPU 的 app,单个 `fg_cpu` 值不要单独看**:它是"两个 SLOW 读之间的 CPU 秒数 ÷ 秒数"(SLOW 间隔 30 秒),Netflix 停在界面上时实测每 10 秒只走 2–3 个 tick,但**偶尔会有一个 17 tick 的尖峰**(加载画面);落在尖峰上的那个 30 秒窗口就会报 0.7% 甚至 1.9%,落在安静段就只有 0.2% —— 都是对的,**要看的是 `STAT fg_cpu` 的 p50/p95 分布,而不是某一次的值**。
 
 > **判定阈值尚未标定**:所有门限目前是设计假设,**一份完全健康的报告也会显示 `v1-uncalibrated`**,避免假信心。标定需要一次健康的 8 小时基线跑。风险清单见 [TODO.md](TODO.md) §6。
 
-### 中文 HTML 报告(给人看的那一版)
-
-控制台那块是给**日志流**看的,排版受终端限制、且必须纯 ASCII。同一份结论还会写成 `perf_<设备>_<时间>.html`,**给人看**——中文、表格、带指示描述:
-
-- 顶部**四色结果横幅**:通过(绿)/ 注意(黄)/ 异常(红)/ 样本不足(灰);未标定时压一条告警条。
-- ①**指标判定** —— 每行一项结论,后面跟一句中文说明(和控制台是同一张 row 表渲染的,不会各说各话)。
-  APP 那行的结论有四种:`STABLE` / `CHANGED` / `GONE`(真坏) / `NEVER SEEN`(整场没出现,无法下结论)。
-- ②**通道分布** —— 每个指标采到多少拍 / 应采多少拍,带单位;数字看着离谱时先看这里。
-- ③**检查门明细** —— **9 道门全列**(不只是没过的),没过的原因写在行内。
-- ④**链路事件** —— 掉线 / 超时 / 重启 / 计数器回绕的时间点,**每条都带墙钟时刻**(如 `18:39:12`,悬停看完整日期),旁边才是「相对时刻」那趟跑的第几秒。
-
-**自包含**:CSS 内联、无 JS、不拉任何图表库 —— 目标是能把这个文件拷出归档目录,在任何一台**从没装过 PPTP** 的机器上、几年后打开,还看得懂。它**不是第二份判定**:由 `report.json` 的同一份 payload 渲染,写失败也只是少个附件,不会改变结论。
-
-**一键导出三件**:点击"导出"按钮,除原有 log.txt(含原始 `PERF|` 采样行)外,同时下载 **perf.csv**(可进 Excel,含 `t_sec` + `t_wall` 墙钟列)+ **chart.png**(深色底 2x 图,**全程时间轴,0.5h 一个刻度**)。Chrome/Edge 单次点击允许多个下载;Firefox 可能拦截后两个,届时分次导出或改用 Chrome。无性能数据的任务只导出 log.txt。
-
-**归档**:任务结束时把**四件**一起收进 `archive/perf/<时间>_perf_monitor_<设备>/`:
-`perf_<设备>_<时间>` 打头的 **`.json`**(判定报告,机器读)、**`.html`**(中文报告,人读)、**`.samples.csv`**(28 列 + 注释块,**全分辨率原始逐拍转储**)、**`.events.csv`**(链路事件)。判定只依赖内存里的证据,不读 CSV —— 所以**即使 samples.csv 被 Excel 独占打开而写不进去**,脚本会降级到 `csv_degraded` 继续跑,判定仍然成立(丢的是原始转储,不是结论)。
-
-> **wire 契约(v2.8.0 起)**:每拍一行
-> `PERF|{"type":"sample","clock":<epoch_ms>,"t":...,"st":"ok:fffhhhhhh","gap_ms":0,"cpu":...,"gpu":...,"mem":...,"fg_cpu":...,"fg_pkg":...,"gpu_clk":...}`;
-> 启动时 `PERF|{"type":"meta","sources":{...}}`;中途事件 `PERF|{"type":"event","clock":<epoch_ms>,"t":...,"kind":...,"reason":...,"detail":...}`(与采样行一样带 `clock`,HTML 报告的事件时刻就是由它渲染的)。
-> `st` = `<拍结果>:<9 个逐指标状态字符>`,顺序见 `cpu,procs,up,mem,gpu,gpu_clk,fg_pkg,fg_pid,fg_cpu`;
-> `f`=新值 `h`=保持 `n`=未到期 `b`=基线 `x`=失败 `a`=缺失 `d`=禁用。
-> 前端按 `type` 分发;**未知类型只打印一行提示、不回显原始 JSON**(否则一个新类型会在每次 WS 重连时把 JSON 刷满 console)。
-
-> 播放视频时 GPU% 通常接近 0:视频解码走硬件专用解码器,CPU/GPU 主核都处于空闲,这是正常现象,不是监控失效。
->
-> 同理 **`fg_cpu` 也可以是**真的 **0.0**:本地媒体播放器停在界面上时,进程的
-> `utime+stime` 十分钟都不动(2026-09-14 实测:10 秒内 delta=0 ticks)。**0.0% 不代表读不到**,
-> 代表这个 app 这一刻真的没在干活。要判断是"读不到"还是"真为 0",看 `st` 那一串:
-> `f`/`h`=读到了,`x`=读失败,`a`=设备上没有这个节点。
->
-> **低 CPU 的 app,单个 `fg_cpu` 值不要单独看**:它是"两个 SLOW 读之间的 CPU 秒数 ÷ 秒数",
-> 而 SLOW 间隔是 30 秒。Netflix 停在界面上时实测每 10 秒只走 2–3 个 tick,但**偶尔会有一个
-> 17 tick 的尖峰**(加载画面);落在尖峰上的那个 30 秒窗口就会报 0.7% 甚至 1.9%,落在安静段就只有 0.2%。
-> 都是对的 —— **要看的是 `STAT fg_cpu` 的 p50/p95 分布,而不是某一次的值**。
+> 本节的实现细节(三层采样的完整定义、9 道门的判据、证据模型与阈值标定)以 **[docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md)** 为唯一出处;报告的通用契约见 **[docs/REPORT_FORMAT.md](docs/REPORT_FORMAT.md)**。
 
 ---
 
@@ -626,7 +475,7 @@ COST     cost_median = what one sample cost the PC. duty = that as a share of
 
 **放电测试结束后的设备卡**:放电模式以"设备关机"自动停,任务结束后设备不在 `adb devices`,平台会保留一张 **"放电关机"专用卡**(虚线红边 + "设备已关机"状态 + "放电关机"徽标,仿重启测试的"临时离线"卡)——测完卡片不消失;重新开机后自动恢复在线卡,删除对应任务后卡片移除。
 
-> **语言规则**:脚本文件 100% 英文/ASCII(含参数标签);前端 UI 文案用中文,**但日志控制台(#log-console)输出全英文**(v2.5.1 起)。因此电池脚本的**参数弹窗标签是英文**,这是"代码文件无中文"规则的直接结果。
+> **语言规则**:脚本文件 100% 英文/ASCII(含参数标签);前端 UI 文案用中文,**但日志控制台(#log-console)输出全英文**。因此电池脚本的**参数弹窗标签是英文**,这是"代码文件无中文"规则的直接结果。
 
 ---
 
@@ -639,9 +488,7 @@ COST     cost_median = what one sample cost the PC. duty = that as a share of
 - 每台设备选的序列(`deviceSequences`)
 - 每台设备、每个脚本配置的参数(`deviceParams`)
 
-服务器数据(devices / scripts / tasks / server info)不持久化,每次都从后端拉。
-
-key 名:`pptp.deviceState.v1`,存在 `localStorage` 里。
+服务器数据(devices / scripts / tasks / server info)不持久化,每次都从后端拉;key 名 `pptp.deviceState.v1`。
 
 ---
 
@@ -649,48 +496,18 @@ key 名:`pptp.deviceState.v1`,存在 `localStorage` 里。
 
 ```
 ProjectorPressureTest/
-├── server.py              # 后端单文件 (FastAPI, 2084 行)
-├── start.bat              # 一键启动(启动成功自动关闭,失败保留信息)
+├── server.py              # 后端单文件 (FastAPI)
+├── start.bat / stop.bat   # 一键启动(成功自动关闭,失败保留信息)/ 一键停止
 ├── server_window.ps1      # PPTP-Server 窗口脚本(实时显示 uvicorn 日志 + 写文件)
-├── stop.bat               # 一键停止
-├── README.md              # 本文档
-├── docs/
-│   ├── HANDOFF_PROMPT.md # 完整信息源(API、数据模型、设计决策、踩坑)
-│   ├── SIMPLE-ARCHITECTURE.md  # 架构总览(数据流、脚本契约;活跃)
-│   ├── FRONTEND_UX.md    # 前端交互设计沉淀(为什么这样做;活跃)
-│   ├── SIMPLE-PRD.md     # 初版 v2.0 设计 PRD(已归档)
-│   └── SIMPLE-PLAN.md    # 初版 1.5 天实施计划(已归档)
-├── static/
-│   ├── index.html         # 单页 HTML
-│   ├── app.js             # 前端逻辑 IIFE
-│   ├── style.css          # 样式
-│   └── vendor/
-│       └── echarts.min.js # ECharts 5.5.1 本地化(性能监控图表,~1MB,pin 版本)
-├── scripts/               # 压测脚本
-│   ├── ir_runner.py             # 红外序列(自包含:IRRemote 内联,默认无限循环,双通道注入,长按=down+hold+up)
-│   ├── wifi_onoff_stress.py     # WiFi 开关压力(关/开循环 + wpa_cli 扫描,参数可配)
-│   ├── wifi_reboot_stress.py    # WiFi 重启压力(reboot + 上线等待,参数可配)
-│   ├── wifi_switch_stress.py    # WiFi 多网络循环切换(预置列表,参数可配)
-│   ├── sensor_reboot_stress.py  # 重启 + 传感器(gsensor/ToF)回连压测,参数可配(含传感器序列下拉框)
-│   ├── app_launch_stress.py     # APP 冷/热启动耗时压测(APP_PRESETS 内置 3 个 APP 一起跑,am start -W TotalTime + logcat Displayed)
-│   ├── perf_monitor.py          # 性能监控(CPU/GPU/内存% + 前台APP CPU%,PERF| 采样流 → 前端实时图表)
-│   ├── battery_inout_stress.py  # 电池充放电压测(充电/放电分开跑,电量/温度/电压,PERF| 采样流 → 前端电量+温度曲线,串口开 health 轮询)
-│   └── bt_reboot_stress.py      # 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询音箱回连,参数可配)
-├── ir_sequences/          # IR 序列 .ini 文件
-│   ├── 1.ini                    # 当前默认序列(KEY_VCR + KEYCODE_HDMI,5 字段格式)
-│   └── KEY_REFERENCE.md         # 按键速查三张表:KEY_* 24 + KEYCODE_* 厂商 23 + 原生 26(手动维护)
-├── reports/               # 脚本写报告的原始位置(脚本契约,gitignore)
-│   └── stress-test/{wifi,sensor,app-launch,perf,battery}/   # 平台运行时会复制一份进存档
-├── logs/                  # 运行期临时工作区(任务结束后内容会被搬进 archive/)+ 服务日志
-│   ├── server.out.log / server.err.log
-│   └── <task_id>_<时间>_<脚本>_<设备>.{log,logcat.log,serial.log}
-└── archive/               # ★ 任务存档(永久保留,按模块分类)
-    └── <模块>/{wifi,perf,battery,sensor,app-launch,ir,bt,other}/
-        └── <时间>_<脚本>_<设备>/
-            ├── stdout.log / logcat.log / serial.log
-            ├── report.json    #   脚本报告(从 reports/ 复制过来)
-            ├── chart.png      #   性能图表(浏览器渲染回传,perf/battery 才有)
-            └── summary.json   #   清单:参数/状态/耗时/各文件行数/备注
+├── README.md / CLAUDE.md / CHANGELOG.md / TODO.md
+├── docs/                  # 文档集(清单见上文"文档地图")
+├── static/                # index.html + app.js + style.css + vendor/echarts.min.js(ECharts 5.5.1 本地化)
+├── scripts/               # 压测脚本 9 个(每个一节,见下文)
+├── ir_sequences/          # IR 序列 .ini(1.ini = 默认序列 KEY_VCR + KEYCODE_HDMI)+ KEY_REFERENCE.md(按键速查三张表)
+├── reports/               # 脚本写报告的原始位置(脚本契约,gitignore),按模块 stress-test/{wifi,sensor,app-launch,perf,battery}/
+├── logs/                  # 运行期临时工作区(内容会被搬进 archive/)+ 服务日志 server.out.log / server.err.log
+└── archive/               # ★ 任务存档,永久保留,按模块分类:archive/<模块>/<时间>_<脚本>_<设备>/
+                           #   模块 ∈ wifi / perf / battery / sensor / app-launch / ir / bt / other
 ```
 
 > **用户只需要看 `archive/`。** `logs/` 与 `reports/` 都不能删:`logs/` 是运行期工作区 + 服务自身日志;
@@ -700,36 +517,9 @@ ProjectorPressureTest/
 
 ## API 一览(完整)
 
-| Method | 路径 | 用途 |
-|---|---|---|
-| GET | `/healthz` | 健康检查 |
-| GET | `/api/server/status` | uvicorn PID + uptime + 任务计数 |
-| POST | `/api/server/shutdown` | 优雅关停(级联 CTRL_BREAK + 退出) |
-| GET | `/api/devices` | ADB 设备列表 |
-| GET | `/api/scripts` | scripts/ 下脚本列表(含 has_params 标志) |
-| GET | `/api/scripts/{name}/params` | 读脚本自描述的参数 schema(`--dump-params`) |
-| GET | `/api/sequences` | ir_sequences/ 下 .ini 列表 |
-| GET | `/api/sequences/{name}` | 读单个 .ini 内容 |
-| PUT | `/api/sequences/{name}` | 写整个 .ini 内容 |
-| DELETE | `/api/sequences/{name}` | 删 .ini(default 拒绝) |
-| POST | `/api/sequences` | 新建 .ini(写最小模板) |
-| POST | `/api/run` | 启动任务(同设备并发返回 409) |
-| POST | `/api/stop/{task_id}` | 单任务中断(CTRL_BREAK) |
-| POST | `/api/tasks/force-stop-by-device/{serial}` | SIGKILL 该设备任务 |
-| POST | `/api/tasks/force-cleanup` | SIGKILL 全部 + 清空任务 |
-| POST | `/api/tasks/cleanup` | 删所有终态任务 + log |
-| POST | `/api/adb/reconnect` | adb kill-server + start-server |
-| GET | `/api/tasks` | 全部任务状态 |
-| GET | `/api/tasks/{id}` | 单任务 |
-| GET | `/api/tasks/{id}/log?source=` | 单通道日志尾部读(默认 `stdout`;`logcat` / `serial`;非法 source → 400) |
-| DELETE | `/api/tasks/{id}` | 从列表移除任务(存档保留) |
-| GET | `/api/serial/ports` | 本机 COM 口列表(串口勾选框用;无 pyserial → 空列表) |
-| POST | `/api/tasks/{id}/archive/artifact` | 浏览器回传图表 PNG 进存档(名称白名单 + 8MB 上限) |
-| POST | `/api/tasks/{id}/archive/reveal` · `/api/archive/reveal` | 资源管理器打开某任务存档 / 存档根目录 |
-| GET | `/api/archive/stats` | 存档总数与总占用 |
-| WS | `/ws/logs/{id}?sources=` | 实时推送(RAF 批处理);前端只用默认的 `stdout` |
+`GET /healthz` 健康检查 · `GET /api/server/status` uvicorn PID + uptime + 任务计数 · `POST /api/server/shutdown` 优雅关停(级联 CTRL_BREAK + 退出) · `GET /api/devices` ADB 设备列表 · `GET /api/scripts` scripts/ 下脚本列表(含 has_params 标志) · `GET /api/scripts/{name}/params` 读脚本自描述的参数 schema(`--dump-params`) · `GET /api/sequences` ir_sequences/ 下 .ini 列表 · `GET /api/sequences/{name}` 读单个 .ini 内容 · `PUT /api/sequences/{name}` 写整个 .ini 内容 · `DELETE /api/sequences/{name}` 删 .ini(default 拒绝) · `POST /api/sequences` 新建 .ini(写最小模板) · `POST /api/run` 启动任务(同设备并发返回 409) · `POST /api/stop/{task_id}` 单任务中断(CTRL_BREAK) · `POST /api/tasks/force-stop-by-device/{serial}` SIGKILL 该设备任务 · `POST /api/tasks/force-cleanup` SIGKILL 全部 + 清空任务 · `POST /api/tasks/cleanup` 删所有终态任务 + log · `POST /api/adb/reconnect` adb kill-server + start-server · `GET /api/tasks` 全部任务状态 · `GET /api/tasks/{id}` 单任务 · `GET /api/tasks/{id}/log?source=` 单通道日志尾部读(默认 `stdout`;`logcat` / `serial`;非法 source → 400) · `DELETE /api/tasks/{id}` 从列表移除任务(存档保留) · `GET /api/serial/ports` 本机 COM 口列表(串口勾选框用;无 pyserial → 空列表) · `POST /api/tasks/{id}/archive/artifact` 浏览器回传图表 PNG 进存档(名称白名单 + 8MB 上限) · `POST /api/tasks/{id}/archive/reveal` · `/api/archive/reveal` 资源管理器打开某任务存档 / 存档根目录 · `GET /api/archive/stats` 存档总数与总占用 · `WS /ws/logs/{id}?sources=` 实时推送(RAF 批处理);前端只用默认的 `stdout`
 
-完整数据模型、状态机、bug 历史见 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md)。
+完整数据模型、状态机、bug 历史见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);接手与排查 SOP 见 [docs/START-HERE.md](docs/START-HERE.md)。
 
 ---
 
@@ -739,13 +529,13 @@ ProjectorPressureTest/
   确认命令行 `adb devices` 能看到设备。
 
 - **找不到日志**
-  去 `archive/<时间>_<脚本>_<设备>/`(任务卡上有 `存档` 按钮直接打开)。`logs/` 只是运行期临时目录,任务一结束内容就搬走了。
+  去 `archive/<时间>_<脚本>_<设备>/`(任务卡上有 `存档` 按钮)。`logs/` 只是运行期临时目录,任务一结束内容就搬走了。
 
 - 脚本运行报错
   看该任务存档里的 `stdout.log`,或前端日志面板。
 
 - 存档里没有 `chart.png`
-  跑完的时候浏览器没开着。图表由浏览器渲染(Tab 关了就画不出来),事后重新打开页面看那个任务会自动补传。三份日志和 `report.json` 不受影响。
+  跑完的时候浏览器没开着。图表由浏览器渲染(Tab 关了就画不出来),事后打开页面看那个任务会自动补传;三份日志和 `report.json` 不受影响。
 
 - 串口下拉框是空的
   没装 pyserial(`pip install pyserial`)或没插 USB 转串口线。命令行 `python -m serial.tools.list_ports -v` 可确认。
@@ -784,23 +574,24 @@ ProjectorPressureTest/
   当前平台透传的 `--device-event-path` 还没接(改中)。临时方案:设环境变量后重启 uvicorn,所有 ir_runner 任务都会读到。
 
 - 想改平台代码后没生效
-  浏览器 **Ctrl+F5** 硬刷(平台加了 `?v=2.5.1` + NoCache 中间件,普通 F5 可能拿到缓存)。
+  浏览器 **Ctrl+F5** 硬刷(平台给静态资源加了带版本号的 `?v=` 查询串 + NoCache 中间件,普通 F5 可能拿到缓存)。
 
 - battery_inout_stress 电量曲线像直线 / 报"polling not enabled"
   确认串口选对了:电量由外部 BMS 管理,必须通过串口 console 开 health 轮询才实时。选错 COM / 串口终端软件占着口 / 波特率不对都会导致开启失败,脚本会打印 `[batt] warning` 并继续用缓存值。先关掉串口终端软件,再在参数弹窗里选对 COM 口重跑。
 
 ---
 
-## 后续(本期不做)
+## 显式不做(Out-of-Scope)
 
-本期已实现:设备列表、脚本列表、IR 序列选择 + 创建、modal 配置、脚本参数前端可配(params,按 设备×脚本 独立持久化,含 `select` 下拉框类型)、WiFi 压测脚本(wifi_onoff / wifi_reboot / wifi_switch)、传感器压测脚本(sensor_reboot_stress,gsensor / ToF)、APP 冷热启动压测脚本(app_launch_stress,cold / hot 分开跑,APP_PRESETS 内置 Netflix / Prime Video / YouTube TV 三个一起跑,am start -W TotalTime + logcat Displayed 交叉验证,每 APP 各自 p95 判定、整体全过才 PASS)、性能监控脚本(perf_monitor,CPU/GPU/内存% + 前台APP CPU%,实时图表 + 三件套导出)、电池充放电压测脚本(battery_inout_stress,充电/放电分开跑,电量/温度/电压实时监控,电量靠串口开 health 轮询,100% 稳定或关机自动停,跳变/温控检测保留)、localStorage 持久化、强制停止、重启 ADB、KEYCODE_* 上层注入(厂商 23 + 原生 26 + 透传,user 版可用)。
+**铁律:纯本地、单机、无远程、无鉴权、单用户。** 不联网、不对外服务、不做账号体系。
 
-本期仍不做:
-- 报告生成、历史日志检索
-- 设备分组、脚本版本管理、收藏
-- 多用户、鉴权
-- Docker、跨平台(Linux/macOS)
+以下东西**是不做,不是"还没做"**:
+
+- **插件框架** —— 脚本靠目录约定被发现:`.py` 丢进 `scripts/` 就出现,没有插件 API、也没有注册机制
+- **任务调度 / 定时执行** —— 没有 cron、没有排期,每次跑都是人在界面上手动点的
+- 设备分组 / 标签、脚本版本管理 / 收藏 / 预设 / 编排
+- 历史日志检索(日志按任务归档,要查就打开 `archive/`)
 - 数据库(全内存 + 文件 + localStorage)
-- 前端构建工具、JavaScript 框架
-
-详细"显式不做"清单见 [docs/SIMPLE-PRD.md §3](docs/SIMPLE-PRD.md#3-显式不做out-of-scope)。
+- 前端构建工具、JavaScript 框架(原生 JS,无构建步骤)
+- Docker 部署(直接 `start.bat`)
+- 跨平台(Linux / macOS)—— **只支持 Windows**(用户实际环境)

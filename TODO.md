@@ -1,8 +1,11 @@
 # PPTP — 待办事项
 
 > 本文件只放**已确认、但当前决定不做**的事情。已完成的进 [CHANGELOG.md](CHANGELOG.md),
-> 设计决策与踩坑进 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md)。
+> 设计决策进 [docs/DECISIONS.md](docs/DECISIONS.md),踩坑与规矩进 [docs/PITFALLS.md](docs/PITFALLS.md)。
 > 用户 2026-09-11 明确:下面这些**先记录,暂不修改**。
+>
+> **编号是标识符,不复用也不重排。**条目被移除后留下的号是空的,不拿新内容去填 ——
+> 否则任何外部转引("见 TODO §7.1")都会指向别的东西。
 
 ---
 
@@ -59,7 +62,7 @@
 修它需要在最取消敏感的路径里插等待,代价与收益不成比例。
 
 **含义**:以裸提示符(无换行)结尾的设备 console,最后一行永远不进文件。
-详见 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md) §5.5.5 #30。
+详见 [docs/PITFALLS.md](docs/PITFALLS.md) #30。
 
 ---
 
@@ -70,106 +73,36 @@
 v2.7.0 的服务端做了逐路径真机验证,DOM id 也做了交叉校验,但"按钮长什么样、点下去对不对"
 没有人在浏览器里看过。
 
+**下次开浏览器先 Ctrl+F5**,重点看:任务卡 `存档` 按钮、任务面板占用数字、跑完那次 `[archive]`
+摘要行、图表回传是否真的落进 `archive/*/chart.png`、perf 折线图右缘是否跟随最新样本滚动,
+以及放电测试后设备卡是否变成"放电关机"(虚线红边)而非消失。这些收益**完全是视觉的**,
+`py_compile` / `node --check` 测不出来。
+
 ---
 
-## 5. ⚠ E-SafeNet 透明加密会破坏 Claude Code 的文件工具(已确认 5 个文件带密文壳)
+## 5. ⚠ E-SafeNet 透明加密会破坏 Claude Code 的文件工具
 
 **严重度:高(会毁文件)** —— 这不是项目代码问题,是本机环境问题,但必须记录。
+机制、不对称性、规则与逃生口的完整说明在 **[docs/PITFALLS.md](docs/PITFALLS.md) #0**;
+本节只留**清单与实测方法**。
 
-**现象**:2026-09-11 v2.7.2 开发期间发现,`server.py` 在磁盘上带一层
-`E-SafeNet`(亿赛通)透明加密外壳。表现:
+**已确认带密文壳(2026-09-16 收尾盘点,逐个 `Read` 实测)**:
+`server.py`、`scripts/_pptp_report.py`、`scripts/perf_monitor.py`、`scripts/wifi_onoff_stress.py`、
+`scripts/battery_inout_stress.py`。
 
-- **Python 进程(经 Bash 启动)读到的是明文** —— 文件正常、能编译能跑。
-- **Claude Code 的 Read / Grep / Edit 工具读到的是密文** —— Read 显示
-  `b#e� P  E-SafeNet  LOCK ...` 之类的二进制;Grep 完全搜不到该文件(直接从结果里消失,
-  连 `FastAPI` 这种必然存在的词都搜不到);Read 看到的行数是 316,而真实文件是 2448 行。
-
-**危险点**:Edit 工具是"读-改-写"。它读到密文、在密文上做替换、再把密文写回 ——
-**会直接毁掉 server.py**。
-
-**状态(2026-09-11,同日)**:用户**已手动解密** `server.py`,Claude Code 的 Read/Grep/Edit 恢复正常
-(实测 2448 行、AST 解析通过、grep 能搜到、多行 Edit 可用)。**但底层加密软件仍在**,随时可能再次
-包上 —— 所以下面的规避手段保留,遇到工具读到乱码/搜不到文件时照此处理。
-
-**当前规避**:改 `server.py` **一律用 Python 脚本**读写并加断言,例如:
-
-```bash
-"D:/Conda_Environments/dev_env/python.exe" - <<'PY'
-import pathlib
-p = pathlib.Path('server.py')
-t = p.read_text(encoding='utf-8')
-old = '''...'''
-assert t.count(old) == 1, f"expected 1 match, got {t.count(old)}"
-p.write_text(t.replace(old, new, 1), encoding='utf-8')
-PY
-"D:/Conda_Environments/dev_env/python.exe" -m py_compile server.py
-```
-
-**注意**:`read_text`/`write_text` **必须显式传 `encoding='utf-8'`**;另外 Python 文本模式写入
-会把 LF 转成 CRLF,写完后要再转回 LF,否则 Edit 工具(即使读得到明文)也会因为行尾不匹配而失败:
-
-```python
-b = pathlib.Path('server.py').read_bytes()
-pathlib.Path('server.py').write_bytes(b.replace(b'\r\n', b'\n'))
-```
-
-**为什么会触发**:推测是 Python 写文件后触发了 E-SafeNet 对**新内容**加密。
-本次会话之前 `server.py` 一直能被 Read 正常读取,是在我用 Python 脚本改写它之后才变成密文的。
-**其它文件(scripts/*.py、static/app.js、docs/*.md)目前都正常**,只有 server.py 中招。
-
-**2026-09-11 v2.7.4 补充确认:新建文件命中即变密文。** 为了做 A/B 复现,我用 Python 脚本
-生成了一份 `server_old_tmp.py` 副本,结果它**一诞生就是密文**:`grep` 完全搜不到(不报错、
-只是从结果里消失),而 Python 自己读写完全正常、uvicorn 也能正常 import。所以
-
-- 上面那套 Python 读写 workaround **只对"Python 自己也读不了"的情况才需要**;只要 Python 能读,
-  文件带壳并不影响运行,别急着救。
-- **反过来更要小心**:`Read`/`Grep` 对这类文件**静默失效**(不是报错),很容易误判成"这段代码不存在"。
-  判断依据:Python `open().read()` 能读到内容、而 Grep 搜同一个字符串 0 命中 ⇒ 就是密文壳。
-- 用 **Write 工具**(Claude Code 自己)建的文件不受影响;用 **Python 脚本**建/改的会中招。
-
-**2026-09-14 v2.9.0 补充确认:第二批文件中招,且这次是我自己的写入触发的。**
-受影响:`scripts/perf_monitor.py`(现在 Read/Grep **静默失效**,Grep 搜 `track_fg` 直接 0 命中,
-而 Python 读得到、`py_compile` 通过、真机跑得动),以及 `%TEMP%` 下的几个 harness 文件
-(`pptp_perf_v2_harness.py` 的 Read 只返回 25 行)。**触发点同样是 Python `write_text`。**
-
-后果很具体:当时我正在改 `perf_monitor.py`,Edit 反复报 "String to replace not found"、
-Grep 报 "No matches found" —— 两次都差点让我得出「这段代码不存在 / 已经删干净了」的错误结论。
-**所以踩到时的第一反应必须是「这文件被包壳了」,而不是「代码不在那儿」。**
-
-**规则(v2.9.0 起生效)**:`scripts/perf_monitor.py` 一律用 Python + `assert t.count(old) == 1` 改,
-写完 `py_compile`,**绝不用 Read/Edit/Grep 碰它**。
-
-**2026-09-16 v2.10.0 再次确认:不对称性可以精确表述了。** 同一时刻、同一个文件,**Read/Grep 读到密文,而 Python 进程读到明文** —— 这是两个不同的读进程,不是文件的两种状态。
-本次的直接证据:`Grep` 在 `scripts/perf_monitor.py` 上搜必然存在的 `HTML_CSS` **0 命中**,同时 `python -c "print(len(open('scripts/perf_monitor.py').read()))"` 把 128KB 全部按 UTF-8 解出来了。
-**推论**:看到 Grep 0 命中时**先怀疑密文壳**,再怀疑代码不存在 —— 这两件事在工具输出里长得一模一样。
-另:本次由 **Write 工具**新建的 `scripts/_pptp_report.py` 与 `docs/REPORT_FORMAT.md` 之后都能正常 Read,
-与上面「Write 工具建的文件不受影响」一致;但 `scripts/_pptp_report.py` 随后被 Python 脚本改过一次,**下次会话碰它之前先确认 Read/Grep 还能看到内容**。
-
-**2026-09-16 v2.10.0 收尾盘点:已确认的受影响文件清单(逐个用 Read 实测出来的,不是推断)。**
-
-- **当前带密文壳**:`server.py`、`scripts/_pptp_report.py`、`scripts/perf_monitor.py`、
-  `scripts/wifi_onoff_stress.py`、`scripts/battery_inout_stress.py`。
-- **当前可正常 Read**:`scripts/wifi_switch_stress.py`、`scripts/wifi_reboot_stress.py`、
-  `scripts/bt_reboot_stress.py`、`scripts/sensor_reboot_stress.py`、`scripts/app_launch_stress.py`、
-  `scripts/ir_runner.py`、`static/app.js`、`docs/*.md`、`CHANGELOG.md`。
+**当前可正常 Read**:`scripts/wifi_switch_stress.py`、`scripts/wifi_reboot_stress.py`、
+`scripts/bt_reboot_stress.py`、`scripts/sensor_reboot_stress.py`、`scripts/app_launch_stress.py`、
+`scripts/ir_runner.py`、`static/app.js`、`docs/*.md`、`CHANGELOG.md`。
 
 ⚠ **带壳与否不可预测** —— 上面那批"带壳"里有一半是**本轮被 Python 脚本改过却仍是明文**的,
 所以**不能用"我改过它/没改过它"推断**,每个文件碰之前**单独实测**。
-便宜测法:`Read` 那个文件 `limit: 2` —— 出乱码或行数明显不对就是带壳。
+
+**便宜的实测方法**:`Read` 那个文件 **`limit: 2`** —— 出乱码或行数明显不对就是带壳。
 **别用字节扫描**(在磁盘上 grep `E-SafeNet` 字样):CLAUDE.md / TODO.md 自己的正文里就写着这个词,
 必然假阳性 —— 而 Python 读它们本来就是明文,壳是**读进程侧**的东西。
 
-**待办**:确认哪些文件受影响、是否有办法让 Agent 工具走白名单进程(或反过来避免用非白名单
-进程写这些文件)。在那之前,`server.py` 与 `scripts/perf_monitor.py` 一律按上面的方式改。
-
-**2026-09-17 v2.11.1 补记:逃生口 —— 用 Python 把明文抄成一个非 `.py` 文件,壳不会跟过去。**
-用户说「现在拿不到 `server.py` 的代码了」时用的就是这招:Python `read_bytes()` → `write_bytes()`
-写成 `server.txt`,写完 **Read 正常、Grep 6 命中**(而同一个 Grep 打在 `server.py` 上是 **0 命中**)。
-**关键在扩展名**:至今中招的**全是 `.py`**(`server.py` / `perf_monitor.py` / `_pptp_report.py` /
-几个 `%TEMP%` harness),说明加密策略是按扩展名下发的 —— 换个扩展名(`.txt`)就落在策略之外。
-**另外一定要字节模式写**(`write_bytes`,不是 `write_text`):既不做 LF→CRLF 翻译,
-也绕开了「Python 文本写」这条已知触发路径。**这就是「文件被包壳后怎么把代码交给用户」的标准做法。**
-校验方式:源与副本各 `read_bytes()` 相等 + `sha256` 一致(2026-09-17:107982 字节 / 2651 行 / 0 CRLF)。
+**待办**:是否有办法让 Agent 工具走白名单进程(或反过来避免用非白名单进程写这些文件)。
+在那之前,`server.py` 与 `scripts/perf_monitor.py` 一律按 PITFALLS #0 的方式改。
 
 ---
 
@@ -234,43 +167,11 @@ v2.8.0 之前跑的 run,归档里只有 `report.json`;v2.8.0 之后才带 `perf_
 P1(定宽列)与 P6(事件行)的收益**完全是视觉的**,`py_compile` / `node --check` 测不出来。
 且前端至今**从未在真实浏览器验证过**(见 §4)。用户 2026-09-14 已同意后续实跑确认。
 
-### 6.10 gate 8(CPU)看不见「通道从来没被请求过」,而证据里没有能拆穿它的数据
-
-**症状(v2.9.0 修掉的那个 bug 暴露出来的)**:前台通道整轮零数据时,gate 8 读的是
-`fg_cpu["n_due_ok"]`,它当时是 **0**,于是门自己得出结论「没有预期中的采样」并**报 pass**。
-
-**为什么 `n_due_ok == 0` 是歧义的**:它既可能是
-(a) 运行太短,一次 SLOW 拍都没轮到(这时 pass 是对的),也可能是
-(b) 代码把整条通道关掉了(这时该 FAIL)。
-**证据里没有任何字段能区分这两者** —— `n_due`/`n_due_ok` 只在「到期」时累加,
-而「到期」正是被写坏的那个东西。这跟 §6.9 里其它条目不同:那些是**阈值没标定**,
-这一条是**判据本身可被同一个 bug 满足**。
-
-**当前的兜底(不是修复)**:
-
-- 假设备 harness 的 `assert_channels_alive()` 会在**测试**里抓住它(条件是「有 SLOW 拍成功返回过」),
-  但那只覆盖 CI 路径,**真机跑不经过它**。
-- 所以生产环境仍然只有**人肉看状态串**这一道 —— `samples.csv` 里 SLOW 拍恒为 `n` 而从不出现
-  `b`/`f`/`h` 就是信号。判定块本身**不会**告警。
-
-**要彻底关掉,需要往证据里加一个和「到期」无关的量**,比如:记录 SLOW 层的**理论开启次数**
-(由总拍数与 T 直接算出,不依赖任何谓词),gate 8 在「理论应当开启过 N 次,而实际到期 0 次」时 FAIL。
-这个量纯粹由 tick 计数推导,**bug 改不动它**,才算真正独立。**未做**(会动证据 schema 与判定版本号)。
-
-> 同类形状的教训已写进 [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md) 踩坑 #42:
-> **形状断言看不见死掉的通道**。这一条是它在判定侧的残留。
-
-**同族问题已修(2026-09-14,v2.9.0)**:gate 9(APP)原来也是"判据分不开两种状态" ——
-把"关注的 app 从没出现过"判成丢失(假 fail),又看不见"窗口还在但进程没了"(假绿),
-而后者正是该参数唯一的存在理由。现在拆成三出口(fail / inconclusive / pass),详见踩坑 #44。
-**本节的 gate 8 盲区仍然存在** —— 它和 gate 9 的病根相同(**判据可以被要检测的那个 bug 自己满足**),
-只是 gate 9 能靠"先健康过没有"这个独立事实拆开,gate 8 目前没有等价物。
-
 ### 6.9 perf_monitor v2 的已拍板决策与其残余风险(2026-09-14)
 
 用户原话:「问我没用,我已经有点看不懂了……你拿一下主意,风险项可以暂时加到 todo 里面」。
-以下由实现方按"保守 + 可反悔"拍板,**决定与理由见 [docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md) §12.7**。
-这里只记**残余风险**,不重复决策。
+以下由实现方按"保守 + 可反悔"拍板,**决定与理由见 [docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md) §12.7
+与 [docs/DECISIONS.md](docs/DECISIONS.md)**。这里只记**残余风险**,不重复决策,也不重复 §6.2。
 
 - **图表在超长跑里会退化成后段缩略图** —— `REPLAY_TAIL_BYTES=4MB`。v2.8.0 加了 `st` 列后
   单行约 309→332 B,所以帽从约 13981 行降到约 **12600 行**:T=2s 时 **≈ 7.0h**(原 7.8h)、
@@ -289,9 +190,6 @@ P1(定宽列)与 P6(事件行)的收益**完全是视觉的**,`py_compile` / `no
 - **WiFi 链路下超时余量未验证** —— 公式里的 adb 往返开销是 USB 实测(110–140 ms)。
   已改为**脚本启动时自测往返基线**(不再硬编码常数),所以 USB/WiFi 差异被自测吸收;
   但"自测值是否足够保守"本身没在 WiFi 下验证过。
-- **所有判定阈值都还没标定** —— 内存斜率、cadence、覆盖率门限目前是占位值。
-  实现会带 `CALIBRATED = False` 并在判定块打印 `judge_version=v1-uncalibrated`,
-  **一份完全健康的报告也会显示未标定**,避免假信心。标定需要**一次健康的 8 小时基线跑**。
 - **`watch_pkg` 默认「不关注」** —— 不选时"应用崩溃回到 launcher"**不会被判成异常**(脚本不知道你关心哪个包)。
   默认行为与今天一致,是刻意选择;要抓这个场景就得选上。
   **v2.9.0 起它是下拉而非自由文本**,清单已由用户定稿(YouTube TV / Netflix / Prime Video /
@@ -302,35 +200,45 @@ P1(定宽列)与 P6(事件行)的收益**完全是视觉的**,`py_compile` / `no
   Netflix 3314,都能取到)。跑它的时候顺手看一眼 `adb shell pidof com.mediatek.wwtv.mediaplayer`
   有没有输出。
 
+### 6.10 gate 8(CPU)看不见「通道从来没被请求过」,而证据里没有能拆穿它的数据
+
+**症状(v2.9.0 修掉的那个 bug 暴露出来的)**:前台通道整轮零数据时,gate 8 读的是
+`fg_cpu["n_due_ok"]`,它当时是 **0**,于是门自己得出结论「没有预期中的采样」并**报 pass**。
+
+**为什么 `n_due_ok == 0` 是歧义的**:它既可能是
+(a) 运行太短,一次 SLOW 拍都没轮到(这时 pass 是对的),也可能是
+(b) 代码把整条通道关掉了(这时该 FAIL)。
+**证据里没有任何字段能区分这两者** —— `n_due`/`n_due_ok` 只在「到期」时累加,
+而「到期」正是被写坏的那个东西。
+
+**当前的兜底(不是修复)**:
+
+- 假设备 harness 的 `assert_channels_alive()` 会在**测试**里抓住它(条件是「有 SLOW 拍成功返回过」),
+  但那只覆盖 CI 路径,**真机跑不经过它**。
+- 所以生产环境仍然只有**人肉看状态串**这一道 —— `samples.csv` 里 SLOW 拍恒为 `n` 而从不出现
+  `b`/`f`/`h` 就是信号。判定块本身**不会**告警。
+
+**要彻底关掉,需要往证据里加一个和「到期」无关的量**,比如:记录 SLOW 层的**理论开启次数**
+(由总拍数与 T 直接算出,不依赖任何谓词),gate 8 在「理论应当开启过 N 次,而实际到期 0 次」时 FAIL。
+这个量纯粹由 tick 计数推导,**bug 改不动它**,才算真正独立。**未做**(会动证据 schema 与判定版本号)。
+
+> 同类形状的教训已写进 [docs/PITFALLS.md](docs/PITFALLS.md) #42:
+> **形状断言看不见死掉的通道**。这一条是它在判定侧的残留。
+
+**同族问题已修(2026-09-14,v2.9.0)**:gate 9(APP)原来也是"判据分不开两种状态" ——
+把"关注的 app 从没出现过"判成丢失(假 fail),又看不见"窗口还在但进程没了"(假绿),
+而后者正是该参数唯一的存在理由。现在拆成三出口(fail / inconclusive / pass),详见PITFALLS.md #44。
+**本节的 gate 8 盲区仍然存在** —— 它和 gate 9 的病根相同(**判据可以被要检测的那个 bug 自己满足**),
+只是 gate 9 能靠"先健康过没有"这个独立事实拆开,gate 8 目前没有等价物。
+
 ---
 
 ## 7. v2.10.0 报告引擎的已知残余(2026-09-16)
 
 > 都是**已确认、当前决定不做**的事。设计决策与实测结论在
-> [docs/HANDOFF_PROMPT.md](docs/HANDOFF_PROMPT.md) §6 的 v2.10.0 条;格式真源在
+> [docs/DECISIONS.md](docs/DECISIONS.md) 的 v2.10.0 条;格式真源在
 > [docs/REPORT_FORMAT.md](docs/REPORT_FORMAT.md)(该文 §12 有同一份清单的简述)。
-> **7.1 当天即已解决**(用户 2026-09-16 裁决),留在这里是为了记住那个缺口的形状。
-
-### 7.1 ✅ `wifi_onoff_stress.py` 中断时不写报告 —— **已解决(2026-09-16 用户裁决)**
-
-用户原话:「中断时报告与 HTML 都写,报告简单注明一下吧」。
-
-- **原先的缺口**:报告写入被 `if not interrupted:` 包着(**脚本自身既有设计**,顶部注释写着
-  「report is only saved on full completion」),但 `=== results ===` + `OVERALL` 在守卫**外**、中断时照打 ——
-  于是中断时 **stdout 有一个 Overall Result,却没有任何报告**,与本轮要求
-  「每个脚本 stdout 的 Overall Result 都需要生成 html 的报告」直接冲突。
-- **为什么只能整条删守卫**:"只在中断时补 HTML"是不可能的 —— 报告与 HTML 必须**同 stem 同目录**
-  才能被归档收走(见 [REPORT_FORMAT.md](docs/REPORT_FORMAT.md) §7),否则那是一个**孤儿 HTML**,
-  被 `_companion_files` 静默丢弃。所以要补就得**同时**写 JSON 报告,只能整条删。
-- **现状**:两类产物每次都写。判定**一个字不改**(控制台与页面因此不可能互相打架),
-  中断这件事进 `interrupted: bool` + `interrupted_note: str`(JSON 里两个键**恒在**),
-  同一句话进 `warn_zh` → HTML 横幅正下方那条黄条。
-- **措辞分两种**:一轮都没跑起来 → 比率与结论**不成立**;跑了若干轮 → 明说
-  「已开始 N/M 轮(其中最后开始的 1 轮未跑完),下面的比率与结论**只覆盖这些已开始的轮次**」——
-  `actual` 数进了在飞的那轮,而它没贡献任何一次检查计数,不写清楚的话半场会被读成一场差的。
-- **真机实测过**:平台拉起 → 跑到第 2 轮点「中断」→ 归档里 `report.json` 与 `<stem>.html` 都在、
-  `report.json` 带 `interrupted: true`、页面黄条可见、`report :` 仍是最后一行。详见
-  [CHANGELOG.md](CHANGELOG.md) v2.10.0「中断时报告与 HTML 都写」。
+> **7.1(中断不写报告,当天即解决)与 7.6(引擎行数估算)已移除** —— 号保留,不复用。
 
 ### 7.2 `wifi_onoff` / `sensor_reboot` / `battery_inout` 的报告没在真机上跑过
 
@@ -355,58 +263,40 @@ P1(定宽列)与 P6(事件行)的收益**完全是视觉的**,`py_compile` / `no
 `WIFI_NETWORKS` 的三条明文口令。这是既有行为(平台从不解析报告 JSON,也不该开始解析),
 但**分享那份 JSON 前必须自己删**。HTML 已验证不含任何口令。
 
-### 7.6 引擎 588 行,计划里估的是 320
-
-多出来的部分是 params 表(要同时吃两种 `choices` 形状)、`_detail_html` 的递归按键名隐去、
-以及三种区块构造器(`section_table` / `section_kv` / `section_list`)。不是失控,是估算偏低。
+> 用户长期指令:**Wi-Fi 口令不算敏感,不要再提**。本节只作事实归档。
 
 ### 7.7 `reports/` 里留着本轮验证的产物(**已定:暂不删**)
 
 2026-09-16 的验证跑在 `reports/stress-test/{wifi,app-launch,perf}/` 留下 6 组 json+html,
-另外 `reports/_demo_report.html` 是我做引擎冒烟测试时的手工件。**它们全部被 `.gitignore` 覆盖**
+另外 `reports/_demo_report.html` 是做引擎冒烟测试时的手工件。**它们全部被 `.gitignore` 覆盖**
 (整个 `reports/` 目录都不入库),所以不进版本库、也不会被任何将来的任务认领
-(mtime 兜底扫描要求 mtime ≥ 任务开始时间)。**用户 2026-09-16 已定:暂不删** —— 留作引擎的手写样例与这轮的验证痕迹(整个 `reports/` 都不入库,不构成负担);哪天真要清就整目录删掉。
+(mtime 兜底扫描要求 mtime ≥ 任务开始时间)。**用户 2026-09-16 已定:暂不删** —— 留作引擎的手写样例与这轮的验证痕迹;哪天真要清就整目录删掉。
+
+### 7.8 `app_launch_stress` 的热启动(hot)模式还没真机验证
+
+**冷启动已真机验证通过**(三个 APP 各 1 轮,`TotalTime` 正常、`LaunchState=COLD`、
+logcat `Displayed` 交叉验证 1/1 命中)。**热启动模式没跑过** —— 下次跑一轮确认
+HOME 退后台 → 拉起流程与 WARM/HOT 语义校验是否符合预期。
+
+---
 
 ## 8. v2.11.0 按键 keepalive 的已知残余(2026-09-17)
 
-### 8.1 ✅ 「硬停」之后那台设备会被永久卡死 —— **已修(v2.11.1,2026-09-17,用户要求修)**
-
-**现象**:对一台设备用「硬停」(force-stop)之后,那台设备**再也起不了新任务**:`POST /api/run` 一直返回
-`409 设备 X 上有正在运行的任务`,直到重启服务或 `POST /api/tasks/force-cleanup`。2026-09-17 的验证里复现两次。
-
-**根因**(`server.py` 的 `api_force_stop_by_device`):硬停把状态写成 `interrupting`,注释说
-「好让 `_stream_logs` 在它看到子进程退出时推进成 `interrupted`」—— 但那一步在 **`await _stop_captures()` 之后**,
-`await` 会让出事件循环,而 `_stream_logs` 此刻正卡在 `proc.wait()` 上、**已经**能拿到退出码:它先跑完
-`task["status"] = "failed"`(终态)、`ended_at`、归档、广播,然后控制权才回到硬停这边,
-把**已经终态**的 `"failed"` **覆盖成 `"interrupting"`**。此后 `_stream_logs` 早已返回,**没有任何东西会再推进它**,
-于是任务永远停在 `interrupting`,而 409 守卫([server.py:1956-1965](server.py#L1956-L1965))恰好拦 `running`/`interrupting`。
-
-**修法(v2.11.1 已实施,「单一终结者」)**:硬停在**第一个 `await` 之前**就同步**认领**终结者的身份 ——
-置 `t["_finalized"] = "force_stop"` 并直接写**终态** `"interrupted"` / `exit_code = -9` / `ended_at`
-(被杀的脚本本来就该是 `interrupted` 而不是 `failed`:是操作员要它死的);
-`_stream_logs` 在 `proc.wait()` 之后看到 `t["_finalized"]` 就**直接 return**,不再做第二次终结。
-硬停这边原本就自己 `_stop_captures` + 归档 + 广播 `end`,v2.11.1 补上一句 `_broadcast_archive_line()`
-(因为 `_stream_logs` 不再代劳)。**关键点:终态必须在任何 `await` 之前落定** ——
-一旦中间让出事件循环,谁先醒就成了竞态。同一形状的坑已记进 HANDOFF 踩坑清单。
-
-**验证**(2026-09-17,真机 `B0403374A2A508001F00`,17/17 通过):
-A 运行中硬停 → `interrupted` / `exit=-9` / 已归档(6 文件);
-B 紧接着 `POST /api/run` **不再 409**(旧 bug 正是在这一步卡死)、正常中断回归 `interrupted`;
-C 正常中断途中再硬停 → 仍是终态;D 连续 3 次硬停 → 全部终态、无残留非终态任务。
-服务端输出里每个硬停任务**只有一行** `[archive] ... (force_stop)`、**没有** `(task_end)`,
-即 `_stream_logs` 确实走了那条 return(否则会多一行)。
+> **8.1(硬停后设备永久卡死)已修于 v2.11.1** —— 号保留,不复用;逐字记录见
+> [CHANGELOG.md](CHANGELOG.md) v2.11.1 与 [docs/DECISIONS.md](docs/DECISIONS.md) 的「单一终结者」条。
 
 ### 8.2 往 `ir_sequences/` **新加** ini 后,下拉框要等重启服务才出现
 
-平台按 `(脚本名, 文件 mtime)` 缓存 `--dump-params`([server.py:1795-1830](server.py#L1795-L1830)),
+平台按 `(脚本名, 文件 mtime)` 缓存 `--dump-params`,
 而 `KEY_INI_CHOICES` 是**导入时**扫目录生成的 → **改已有 ini 的内容随时生效**(节奏立刻变),
 **新增一个 ini 文件**则要等服务重启或 `perf_monitor.py` 本身变动。**不为它加缓存失效机制**(收益极小)。
 
 ### 8.3 keepalive 的 adb 调用会与每拍采样争用同一台设备
 
 一次按键 ≈ 一次 `adb shell input keyevent`,与当拍的复合采样命令抢同一个 adb server。
-`_adapt_guard` 看到 `cost_ms` 变大只会**抬高**设备守卫 `G`,**不会误杀**;代价是报告里的 `COST`/`duty`
-读数会**略微上浮**。30 分钟一次的节奏下影响可忽略,但归因时要知道参数表里选了哪个 ini(报告 `config` 里有 `key_ini`)。
+`cost_ms` 变大**只会抬高**预算 —— PC 侧 `B` 由最近 30 个 tick 中 `res ∈ {ok, partial}` 的 `cost_ms`
+估计窗派生(必须排除 timeout),设备侧 `G` 随之放宽(`timeout -k 2 G <cmd>`)—— **不会误杀**;
+代价是报告里的 `COST`/`duty` 读数会**略微上浮**。判定模型见 [docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md) §12.3。30 分钟一次的节奏下影响可忽略,但归因时要知道参数表里选了哪个 ini(报告 `config` 里有 `key_ini`)。
 
 ### 8.4 中断恰好落在 `Long` 长按的「按下」与「抬起」之间 → 设备可能停在按下态
 
@@ -427,3 +317,39 @@ CPython 的 `print` 是**两次 write**(先写内容、再写 `\n`),所以两个
 所以 `count=0` 的步不计数(与 `run_step` 行为一致),而**被打断的那一次按键不计**
 (它可能已经按下去了,但 `run_step` 没返回)。**这是保守方向**:宁可少报,不虚报。
 
+---
+
+## 9. 平台的会话与清理残留(2026-09-18 归档)
+
+两条都是**已知、当前不做**的小问题,不影响数据正确性,但知道形状能省掉一次排查。
+
+### 9.1 服务重启后,页面的日志面板「卡」在最后一行
+
+WS 在 server restart 时会断,而前端**没有自动 rejoin**(log WS 只有手动重连路径)。
+表现:日志 console 停在上一次的最后一行不再增长,但任务其实还在跑。
+**绕法**:重新点一次任务(`viewTaskLogs`)或刷新页面。**不做自动重连** ——
+`ir_runner` 任务之外都是纯客户端流,加自动重连要在 `openWs`/`scheduleReconnect` 上再叠一层陈旧防护,
+收益不抵风险。
+
+### 9.2 任务被删除后,它的 log 文件没有任何自动回收
+
+**实测**(2026-09-18 逐处读 `server.py`):删任务只走 `_forget_task()`,其 docstring 逐字写着
+**"Deliberately touches NOTHING on disk"**、处置说明 "left for the user to clear by hand"。
+全库对 `LOGS_DIR` 只有**写**(L265 / L1361 / L1989)与**建目录**(L73),无任何 `unlink` / `glob`;
+仅有的删除是 `ir_sequences/_seq_*.ini`(startup,L408–410)、`_archive_task` 搬走后的 `reports/`
+原件(L1392 / L1421)、以及用户点名删的 `.ini`(L1908)。
+⚠ `_reap_orphan_scripts()` / `_reap_orphan_logcat()` 清的是**崩溃残留的进程**(前者 `python.exe`、
+后者 `adb logcat` 子进程),**不是文件** —— 别再说"startup 会把 log 文件清掉"。
+**刻意不做自动回收**:`archive/` 是耐用副本,`logs/` 只是运行期工作区。
+
+### 9.3 删除任务的确认框在说谎:它说日志会被一起删掉
+
+**严重度:低(不改数据,只误导用户)** —— 但方向很坏:它让用户以为删任务会销毁产物。
+
+`static/app.js` 里两处确认文案都写着「日志文件会一起删除,无法恢复」(删单个任务、批量清空),
+而**同一个界面**上任务卡 `×` 按钮的 tooltip 写的是「从列表移除(存档保留在 archive/)」。
+**后者才是事实**:`_forget_task()` 刻意不碰磁盘,归档永久保留;`logs/` 里的运行期文件确实不会被删,
+但那是"残留待清"(§9.2),不是"被删掉"。
+
+**改法**(未做):两处确认文案改成与 `×` tooltip 一致的措辞 ——
+「从列表移除;归档保留在 `archive/`,`logs/` 里的临时文件需要手工清理」。

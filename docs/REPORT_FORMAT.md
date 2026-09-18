@@ -1,9 +1,11 @@
 # PPTP 报告格式与生成架构
 
-> **本文档是"HTML 报告长什么样、数据从哪来、怎么和归档对上"的真源(v2.10.0,2026-09-16)。**
+> **本文是报告格式与参数架构的唯一真源(v2.10.0,2026-09-16)。**
 > 面向两种读者:① 想读懂一份已生成报告的人;② 要给**新脚本**接入报告的开发者。
-> 代码级细节(函数行号 / 平台侧归档逻辑 / 设计决策沿革)以 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 为准。
-> 平台整体架构见 [SIMPLE-ARCHITECTURE.md](SIMPLE-ARCHITECTURE.md)。
+> **分工**:凡本文写到的(payload / row 模型 / HTML / params / stdout / 引擎 API / 归档命名与 `<stem>` 配对规则)
+> 都以本文为准;**平台的认领与归档时机**(`_sniff_report_path` / `_CLAIMED_REPORTS`)归
+> [ARCHITECTURE.md](ARCHITECTURE.md) §4.3,不属于本文。**文内不再有"以某文为准"的转引。**
+> 平台整体架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 > 版本:v2.10.0 | 引擎版本:`_pptp_report.ENGINE_VERSION = 1.0.0` | 报告 schema:`pptp-report/1`
 
@@ -487,7 +489,9 @@ SCRIPT_VERSION = "1.0.0"
 
 ## 13. 相关文档
 
-- [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) —— 平台侧归档逻辑、`_sniff_report_path`、设计决策沿革与踩坑
-- [SIMPLE-ARCHITECTURE.md](SIMPLE-ARCHITECTURE.md) —— 数据流全景
+- [START-HERE.md](START-HERE.md) —— 新会话入口(这是什么、先读哪、SOP)
+- [ARCHITECTURE.md](ARCHITECTURE.md) —— 平台侧归档逻辑、`_sniff_report_path` / `_CLAIMED_REPORTS`、数据流全景
+- [DECISIONS.md](DECISIONS.md) —— 报告引擎的已批准决策(DO NOT REVERT,分组「报告引擎」)
+- [PITFALLS.md](PITFALLS.md) —— 改脚本 stdout / 报告渲染时会踩到的坑
 - [PERF_MONITOR_V2.md](PERF_MONITOR_V2.md) —— `perf_monitor` 自身的判定模型(`judge()` / gates / `ROW_SPEC`)
 - [CHANGELOG.md](../CHANGELOG.md) —— v2.10.0 起每次变动的记录
