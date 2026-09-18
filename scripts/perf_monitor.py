@@ -69,6 +69,7 @@ import statistics
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from datetime import datetime
 
@@ -80,6 +81,13 @@ from datetime import datetime
 # See docs/REPORT_FORMAT.md.
 import _pptp_report
 
+# The optional key injector drives ir_runner's step executor rather than
+# re-implementing `adb shell input keyevent` here: the .ini grammar, the
+# KEYCODE_* vs KEY_* dispatch and the long-press handling already live there and
+# are proven on this device. Importing it has no side effects (its main() is
+# guarded by __name__), and a sibling import resolves exactly like the one above.
+import ir_runner
+
 # Make CTRL_BREAK_EVENT (sent by PPTP platform's stop button on Windows)
 # raise KeyboardInterrupt so the loop can exit cleanly with a verdict.
 if hasattr(signal, "SIGBREAK"):
@@ -88,7 +96,7 @@ if hasattr(signal, "SIGBREAK"):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.1"
 
 # ---------------------------------------------------------------------------
 # Frozen schema (order is load-bearing; do not sort or reorder)
@@ -181,6 +189,10 @@ BUDGET_WINDOW = 30             # ticks used to estimate the typical cost
 BUDGET_GROW_STREAK = 3         # consecutive requests needed before G may grow
 
 EVENT_RATE_WINDOW_S = 60.0
+
+# A fixed wall clock for the synthetic event that --selftest renders, so the
+# expected "18:39:12"-style string is predictable in any timezone.
+SELFTEST_EVENT_CLOCK_MS = 1789614015576
 SNAPSHOT_INTERVAL_S = 120.0    # partial verdict cadence (hard-kill insurance)
 GPU_REPROBE_INTERVAL_S = 300.0
 GPU_DEGRADE_AFTER = 3          # consecutive failed due ticks before disabling
@@ -214,6 +226,27 @@ WATCH_PKG_CHOICES = [
     {"value": "com.mediatek.wwtv.mediaplayer", "label": "本地媒体播放器"},
 ]
 
+def _key_ini_choices() -> list:
+    """The .ini files the key injector may run, as {value,label} select choices.
+
+    A fixed list rather than free text, for the same reason as watch_pkg: the
+    point is to pick one of the sequences that exist, and a typo in a path would
+    silently start nothing at all. Transient _seq_*.ini files are skipped -
+    ir_runner writes those only while running with a `sequence_content` param,
+    so they are never a real choice. Empty first entry = do not inject keys.
+    """
+    choices = [{"value": "", "label": "(不发送按键)"}]
+    d = os.path.join(PROJECT_ROOT, "ir_sequences")
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".ini") and not name.startswith("_"):
+                choices.append({"value": f"ir_sequences/{name}",
+                                "label": name})
+    return choices
+
+
+KEY_INI_CHOICES = _key_ini_choices()
+
 PARAMS = [
     {"name": "interval_sec", "label": "采样间隔(秒)", "type": "float",
      "default": 2.0, "min": INTERVAL_MIN_SEC, "max": INTERVAL_MAX_SEC},
@@ -221,6 +254,8 @@ PARAMS = [
      "default": 0, "min": 0, "max": DURATION_MAX_SEC},
     {"name": "watch_pkg", "label": "关注的应用(它掉到后台/挂掉才算异常)",
      "type": "select", "choices": WATCH_PKG_CHOICES, "default": ""},
+    {"name": "key_ini", "label": "定时发按键的 ini(长跑时防空闲提示)",
+     "type": "select", "choices": KEY_INI_CHOICES, "default": ""},
 ]
 
 OFFLINE_RE = re.compile(r"device offline|no devices|device not found|not found",
@@ -1406,6 +1441,26 @@ def _pct(v) -> str:
     return f"{v * 100:.0f}%"
 
 
+def _hms(clock_ms, full: bool = False) -> str:
+    """Epoch milliseconds as a local wall clock ("18:39:12"), or "".
+
+    Every event carries both a run-relative tick (`t_sec`) and the wall clock it
+    happened at (`clock_ms`). The tick says WHERE in the run it was; the clock
+    says WHEN it was - and that is the part an operator can line up against
+    another device's log, a bug ticket, or their own memory of the afternoon.
+    Local time on purpose: the report gets read next to the person who was
+    watching the device, not next to a UTC reference.
+
+    A missing or nonsensical clock degrades to "" instead of raising - the same
+    HTML is also written from a partial snapshot on the way out of a run.
+    """
+    fmt = "%Y-%m-%d %H:%M:%S" if full else "%H:%M:%S"
+    try:
+        return time.strftime(fmt, time.localtime(int(clock_ms) / 1000.0))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
 def format_result_html(payload: dict) -> str:
     """Standalone Chinese HTML report, written next to report.json.
 
@@ -1484,7 +1539,8 @@ def format_result_html(payload: dict) -> str:
     parts.append(_pptp_report.render_params_table(
         {"interval_sec": cfg.get("interval_sec"),
          "duration_sec": cfg.get("duration_sec"),
-         "watch_pkg": cfg.get("watch_pkg") or ""},
+         "watch_pkg": cfg.get("watch_pkg") or "",
+         "key_ini": cfg.get("key_ini") or ""},
         PARAMS, num=2))
     # -- 3. distribution -----------------------------------------------------
     keys = ("min", "avg", "p50", "p90", "p95", "max", "n")
@@ -1539,12 +1595,19 @@ def format_result_html(payload: dict) -> str:
     parts.append('<h2>五、链路事件 <span>'
                  f'共 {len(items)} 条，按发生时间排列</span></h2>')
     if items:
-        parts.append("<table><tr><th>#</th><th>相对时刻</th><th>类型</th>"
+        parts.append("<table><tr><th>#</th><th>发生时刻</th>"
+                     "<th>相对时刻</th><th>类型</th>"
                      "<th>原因</th><th>详情</th></tr>")
         for n, e in enumerate(items, 1):
+            # The wall clock leads: "it broke at 18:39:12" is the sentence a
+            # reader arrives with. The run-relative tick stays beside it as the
+            # secondary reading, and the full date rides along in the tooltip -
+            # a run that crosses midnight is otherwise ambiguous.
             parts.append(
                 "<tr>"
                 f'<td class="num">{n}</td>'
+                f'<td class="num" title="{_esc(_hms(e.get("clock_ms"), full=True))}">'
+                f'{_esc(_hms(e.get("clock_ms")) or "-")}</td>'
                 f'<td class="num">{_esc(e.get("t_sec"))} s</td>'
                 f'<td class="k">{_esc(e.get("type"))}</td>'
                 f'<td class="note">{_esc(e.get("reason"))}</td>'
@@ -1640,6 +1703,150 @@ class CsvSink:
             pass
         self.handle = None
         self.writer = None
+
+
+class KeyInjector:
+    """Press keys on the device on a schedule, from an ir_sequences/*.ini.
+
+    A long playback run dies on the app's own idle prompt ("are you still
+    watching?"). One press per interval keeps it away. The interval is the .ini's
+    `delay_ms`, deliberately not a parameter: two sources for one schedule would
+    drift apart, and the place to retune it is the file named in the report.
+
+    WHY A THREAD AND NOT A SUBPROCESS. The platform stops a task with
+    CTRL_BREAK_EVENT, which a child process would indeed receive - but its
+    force-stop path is proc.kill() (TerminateProcess), which sends no console
+    control event at all. A child process would survive that and keep pressing
+    keys on the device until the server next restarted and reaped it. A daemon
+    thread dies with this process, so that failure mode cannot happen.
+
+    WHY run_step AND NOT run_loop. run_loop loops forever with no exit, and its
+    only escape is a KeyboardInterrupt raised in its own thread - which never
+    arrives, because Windows delivers a console control event to the main thread
+    only. Driving run_step from here instead buys an interruptible wait, an exact
+    press count for the report, and no presses during teardown.
+
+    Nothing here can change the verdict. An unreachable device, a malformed .ini
+    or an unknown key name land in `status` (and thus in the report's config) and
+    the measurement run carries on untouched.
+
+    A press that fails once does NOT kill the keepalive - see _run.
+    """
+
+    def __init__(self, device: str, ini_rel: str, root: str):
+        self.device = device
+        self.ini_rel = ini_rel
+        self.root = root
+        self.sent = 0
+        self.failed = 0
+        self.n_steps = 0
+        self.status = "off"
+        self._stop = threading.Event()
+        self._thread = None
+        self._steps: list = []
+        self._ir = None
+
+    def start(self) -> None:
+        """Load the .ini and begin pressing. Never raises."""
+        try:
+            path = self.ini_rel
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(self.root, path))
+            self._steps = list(ir_runner.SequenceConfig(path).steps)
+            if not self._steps:
+                self.status = "failed: sequence is empty"
+                print(f"[key] not started: {self.status}")
+                return
+            self.n_steps = len(self._steps)
+            self._ir = ir_runner.IRRemote(
+                event_path=ir_runner.resolve_event_path(None))
+        except Exception as e:
+            # A wrong path or a malformed ini is a configuration mistake, not a
+            # reason to abandon a run that is measuring the device correctly.
+            self.status = f"failed: {type(e).__name__}: {e}"
+            print(f"[key] not started: {self.status}")
+            return
+
+        self.status = "running"
+        # Announced here rather than by the caller, and before the thread starts:
+        # the moment that thread runs it prints its own `  -> <KEY>` line for the
+        # first press, and two unsynchronised prints would land on one line.
+        print(f"[key] keepalive on: {self.ini_rel} ({self.n_steps} step(s); "
+              f"pressing now, then every step's delay_ms)")
+        print()
+        self._thread = threading.Thread(target=self._run, name="key-inject",
+                                       daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        """One press, then delay_ms; repeat until stopped.
+
+        run_step prints its own `  -> <KEY>` line per press - that is the
+        heartbeat in the console, and the only per-press output on purpose.
+
+        Repeats are driven from here instead of being handed to run_step as a
+        single `count` because run_step's own repeat loop cannot be interrupted:
+        a stop would let a burst press on to its end, and the whole step's presses
+        would then count either all or none. One press per call makes the count
+        exact and the stop immediate. delay_ms stays the gap between presses,
+        exactly as run_step and run_loop pace it - so with the single-step
+        keepalive ini it is simply the press interval.
+        """
+        pending = None       # a press error not yet attributed to either cause
+        while not self._stop.is_set():
+            for step in self._steps:
+                # A count=1 copy: which adb channel and which press length to use
+                # stays entirely run_step's business. count=0 presses nothing, the
+                # same as run_step.
+                one = ir_runner.SequenceStep(step.index, step.code, step.action,
+                                             step.delay_ms, 1,
+                                             step.long_duration_ms)
+                for _ in range(step.count):
+                    if self._stop.is_set():
+                        return
+                    try:
+                        ir_runner.run_step(self._ir, one, self.device)
+                        self.sent += 1
+                    except Exception as e:
+                        # Two very different things look identical right here. A
+                        # press can be cut short by the very CTRL_BREAK that stops
+                        # the task (that event reaches the whole process group,
+                        # adb.exe included, so it comes back as a failure with
+                        # empty stderr), and a press can also fail on its own: the
+                        # device is busy or briefly offline, or adb is restarted
+                        # under us. The stop flag does not separate them - adb.exe
+                        # dies before our main thread notices, so it is still clear
+                        # at this instant. The wait after this press does: a real
+                        # fault is followed by the normal interval, a stop
+                        # truncates it. So say it now (an 8-hour run should not
+                        # learn of a press problem 30 minutes late) but attribute
+                        # it only once that wait has run its course.
+                        pending = e
+                        print(f"[key] press error, will retry next interval: "
+                              f"{type(e).__name__}: {e}")
+                    if self._stop.wait(step.delay_ms / 1000.0):
+                        return   # the stop: `pending` was that stop, drop it
+                    if pending is not None:
+                        # The interval ran out with the task still going, so the
+                        # keepalive survived it. Giving up here would leave the
+                        # rest of the run with no keepalive at all - the wrong
+                        # trade for one missed press. Count it, try again.
+                        self.failed += 1
+                        pending = None
+
+    def stop(self, timeout: float = 3.0) -> None:
+        """Ask the thread to finish, without waiting forever for it.
+
+        A press in flight is an adb client with no timeout of its own, so the
+        join is bounded and giving up is the right outcome: the thread is a
+        daemon and the process is about to exit regardless. Same reasoning as
+        adb_run's give-up branch.
+        """
+        if self.status == "running":
+            self.status = "stopped"
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
 
 
 def atomic_write_json(path: str, payload: dict) -> None:
@@ -1837,6 +2044,10 @@ def _synthetic_evidence(result_wanted: str) -> dict:
         ev.csv_status = "csv_degraded (PermissionError)"
     if result_wanted == "reboot":
         ev.reboots.append({"t_sec": 100.0, "before_s": 8000.0, "after_s": 40.0})
+        # Also an event row: the report has to render an event's wall clock, and
+        # this is the one synthetic case that raises one.
+        ev.add_event(100.0, SELFTEST_EVENT_CLOCK_MS, "reboot",
+                     "uptime went backwards", "8000.0s -> 40.0s")
     return ev.freeze("ok", "perf_TESTDEV_samples.csv", False)
 
 
@@ -1973,6 +2184,46 @@ def run_selftest() -> int:
         check(f"html({kind}): utf-8 declared",
               'charset="utf-8"' in page)
 
+    # An event row must carry the wall clock, not only the run-relative tick.
+    # Built from the "reboot" case, the one synthetic evidence that raises an
+    # event; the expected string is derived through the same timezone the
+    # renderer uses, so this passes anywhere.
+    ev_rb = _synthetic_evidence("reboot")
+    v_rb = judge(ev_rb)
+    page_rb = format_result_html({
+        "device_id": "TESTDEV", "test_time": "2026-09-14 00:00:00",
+        "config": {"interval_ms": 2000, "duration_sec": 0,
+                   "watch_pkg": "com.netflix.ninja"},
+        "verdict": v_rb, "stats": metric_stats(ev_rb), "evidence": ev_rb})
+    want_hms = _hms(SELFTEST_EVENT_CLOCK_MS)
+    want_date = _hms(SELFTEST_EVENT_CLOCK_MS, full=True)
+    check("hms: formats an epoch clock as HH:MM:SS",
+          len(want_hms) == 8 and want_hms.count(":") == 2, want_hms)
+    check("hms: full form carries the date",
+          want_date.startswith(time.strftime(
+              "%Y-%m-%d", time.localtime(SELFTEST_EVENT_CLOCK_MS / 1000.0))),
+          want_date)
+    check("hms: a broken clock degrades to empty, never raises",
+          _hms(None) == "" and _hms("nonsense") == "")
+    check("html: event row shows the wall clock", want_hms in page_rb, want_hms)
+    check("html: event row tooltip shows the full date", want_date in page_rb,
+          want_date)
+    check("html: event row keeps the run-relative tick", "100.0 s" in page_rb)
+    check("html: the wall-clock column is announced", "发生时刻" in page_rb)
+    # The same HTML is written from a partial snapshot on the way out of a run,
+    # so a clock-less event must degrade rather than raise.
+    ev_nc = _synthetic_evidence("reboot")
+    for e in ev_nc["events"]["items"]:
+        e.pop("clock_ms", None)
+    page_nc = format_result_html({
+        "device_id": "TESTDEV", "test_time": "2026-09-14 00:00:00",
+        "config": {"interval_ms": 2000, "duration_sec": 0,
+                   "watch_pkg": "com.netflix.ninja"},
+        "verdict": judge(ev_nc), "stats": metric_stats(ev_nc),
+        "evidence": ev_nc})
+    check("html: a clock-less event degrades to a dash, not a crash",
+          'title="">-</td>' in page_nc)
+
     # --- expected outcomes --------------------------------------------------
     check("healthy -> OK",
           judge(_synthetic_evidence("healthy"))["result"] == "OK",
@@ -2107,6 +2358,23 @@ def run_selftest() -> int:
     check("no watch_pkg -> no losses",
           _u["gone"] == 0 and _u["seen"] is False, str(_u))
 
+    # --- the key injector's parameter ---------------------------------------
+    # The injector itself needs a device, but the one part of it that can be
+    # wrong without anyone noticing is the choice list the platform renders: a
+    # list that has drifted from the folder would offer a path that starts
+    # nothing, which looks exactly like a keepalive that is working.
+    _ki = next(f for f in PARAMS if f["name"] == "key_ini")
+    check("key_ini is off by default",
+          _ki["default"] == "" and _ki["choices"][0].get("value") == "",
+          str(_ki["choices"][0]))
+    _offered = {c["value"] for c in _ki["choices"]}
+    _on_disk = {""} | {
+        f"ir_sequences/{n}" for n in
+        os.listdir(os.path.join(PROJECT_ROOT, "ir_sequences"))
+        if n.endswith(".ini") and not n.startswith("_")}
+    check("key_ini offers every real ir_sequences/*.ini and no temp ones",
+          _offered == _on_disk, str(sorted(_offered ^ _on_disk)))
+
     print(f"\n[selftest] {len(fails)} failure(s)")
     for f in fails:
         print(f"  - {f}")
@@ -2122,6 +2390,9 @@ class Monitor:
         self.serial = serial
         self.dev_short = serial.replace(":", "_").replace(".", "_")
         self.watch_pkg = watch_pkg
+        # Set by main() only once the device is confirmed reachable, and left
+        # None when no key_ini was configured. Read by _write_reports.
+        self.keys = None
         self.duration_sec = duration_sec
         self.t_ms = max(int(INTERVAL_MIN_SEC * 1000),
                         min(int(INTERVAL_MAX_SEC * 1000),
@@ -2310,6 +2581,13 @@ class Monitor:
             "interval_ms": self.t_ms,
             "duration_sec": self.duration_sec,
             "watch_pkg": self.watch_pkg or None,
+            # Recorded, not judged: keys are a test-harness aid, so they must not
+            # move the verdict. The count is what tells a long unattended run
+            # whether the keepalive was alive (it ticks up in every snapshot).
+            "key_ini": self.keys.ini_rel if self.keys else None,
+            "key_sent": self.keys.sent if self.keys else 0,
+            "key_failed": self.keys.failed if self.keys else 0,
+            "key_status": self.keys.status if self.keys else "off",
         }, self.ev.sources, self.serial)
         try:
             atomic_write_json(self.report_path, payload)
@@ -2723,7 +3001,7 @@ def main() -> int:
     p.add_argument("--device", required=True, help="ADB device serial")
     p.add_argument("--params", default="{}",
                    help='JSON: {"interval_sec"?, "duration_sec"?, '
-                        '"watch_pkg"?}')
+                        '"watch_pkg"?, "key_ini"?}')
     p.add_argument("--probe", action="store_true",
                    help="test node readability then exit")
     p.add_argument("--probe-cost", action="store_true",
@@ -2751,6 +3029,7 @@ def main() -> int:
     except (TypeError, ValueError):
         duration_sec = int(defaults["duration_sec"])
     watch_pkg = str(params.get("watch_pkg", defaults["watch_pkg"]) or "").strip()
+    key_ini = str(params.get("key_ini", defaults["key_ini"]) or "").strip()
 
     # Clamp twice: the platform caches the schema but does not enforce min/max, so
     # a hand-written --params can still arrive out of range.
@@ -2762,6 +3041,7 @@ def main() -> int:
     print(f"[config] duration_sec    = {duration_sec} "
           f"{'(until manually stopped)' if duration_sec <= 0 else ''}")
     print(f"[config] watch_pkg       = {watch_pkg or '(unset)'}")
+    print(f"[config] key_ini         = {key_ini or '(none)'}")
 
     report_dir = os.path.join(PROJECT_ROOT, "reports", "stress-test", "perf")
     mon = Monitor(args.device, interval_sec, duration_sec, watch_pkg,
@@ -2769,6 +3049,13 @@ def main() -> int:
     if not mon.setup():
         print("[error] device not reachable via adb")
         return 1
+
+    # Keys start only after the device is confirmed reachable: a device that just
+    # failed setup() will not accept them either, and a failed start would only
+    # add noise to the log of a run that is about to exit.
+    if key_ini:
+        mon.keys = KeyInjector(args.device, key_ini, PROJECT_ROOT)
+        mon.keys.start()        # announces itself; see KeyInjector.start
 
     mon.start_mono = time.monotonic()
     mon.origin_ms = mon._now_ms()
@@ -2800,6 +3087,13 @@ def main() -> int:
     except KeyboardInterrupt:
         mon.interrupted = True
         print("\n[perf] interrupted - computing verdict")
+
+    # Stop the keys before the verdict block, so the report path stays the last
+    # line of stdout (format_result_lines) whatever happened above.
+    if mon.keys is not None:
+        mon.keys.stop()
+        print(f"[key] keepalive: {mon.keys.sent} key(s) injected, "
+              f"{mon.keys.failed} press error(s), {mon.keys.status}")
 
     status = "interrupted" if mon.interrupted else "completed"
     out = mon.finish(status)

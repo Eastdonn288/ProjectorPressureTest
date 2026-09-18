@@ -1,10 +1,10 @@
 # PPTP 架构总览
 
-> **本文档描述 PPTP 平台当前的真实架构(v2.10.0,2026-09-16)。**
+> **本文档描述 PPTP 平台当前的真实架构(v2.11.1,2026-09-17)。**
 > 代码级细节(函数行号 / 数据模型 / 设计决策 / 踩坑)以 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 为准;
 > 本文是"系统长什么样、数据怎么流、契约是什么"的速览。改代码前先看 HANDOFF。
 
-> 版本:v2.10.0 | 维护规则:架构变动随版本更新;README / CHANGELOG / HANDOFF 同步。
+> 版本:v2.11.1 | 维护规则:架构变动随版本更新;README / CHANGELOG / HANDOFF 同步。
 > 报告(HTML)的格式与参数架构单独沉淀在 [REPORT_FORMAT.md](REPORT_FORMAT.md)。
 
 ---
@@ -143,7 +143,8 @@
 ### 4.3 任务结束 → 自动存档
 
 ```
-[_stream_logs 尾部 / 硬停 / 强制清理 / 关服务]  ← 四个收尾调用点
+[_stream_logs 尾部 / 硬停 / 强制清理 / 关服务]  ← 四个收尾调用点(同一个任务只会走到其中一个;
+                                               硬停那条靠 t["_finalized"] 让 _stream_logs 让位,见 4.4)
         │
         ├─▶ _stop_captures(task_id, reason)   ← 必须在前:释放串口 + 关闭日志句柄
         │      (failed/unavailable/skipped/capped 保留自身状态,不被改写成 stopped)
@@ -176,7 +177,14 @@
 
 ### 4.4 中断 / 硬停
 - **中断**:`POST /api/stop/{id}` → 子进程发 CTRL_BREAK(Windows)→ 脚本 `SIGBREAK→KeyboardInterrupt` → 打印已完成汇总 → **报告与 HTML 照常写出**(2026-09-16 起,中断不再跳过报告;报告里注明本次被中断)→ 退出 → 状态 `interrupted`。**刻意不杀采集** —— 停机/收尾日志最有价值,由 `_stream_logs` 在真正 EOF 时统一收
-- **硬停**:`POST /api/tasks/force-stop-by-device/{serial}` → `proc.kill()`(SIGKILL)+ 就地归档(SIGKILL 没有 EOF 可等)
+- **硬停**:`POST /api/tasks/force-stop-by-device/{serial}` → `proc.kill()`(SIGKILL)+ 就地归档(SIGKILL 没有 EOF 可等)。
+  **v2.11.1 起,硬停是它那条路径上的唯一终结者**,且在**第一个 `await` 之前**同步认领:`t["_finalized"] = "force_stop"`
+  + 直接写终态 `interrupted` / `exit_code = -9` / `ended_at`。`_stream_logs` 在 `proc.wait()` 之后看到 `_finalized`
+  就 **return**,不做第二次终结(它要做的收尾硬停本来就全做了)。**为什么必须这样**:`_stream_logs` 正卡在
+  `proc.wait()` 上,**子进程一死就醒**,而原作者以为它「稍后」才醒 —— 结果是它先把任务终结成 `failed`(终态),
+  硬停随后的 `interrupting`(非终态)**盖在终态上**,而它已经 `return`,没人再推进 ⇒ 任务永远 `interrupting`,
+  409 守卫([第 102 行](#43-任务结束--自动存档)那条 `running/interrupting` 校验)把那台设备**永久锁死**。
+  见 HANDOFF 踩坑 #48 / [TODO.md](../TODO.md) §8.1。
 
 ---
 

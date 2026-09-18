@@ -663,7 +663,13 @@ causes, events                                       ← 28 列,顺序固定
 
 - P2 事件集:`timeout, offline_start, offline_end, cadence, tick_gap, misparse, src_degraded, src_recovered`
 - P3 增补:`reboot, rollover, fg_change, fg_lost, app_gone, pkg_mismatch, budget_exhausted, leak_suspect`
-- **限流**:key = `(kind, dev_short)`,固定 60 s 窗口;**只有真正打印了才登记**(禁止「先登记再丢弃」,否则真事件会被限流吃掉)
+- **限流**:key = `(kind, dev_short)`,固定 60 s 窗口;**只有真正打印了才登记**(禁止「先登记再丢弃»,否则真事件会被限流吃掉)
+- **两套时间,各有各的用处(v2.11.2,2026-09-18)**:每条事件同时带 `t_sec`(运行节拍,第几秒)与
+  `clock_ms`(epoch 毫秒)。`reports/*.html` 第五节「链路事件」**两列都渲染**,墙钟 `发生时刻` 在前、
+  节拍 `相对时刻` 在后,悬停给出完整 `YYYY-MM-DD HH:MM:SS`。用户原话「我想要能看到问题发生时的时间如
+  18:39:12 等,这个才是重要的元素」—— 节拍只说「在这趟跑的哪个位置」,墙钟才能和另一台设备的日志、
+  一张工单、或某人"下午那会儿"对上。**`clock_ms` 本来就是渲染层漏掉的一个字段,不是新采的数据** ——
+  payload / CSV / 判定 / 限流全都没动。缺失或非法时钟渲染成 `-`,绝不抛(收尾的 partial snapshot 也走这条渲染)。
 
 **report.json**(只存证据,不存原始样本):
 
@@ -862,3 +868,35 @@ README 与 HANDOFF 已补。**
 > **⚠ 这一轮引入并修掉了一个通道级静默失效** —— 删 `track_foreground` 时把 `due_sec()` 的布尔谓词
 > 一起改写,**逻辑整个取反**,前台通道整轮零数据而三层测试全绿。详见 [HANDOFF_PROMPT.md](HANDOFF_PROMPT.md) 踩坑 #42
 > 与 [TODO.md](../TODO.md) §6.10。**教训:形状断言看不见死掉的通道。**
+
+### 12.9 长跑按键 keepalive(v2.11.0,2026-09-17)
+
+压测 YouTube / Prime Video / Netflix / 本地播放器时,**长时间播放会让 app 弹「还在看吗」**,把播放打断 ——
+采到的样本里混进一段「没人看」的数据,而报告看起来一切正常。办法:加第 4 个参数 `key_ini`,
+后台按选中的 `.ini` 定时发按键把它压下去。**用户四条已裁决**:线程内 `import ir_runner` / 先给 MEDIA_PLAY 模板且
+ini 要能自由选自由改 / 30 分钟一次 / **只有 perf_monitor 需要**,其余 7 个脚本与平台逻辑零改动。
+
+| # | 议题 | 决定 | 理由 | 怎么反悔 |
+|---|---|---|---|---|
+| 1 | 怎么调 ir_runner | **线程内 `import ir_runner`**,不起子进程 | 平台「硬停」走 `proc.kill()`(`TerminateProcess`),**不发任何控制台事件** —— 子进程会活下来继续按按键,直到下次重启服务器才被 `_reap_orphan_scripts` 扫掉。daemon 线程随进程一起死 | 改 `Popen`(**不建议** —— 除非同时给硬停加进程组清理) |
+| 2 | `run_loop` 还是自己驱动 | **自己按「一次按键」循环调 `run_step`** | `run_loop` 的 `while True` 唯一出口是它自己那个线程里的 `KeyboardInterrupt`,而 Windows 只把控制台事件投给**主线程** —— 那个异常永不到达 | 调 `run_loop`(失去中断能力与精确计数) |
+| 3 | 再加一个发送间隔参数? | **不加**,节奏 = ini 的 `delay_ms` | 单步 ini 的 `delay_ms` 既是「重复间隔」也是「轮间隔」,它就是按键周期。再加一个参数 = 两处真相 | 加 `key_interval_sec`(不建议) |
+| 4 | 报告要不要新 gate | **不要**,只记 4 个字段 | keepalive 是**测量条件**,不是被测对象。它的故障不能把一场本来有效的样本判成"不通过" | 加 gate(会污染判定语义) |
+| 5 | `count>1` 的步怎么算 | **拆成 `count=1` 副本,逐次调用** | `run_step` 自己的重复循环**无法被中断**:一个 50 连发的步在停止后会一路按完;而且那一串**要么全算要么全不算**(实测出现过「日志 40 行按键、计数 30」) | 整个 `count` 交回 `run_step`(**不建议**) |
+
+**一处真机发现**:`CTRL_BREAK` 送给**整个进程组**,`adb.exe` 也在内 —— 停止瞬间在途的那次按键会以
+`ADB failed: `(stderr 为空)失败返回。第一版把它计成 `key_failed=1`,报告里看起来像 keepalive 出过错,
+**实际是用户自己按的停止**。定性只能放在**按键后面那个等待**上:真故障后面跟着正常间隔,停止会打断它。
+**`key_failed` 的含义 = 失败过且仍在重试**(一次瞬时失败不再让整场长跑失去 keepalive)。
+
+**参数面**:`key_ini` 走 select(与 `watch_pkg` 同款待遇,见 §12.8 第 2 条),choices 在**导入时**用 `os.listdir`
+扫 `ir_sequences/*.ini`(排除 `_` 前缀的临时文件),值用仓库相对路径、解析时对 `PROJECT_ROOT` 取绝对路径。
+前端本就消费 `f.choices`,**零改动**。`docs/REPORT_FORMAT.md` **不动** —— 共享引擎的 schema 没变,这只是新参数实例。
+
+**v2.11.1 补记(2026-09-17,平台侧,与 perf_monitor 无关)**:验证本功能时撞见并修掉了「硬停之后那台设备被
+永久卡死」—— 上表第 1 条把「硬停 = `proc.kill()`,不发控制台事件」当成既定事实,而那条路径当时自己也坏了:
+它把 `interrupting` 写在 `await _stop_captures()` **之后**,`_stream_logs` 却在 `proc.wait()` 上**先醒**、
+先把任务终结成 `failed`,于是非终态覆盖了终态、没人再推进,任务永远 `interrupting`,409 守卫把那台设备锁死。
+硬停现在在**第一个 `await` 之前**认领终结者并直写终态 `interrupted`。**本表第 1 条的结论不变**:
+硬停仍然是 `proc.kill()`、仍然不发控制台事件 —— 所以「线程而不是子进程」这个取舍依旧成立。
+详见 [SIMPLE-ARCHITECTURE.md](SIMPLE-ARCHITECTURE.md) §4.4 与 HANDOFF 踩坑 #48。

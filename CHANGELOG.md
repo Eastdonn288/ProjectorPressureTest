@@ -1,5 +1,174 @@
 # 更新日志 (Changelog)
 
+## v2.11.2 — 2026-09-18 (perf_monitor HTML 报告:链路事件带上墙钟时刻)
+
+用户原话:
+
+> html 的报告里面的 rollback 和 reboot 等 event 目前只有运行节拍的标记而没有 timestamp,
+> 我想要能看到问题发生时的时间如 18:39:12 等,这个才是重要的元素
+
+**先澄清一个词**:报告里的类型叫 **`rollover`**(GPU/CPU 计数器回绕),不是 `rollback` ——
+`grep rollback` 在仓库里只命中 `scrollback` 的假阳性。用户看到的正是那条 `24 counter rollover(s)`。
+
+### 改了什么
+
+报告第五节「链路事件」新增一列 **`发生时刻`**(本地时区 `HH:MM:SS`),**排在「相对时刻」前面**;
+鼠标悬停显示完整的 `YYYY-MM-DD HH:MM:SS`。两列都留:节拍回答「在这趟跑的哪个位置」,
+墙钟回答「几点几分出的问题」—— 后者才是能拿去和另一台设备的日志、一张工单、或某个人"下午那会儿"对上的东西。
+
+### 关键事实:数据早就有,只是渲染层没输出
+
+每条事件本来就同时带 `t_sec`(运行节拍)和 `clock_ms`(epoch 毫秒),`events.csv` 的列头一直是
+`t_sec, clock_ms, type, reason, detail`,`report.json` 的 `events.items` 里也一直有 `clock_ms` ——
+**HTML 渲染时只取了 `t_sec`**。所以本次**只动渲染**:payload、判定、CSV、限流逻辑一律没碰,
+`docs/REPORT_FORMAT.md`(共享引擎 schema)同样不动 —— 这是 perf_monitor 自己的第 4 个区块。
+
+**降级**:缺失或非法的 `clock_ms` 渲染成 `-` 而不是抛异常 —— 同一份 HTML 在收尾时也会从
+partial snapshot 写一遍,那条路径上不能因为一个时间戳把报告整个弄没。
+
+### 验证(2026-09-18)
+
+| 门 | 结果 |
+|---|---|
+| `--selftest` | **0 failure**,其中 8 条是本次新增(格式化 / 完整日期 / 坏时钟不抛 / 行内墙钟 / tooltip / 节拍列保留 / 列头 / 无时钟降级) |
+| **真实归档数据重渲染** | 取归档里 30 条事件的报告,用新渲染器重出 HTML,**逐行**与 `events.csv` 的 `clock_ms` 比对:30/30 行的 `HH:MM:SS` 与本地时间一致,tooltip 的完整日期一致,`相对时刻`/`类型` 两列逐行不变(回归) |
+| 真机 20s 短跑 | `report :` 仍是**最后一行**(既有硬约束),`html =` 照常落盘,0 事件时走「没有记录到任何链路事件」空分支,文档完整 |
+
+### 版本
+
+`perf_monitor.py` 的 `SCRIPT_VERSION` 1.1.0 → **1.1.1**;平台 2.11.1 → **2.11.2**
+(`server.py` 的 `version=` + `healthz`、`static/index.html` 的 `?v=` ×3)。平台侧**零逻辑改动**。
+
+## v2.11.1 — 2026-09-17 (修「硬停」之后那台设备被永久卡死)
+
+用户原话:
+
+> 修一下，硬停的这个 bug
+
+### 现象
+
+对一台设备「硬停」(force-stop)之后,那台设备**再也起不了新任务**:`POST /api/run` 一直返回
+`409 设备 X 上有正在运行的任务`,直到重启服务或 `POST /api/tasks/force-cleanup`。同一次验证里复现两次。
+
+### 根因:谁先醒,谁就把状态写死
+
+`api_force_stop_by_device` 把状态写成 `interrupting`,指望 `_stream_logs` 看到子进程退出后把它推进成
+`interrupted`。但那一步在 **`await _stop_captures()` 之后** —— 一 `await` 就让出事件循环,而 `_stream_logs`
+此刻正卡在 `proc.wait()` 上,子进程一死它立刻拿到退出码,于是:
+
+1. `_stream_logs` 先跑完自己的终结块:`status = "failed"`(终态)、`ended_at`、停采集、归档、广播 `end`;
+2. 控制权回到硬停这边,把**已经终态**的 `"failed"` **覆盖成 `"interrupting"`**;
+3. `_stream_logs` 早已 `return`,**没有任何东西会再推进它** —— 任务永远停在 `interrupting`,
+   而 409 守卫恰好拦 `running` / `interrupting`。
+
+正常「中断」(`POST /api/stop/{task_id}`)**没有**这个问题:它**同步**写 `interrupting` 再发信号,不存在交叠。
+
+### 改法:单一终结者 —— 终态必须在任何 `await` 之前落定
+
+- 硬停在**第一个 `await` 之前**同步**认领**终结者身份:`t["_finalized"] = "force_stop"`,并直接写**终态**
+  `"interrupted"` / `exit_code = -9` / `ended_at`。被杀的脚本本来就该记 `interrupted` 而不是 `failed` ——
+  是操作员要它死的。
+- `_stream_logs` 在 `proc.wait()` 之后看到 `t["_finalized"]` 就**直接 return**,不再做第二次终结。
+  它原本要做的五件事(状态 / `ended_at`、停采集、归档、广播 `end`、广播归档行)硬停这边一件不少地自己做,
+  所以没有丢失 —— v2.11.1 只补了一句 `_broadcast_archive_line()`,因为 `_stream_logs` 不再代劳。
+
+### 验证(真机 `B0403374A2A508001F00`,17/17 通过)
+
+| 场景 | 结果 |
+|---|---|
+| A 运行中硬停 | `interrupted` / `exit=-9` / 已归档(6 文件,21528 字节) |
+| B 紧接着 `POST /api/run` | **不再 409** —— 旧 bug 正卡在这一步(设备解封) |
+| B' 正常「中断」回归 | `interrupted`,归档齐全 |
+| C 中断途中再硬停 | 仍是终态 |
+| D 连续 3 次硬停 | 全部终态 `interrupted` / `exit=-9`,无残留非终态任务 |
+
+服务端输出里每个硬停任务**只有一行** `[archive] … (force_stop)`、**没有** `(task_end)` ——
+这就是 `_stream_logs` 确实走了那条 `return` 的证据(否则会多出一行)。
+
+### 版本
+
+`server.py` 2.11.0 → 2.11.1(`app = FastAPI(version=…)` + `healthz`)、`static/index.html` 的 `?v=` ×3。
+**逻辑改动只有上面那两处**;perf_monitor 与其余 7 个脚本未动。
+
+## v2.11.0 — 2026-09-17 (perf_monitor 长跑按键 keepalive:写个 .ini,让设备别弹「还在看吗」)
+
+用户原话:
+
+> 我后续压测 YouTube | Amazon | Netflix | MediaPlayer 可能存在长时间播放时,应用弹出无操作提示,
+> 所以我需要在现有的 perf monitor 的基础上,可以通过调用 ir_runner 发送按键给设备
+> 我建议是在 perf monitor 的 params 增加可以选红外 ini 的选项,然后直接调用一个后台持续发这个 ini 就行了
+> 避免过度设计
+> 只是需要在 perf_monitor 的时候跑 ini 就行了
+
+### 做了什么
+
+`perf_monitor` 第 4 个参数 `key_ini`(**下拉,默认空 = 不发送**)。选中后它在一条 **daemon 线程**里反复执行那个
+`.ini` —— 按键节奏**就是** ini 里的 `delay_ms`(唯一真相,不另加参数,改节奏 = 改文件)。附一份模板
+`ir_sequences/idle_keepalive.ini`:`KEYCODE_MEDIA_PLAY` 短按 @30 分钟。**ini 随便选、随便改。**
+
+### 四条已拍板决策(DO NOT REVERT)
+
+1. **线程内 `import ir_runner`**,不起子进程。
+2. 先给一个 `KEYCODE_MEDIA_PLAY` 模板,之后要能自由选 / 自由改 ini。
+3. 30 分钟一次(`delay_ms` 决定)。
+4. **只有 perf_monitor 需要** —— 其余 7 个脚本、平台逻辑零改动。
+
+### 为什么是线程,不是子进程(本轮核心取舍)
+
+平台「中断」发 `CTRL_BREAK_EVENT`,子进程确实收得到;但**「硬停」走的是 `proc.kill()`(`TerminateProcess`),
+不发任何控制台事件** —— 子进程会活下来**继续按按键**,直到下次重启服务器才被 `_reap_orphan_scripts` 扫掉。
+daemon 线程随进程一起消失,这个失败模式根本不存在。**真机验证:硬停 `killed:1` / `exit=-9` 之后,
+又等了 16 秒(3 个以上按键周期),没有任何进程还在发按键。**
+
+### 为什么自己驱动 `run_step`,不用 `run_loop`
+
+`run_loop` 是 `while True`,唯一出口是它自己那个线程里的 `KeyboardInterrupt` —— 而 Windows 的控制台事件
+**只投给主线程**,那个异常永远不会到。改为以「一次按键」为单位自己循环,换来三件事:
+
+- **可中断的等待**(`stop.wait(sec)` 而非 `time.sleep`)→ 停起来是瞬时的;
+- **精确的按键数** —— 一次 `run_step` 调用 = 一次按键,`key_sent` 就是真按下去的次数。原先把整个 `count`
+  交给 `run_step`,中断时那一串**要么全算要么全不算**(实测出现过「日志 40 行按键、计数 30」);
+- **teardown 期间不再按键** —— `run_step` 自己的重复循环无法被中断,一个 `count=50` 的步会一路按到结束。
+
+派发细节(Short/Long、KEYCODE vs sendevent)仍然全部归 `run_step`,这里只传一个 `count=1` 的副本。
+
+### 报告如实记录 4 个字段(不参与判定)
+
+`config` 加 `key_ini` / `key_sent` / `key_failed` / `key_status`;HTML 参数表显示选的是哪个 ini。
+**keepalive 永远不能改变结论** —— 设备掉线、ini 写坏、按键名不认识,全都只进 `status`,判定块照常。
+
+### 一个真实发现:`CTRL_BREAK` 会打断「在途的那次按键」
+
+`CTRL_BREAK` 送给**整个进程组**,`adb.exe` 子进程同样收到 —— 于是停止瞬间正在飞的那次按键会以
+`ADB failed: `(stderr 为空)的形式失败返回。第一版把它计成 `key_failed=1`,报告里看起来像 keepalive 出过错,
+**而那其实是用户自己按的停止**。修法:按键报错先**不计数**,等它后面那个等待走完再定性 ——
+真故障后面跟着正常间隔,停止会把那个等待打断。**所以 `key_failed` 的含义是「失败过并且还在继续重试」。**
+(同一处还修掉了更脆的一点:一次瞬时失败原本会让整场长跑的 keepalive **彻底死掉**,现在只是跳过这一次。)
+
+### 验证(真机 `B0403374A2A508001F00`)
+
+| 门 | 结果 |
+|---|---|
+| `py_compile` / `--selftest` | 通过,0 failure(含新增 2 条 `key_ini` 断言) |
+| `--dump-params` | 4 个 field;`key_ini` 是 select:`(不发送按键)` / `1.ini` / `idle_keepalive.ini` |
+| 不传 `key_ini` 跑 20s | 0 行 `[key]` 输出;`[config] key_ini = (none)`;报告行仍在最后;rc=0 |
+| 5 秒节奏 ini 跑 60s | **12 次按键 = 60/5 整除**,`key_sent=12`、`key_failed=0` |
+| ini 路径故意写坏 | `status=failed: FileNotFoundError...`,**跑测照常完成、判定不受影响** |
+| 平台跑模板 ini(相对路径) | 立刻 1 次按键,之后 30 分钟一次;`key_sent=1`、`key_failed=0`、`stopped` |
+| 中断恰好落在按键中间(300ms 密节奏) | **日志按键行数 == `key_sent`**,`key_failed=0`(即上面那个误判已修) |
+| 硬停(force-stop) | `killed:1` / `exit=-9` / 16 秒内**无残留进程继续按键**;归档 6 个文件完好 |
+| 确定性用例 A/B/C/D | 停止打断的报错不计;真瞬时故障计数且 keepalive 存活;计数与按键一一对应;50 连发在 stop 后 0.5s 内停下且只算真实按下的 10 次 |
+| HTML 参数表 | 显示所选 ini 名,不再是 `&mdash;` |
+
+平台侧**只 bump 版本号**(`server.py` 的 `version=`、healthz、`static/index.html` 的 `?v=` ×3 → 2.11.0),
+**零逻辑改动**:前端 `paramInputHtml` 本来就消费 `f.choices`,加一个 select 参数是零改动。
+
+### 已知残余
+
+见 [TODO.md](TODO.md) §8。另:`docs/REPORT_FORMAT.md` **不动** —— 共享引擎的 schema 没变,这只是一个新参数实例。
+
+---
+
 ## v2.10.0 — 2026-09-16 (每个脚本的 Overall Result 都出一份中文 HTML 报告 + 报告引擎沉淀)
 
 用户 2026-09-16 的四点要求:

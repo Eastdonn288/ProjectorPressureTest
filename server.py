@@ -308,7 +308,7 @@ WS_SUBS: dict[int, set[str]] = {}
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="PPTP", version="2.10.0")
+app = FastAPI(title="PPTP", version="2.11.2")
 
 # Disable HTTP caching for static files (dev mode)
 app.add_middleware(NoCacheMiddleware)
@@ -813,6 +813,18 @@ async def _stream_logs(task_id: str) -> None:
         # alive, and a blocking wait() here would freeze the whole server.
         await loop.run_in_executor(None, proc.wait)
         exit_code = proc.returncode
+
+        if task.get("_finalized"):
+            # A force-stop already finalized this task: it had to, because a
+            # SIGKILLed script never prints its report line and may never exit.
+            # It set the terminal status, stopped the captures, archived and
+            # broadcast the end frame + archive line already - mirroring
+            # everything below. Finalizing a second time would overwrite its
+            # "interrupted" with the "failed" that this exit code (-9) earns,
+            # which is exactly the race that used to leave the task stuck
+            # non-terminal and the device blocked by the /api/run guard.
+            return
+
         task["exit_code"] = exit_code
 
         if task["status"] == "interrupting":
@@ -1674,7 +1686,7 @@ class SequenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": "2.10.0", "time": datetime.now().isoformat(timespec="seconds")}
+    return {"ok": True, "version": "2.11.2", "time": datetime.now().isoformat(timespec="seconds")}
 
 
 @app.get("/api/server/status")
@@ -2122,15 +2134,30 @@ async def api_force_stop_by_device(device_serial: str):
             killed += 1
         except Exception:
             pass
+
+        # This endpoint is the task's FINISHER, and it must CLAIM that job here,
+        # synchronously, before the first await below.
+        #
+        # Why: _stream_logs has been parked in proc.wait() and wakes up the
+        # instant the child dies. If it wins the race it finalizes the task
+        # itself - with the status this exit code earns (-9 => "failed") - and
+        # stops the captures on its way out. This coroutine then resumed and
+        # used to write "interrupting" on top, i.e. a NON-terminal status over
+        # an already-decided one, and by then _stream_logs had already returned:
+        # nothing was left to ever advance it. The task sat non-terminal
+        # forever, and the /api/run guard that refuses a device with a
+        # running-or-interrupting task blocked that device until the server was
+        # restarted. (_stream_logs now stands down when it sees this flag.)
+        #
+        # A killed task is "interrupted", not "failed" - the operator asked for
+        # this - so decide it here and let _stream_logs drop out.
+        t["_finalized"] = "force_stop"
+        t["status"] = "interrupted"
+        t["ended_at"] = datetime.now().isoformat(timespec="seconds")
+        t["exit_code"] = -9
         # The subprocess was SIGKILLed, so there is no EOF to wait for -
         # stop the capture channels here rather than in _stream_logs.
         await _stop_captures(t["task_id"], "force_stop")
-        # Mark as "interrupting" so _stream_logs will transition it to "interrupted"
-        # when it sees the subprocess exit. Avoid race condition where _stream_logs
-        # overwrites our "interrupted" with "failed".
-        t["status"] = "interrupting"
-        t["ended_at"] = datetime.now().isoformat(timespec="seconds")
-        t["exit_code"] = -9
         # Archive here too: a SIGKILLed script never prints its report line and
         # may be stuck, so waiting for _stream_logs is not guaranteed.
         await asyncio.get_running_loop().run_in_executor(
@@ -2143,6 +2170,7 @@ async def api_force_stop_by_device(device_serial: str):
             "reason": "force_stop",
             "archive": t.get("archive"),
         }, source=None)
+        await _broadcast_archive_line(t["task_id"])
     return {"ok": True, "killed": killed}
 
 
