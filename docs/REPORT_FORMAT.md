@@ -196,10 +196,10 @@ doc["hide_keys"] = ["password"]      # wifi_switch_stress 的写法
 |---|---|---|
 | `name` | str | 参数名,与 `argparse` 的 `--name` 一致 |
 | `label` | str | 中文短标签,前端与报告都显示它(这是**允许出现中文的字符串字面量**,与代码无中文的约束不冲突) |
-| `type` | str | `int` / `float` / `bool` / `select` |
-| `default` | any | 默认值。**`""` 是有意义的默认值**(如 `watch_pkg` 的"不关注任何应用") |
+| `type` | str | `int` / `float` / `bool` / `select` / `multiselect` |
+| `default` | any | 默认值。**`""` 是有意义的默认值**(如 `watch_pkg` 的"不关注任何应用")。`multiselect` 默认值是**列表** |
 | `min` / `max` | number | `int`/`float` 的取值范围,前端用 |
-| `choices` | list | 仅 `select` 用,**两种形状都存在,渲染必须都吃**(见下) |
+| `choices` | list | `select` 与 `multiselect` 用,**两种形状都存在,渲染必须都吃**(见下) |
 
 ### `choices` 的两种形状 —— 这是最容易踩的坑
 
@@ -228,6 +228,7 @@ doc["hide_keys"] = ["password"]      # wifi_switch_stress 的写法
 |---|---|
 | `type="bool"` | `是` / `否`(**绝不打 `True`/`False`**) |
 | `type="select"` | 用 `_choice_label` 解析后的中文标签 |
+| `type="multiselect"` | 每个取值过 `_choice_label` 后用 `、` 连接(**绝不打 Python 列表字面量** `['mem', 'gpu']`)。**空选择渲染「(未勾选)」,不是 `—`** —— 空选择是一个真实、故意的答案(`—` 的含义是"没传这个参数")。逗号串也吃(CLI 就是那个形状) |
 | 值 `None` | `—` |
 | 其他 | 原样转义 |
 

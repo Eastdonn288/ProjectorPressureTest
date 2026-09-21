@@ -308,7 +308,7 @@ WS_SUBS: dict[int, set[str]] = {}
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="PPTP", version="2.11.2")
+app = FastAPI(title="PPTP", version="2.14.0")
 
 # Disable HTTP caching for static files (dev mode)
 app.add_middleware(NoCacheMiddleware)
@@ -1636,7 +1636,13 @@ def _companion_files(report: Path) -> list[Path]:
     try:
         prefix = report.stem + "."
         for f in report.parent.iterdir():
-            if (f.is_file() and f.suffix.lower() in (".csv", ".html")
+            # `.png` is here for perf_monitor's NTC temperature chart, which its
+            # post-run conversion step writes as <report stem>.samples.temps.png.
+            # Without it in this tuple the file is never claimed: it sits in
+            # reports/ forever while the archive looks complete - the "silent loss"
+            # _pptp_report.html_path_for() warns about. Widening this tuple is how a
+            # NEW ARTIFACT TYPE becomes archivable; adding the file alone is not enough.
+            if (f.is_file() and f.suffix.lower() in (".csv", ".html", ".png")
                     and f.name.startswith(prefix)):
                 out.append(f)
     except Exception:
@@ -1686,7 +1692,7 @@ class SequenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": "2.11.2", "time": datetime.now().isoformat(timespec="seconds")}
+    return {"ok": True, "version": "2.14.0", "time": datetime.now().isoformat(timespec="seconds")}
 
 
 @app.get("/api/server/status")

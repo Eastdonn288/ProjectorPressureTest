@@ -728,6 +728,18 @@ html, body {
 .param-control input[type="checkbox"] {
   width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer;
 }
+/* A multiselect is a GROUP of boxes rather than one control, so it is the one
+   param cell that needs more than one line. Stacked, and left-aligned to match
+   the label above it - the 200px control box would otherwise push a wrapping
+   row out of line with its own label. */
+.param-control .param-multi {
+  display: flex; flex-direction: column; align-items: flex-start;
+  gap: 6px; width: 100%;
+}
+.param-multi-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--fg); cursor: pointer;
+}
 .seq-list {
   max-height: 50vh;
   overflow-y: auto;

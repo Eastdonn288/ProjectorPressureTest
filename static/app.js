@@ -853,6 +853,11 @@
     frame_error: "alert", src_degraded: "alert",
     offline_end: "info", src_recovered: "info", reboot: "info",
     rollover: "info", pid_change: "info",
+    // wifi_lost is an alert on purpose: without it the console shows "[?]" at
+    // the exact moment the link dropped, which is the moment most worth
+    // noticing. An unknown kind still renders as text (never raw JSON) - this
+    // only decides the tag.
+    wifi_lost: "alert", wifi_back: "info",
   };
 
   // Parse a PERF| line. Returns the human-readable line to show in the console
@@ -919,7 +924,12 @@
       }
       const src = obj.sources || {};
       return `[perf] monitor start | CPU=${src.cpu ? "stat" : "N/A"} | MEM=${src.mem ? "meminfo" : "N/A"}`
-           + ` | GPU=${src.gpu ? "mali/dvfs" : "N/A"} | FG=${src.fg ? "top" : "off"}`;
+           + ` | GPU=${src.gpu ? "mali/dvfs" : "N/A"} | FG=${src.fg ? "top" : "off"}`
+           // src.wifi is absent on older archived runs, so a missing key reads
+           // as "off" rather than crashing the meta line.
+           + ` | WIFI=${src.wifi ? "cmd wifi status" : "off"}`
+           // src.ntc is absent on older archived runs, exactly like src.wifi.
+           + ` | NTC=${src.ntc ? "iio adc" : "off"}`;
     }
 
     if (obj.type === "sample") {
@@ -939,13 +949,33 @@
       // Columns are always emitted even when a series is disabled (gpu without
       // root, fg with track_foreground off) - a dashed column stays aligned and
       // is self-explanatory, whereas a sometimes-present column is not.
+      // "-" for a missing node, never 0: a zero ADC count is a real reading
+      // (a shorted/absent NTC) and must not be reachable by accident.
+      const ntcCell = (obj.ntc_lcd == null ? "-" : obj.ntc_lcd) + "/"
+                    + (obj.ntc_led == null ? "-" : obj.ntc_led);
       let s = `[perf] t=${padCell(obj.t, "s", 8, 1)}`
             + ` | cpu=${padCell(obj.cpu, "%", 6, 1)}`
             + ` | gpu=${padCell(obj.gpu, "%", 6, 1)}`
             + ` | mem=${padCell(obj.mem, "%", 6, 1)}`
             + ` | fg=${padCell(obj.fg_cpu, "%", 6, 1)}`
             + ` | clk=${padCell(obj.gpu_clk, "MHz", 7, 0)}`
-            + ` | st=${padSt(obj.st)}`;
+            + ` | st=${padSt(obj.st)}`
+            // Fixed-width like every other cell, so a state word of another
+            // length (noassoc / unknown = 7) cannot shift the columns after it
+            // and break vertical reading. Deliberately NOT padCell(): that one
+            // calls v.toFixed() and would throw on a string. Left-aligned
+            // because this is a word, not a number. "-" for a sample with no
+            // wifi reading (an older line replayed, or the channel disabled).
+            + ` | wifi=${String(obj.wifi == null ? "-" : obj.wifi).padEnd(7)}`
+            // Both NTC nodes in one cell, and it goes BEFORE pkg= for the reason
+            // stated above: pkg has no fixed length. Fixed-width as well, sized
+            // for a 12-bit full scale ("4095/4095" = 9, +2 of margin), and
+            // deliberately NOT padCell() for the same reason wifi isn't - these
+            // are raw ADC counts that can be missing, and padCell calls toFixed.
+            // The numbers are NOT degrees; they are ADC counts (the script's
+            // CSV declares unit=raw_adc). No chart is built from them - the
+            // curve belongs to Excel, per the 2026-09-20 ruling.
+            + ` | ntc=${String(ntcCell).padEnd(11)}`;
       if (obj.fg_pkg) s += ` | pkg=${obj.fg_pkg}`;
       return s;
     }
@@ -2272,6 +2302,25 @@
       }).join("");
       return `<select name="${n}">${opts}</select>`;
     }
+    if (f.type === "multiselect") {
+      // A checkbox GROUP sharing one name, so the selection is one param whose
+      // value is an array. Anything that is not an array - a comma string from a
+      // hand-written --params, a single value, undefined - is normalised here,
+      // because the same value round-trips through localStorage and the CLI.
+      const cur = Array.isArray(value) ? value.map(String)
+        : (value == null || value === "" ? [] : String(value).split(","));
+      const boxes = (f.choices || []).map((c) => {
+        const o = (c && typeof c === "object") ? c : { value: c, label: c };
+        const on = cur.includes(String(o.value)) ? " checked" : "";
+        // `data-multi` is what saveParams matches on. It is not decoration: the
+        // whole group shares a name, so the selector that reads it back has to
+        // be able to name the group and not the single first box.
+        return `<label class="param-multi-item"><input type="checkbox" name="${n}"`
+             + ` data-multi="1" value="${esc(o.value)}"${on}>`
+             + `<span>${esc(o.label != null ? o.label : o.value)}</span></label>`;
+      }).join("");
+      return `<div class="param-multi">${boxes}</div>`;
+    }
     if (f.type === "int" || f.type === "float") {
       let extra = "";
       if (f.min != null) extra += ` min="${f.min}"`;
@@ -2307,6 +2356,18 @@
     if (!ctx) return;
     const params = {};
     for (const f of _paramsFields) {
+      // A multiselect is many boxes under ONE name, so it must not go through
+      // querySelector: that returns only the first match, and the selection
+      // would silently collapse to whichever box happens to come first in the
+      // DOM. An empty selection is a real answer, not a missing one - the
+      // script keeps the locked FAST trio and runs with the rest deselected.
+      if (f.type === "multiselect") {
+        const boxes = document.querySelectorAll(
+          `#modal-params [name="${esc(f.name)}"][data-multi="1"]`);
+        params[f.name] = Array.from(boxes).filter((b) => b.checked)
+          .map((b) => b.value);
+        continue;
+      }
       const el = document.querySelector(`#modal-params [name="${esc(f.name)}"]`);
       if (!el) continue;
       if (f.type === "bool") params[f.name] = el.checked;

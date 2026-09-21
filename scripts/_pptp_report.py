@@ -301,12 +301,23 @@ def _choice_label(choices, value):
     return value
 
 
-def _plain(value) -> str:
+def _plain(value, field: dict | None = None) -> str:
     """A schema default as the reader should see it. An empty string is a
     meaningful default in this repo (watch_pkg's 'do not watch anything'), but
-    printed bare it reads as a rendering fault - so name it."""
+    printed bare it reads as a rendering fault - so name it.
+
+    `field` is optional and only needed for a list-valued default, i.e. a
+    multiselect's default selection. Without it that default printed as a Python
+    list literal - ['mem', 'gpu', 'fg'] - in the middle of a Chinese table, which
+    is exactly the "nobody converted this value" tell the rest of this module
+    exists to avoid.
+    """
     if value is None:
         return "—"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        labels = [str(_choice_label((field or {}).get("choices"), v))
+                  for v in value]
+        return "、".join(labels) if labels else "（未勾选）"
     if value == "":
         return "(空)"
     return str(value)
@@ -320,9 +331,25 @@ def _fmt_param(field: dict, value) -> str:
         return "是" if value else "否"
     if t == "select":
         return esc(_choice_label(field.get("choices"), value))
+    if t == "multiselect":
+        # A SET of choices, one row per parameter. Every id goes through the same
+        # _choice_label the dropdown uses, so the table shows the Chinese label
+        # and not the raw id. The join is escaped as a whole because the caller
+        # writes this into a <td class="v"> that does no escaping of its own.
+        # A comma string is accepted too: the same values arrive from the CLI.
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            value = [v for v in str(value).split(",") if v]
+        labels = [str(_choice_label(field.get("choices"), v)) for v in value]
+        # An empty selection is a real, deliberate answer (run with everything
+        # optional switched off), not a missing value - so it must not render as
+        # an em-dash, which is what "not passed in" means on the rows above.
+        return esc("、".join(labels)) if labels else "（未勾选）"
     if isinstance(value, bool):
         # A bool field whose schema forgot the type: still never print "True".
         return "是" if value else "否"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # Any other list-valued field: never let a Python repr reach the page.
+        return esc("、".join(str(v) for v in value)) if value else "（空）"
     return esc(value)
 
 
@@ -381,7 +408,7 @@ def render_params_table(values: dict, schema: list, num=None,
             origin_note = "传入了与默认相同的值"
         else:
             origin = "已改"
-            origin_note = f"默认 {_plain(default)}"
+            origin_note = f"默认 {_plain(default, f)}"
         parts.append(
             f'<tr><td class="k">{esc(label)}<small>{esc(name)}</small></td>'
             f'<td class="v">{_fmt_param(f, value)}</td>'

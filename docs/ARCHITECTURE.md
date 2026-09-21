@@ -142,8 +142,9 @@
         │      ├─ 三份日志 Path.replace() 进 archive/<名字>/
         │      ├─ report.json ← _sniff_report_path 从 stdout 嗅探(只取第一行命中),
         │      │   兜底 mtime 扫描并跳过 _CLAIMED_REPORTS 已认领的;必须落在 reports/ 内
-        │      ├─ <报告stem>.html ← _companion_files 按「同目录 + 同 stem + .html」收走
-        │      │   (v2.10.0 起每个脚本都有;主报告改名 report.json,伴随文件保留原名)
+        │      ├─ <报告stem>.* ← _companion_files 按「同目录 + 同 stem + 后缀∈白名单」收走
+        │      │   白名单 = .csv / .html / .png (v2.14.0 起含 .png —— perf 的温度曲线图)
+        │      │   (v2.10.0 起每个脚本都有 .html;主报告改名 report.json,伴随文件保留原名)
         │      └─ summary.json ← 参数/状态/各文件 bytes+lines/report_source/notes
         ├─▶ WS end 帧(带 archive 字段)
         └─▶ console 一行 [archive] 摘要(串口采到没有就靠这一行)
@@ -152,11 +153,14 @@
 **何时归档**:任务一进终态就归档,没有"手动归档"这一步 —— 四个收尾调用点各自触发,靠 `_archive_task` 的幂等性与 `t["_finalized"]` 保证只发生一次。
 **为何这样归档**:`logs/` 是运行期工作区(会被清),`archive/` 是给人看的永久产物 —— 所以结束时把三份日志 `move` 走、把报告 `copy` 留下一份。`archive/` 目录名**不含 task_id**(那是给人看的),task_id 在 `summary.json` 里。
 
-**`_sniff_report_path` 的判定**(规则在这里,实现才在代码里):stdout 里**含 `" : "` 且含 `report`** 的行才是候选 —— 取 ` : ` **最后一次**出现的右侧,并要求它以 `.json` 结尾;命中后还要落在 `reports/` 内、跳过 `_CLAIMED_REPORTS` 已认领的。所以报告行必须**恰好一行、且在最后**(见 [REPORT_FORMAT.md](REPORT_FORMAT.md) §8)。
+**`_sniff_report_path` 的判定**(规则在这里,实现才在代码里):stdout 里**含 `" : "` 且含 `report`** 的行才是候选 —— 取 ` : ` **最后一次**出现的右侧,并要求它以 `.json` 结尾;命中后还要落在 `reports/` 内、跳过 `_CLAIMED_REPORTS` 已认领的。所以报告行必须**恰好一行、且在最后**(见 [REPORT_FORMAT.md](REPORT_FORMAT.md) §8)。**反过来说:任何新打印的路径行都必须避开这个形状** —— perf 的 `[ntc] wrote: <路径>` 刻意不带 `" : "`,因为那条路径里含 `reports/stress-test/perf/`,两者凑齐就成了报告行的候选形状(D-65)。
+
+**`_companion_files` 的判定**(同样在这里):**不是目录 glob**,而是三条**同时**成立 —— 同目录 + 文件名以 `<报告 stem>.` 开头 + **后缀在白名单元组里**(`.csv` / `.html` / `.png`)。所以**新增一种产物类型要动两个地方**:名字要合格,后缀也要进白名单;只做一件就是**安静丢失**(那份文件永远留在 `reports/` 里,而归档看起来一切正常)。见 [PITFALLS.md](PITFALLS.md) #54 与 D-67。
 
 > 归档命名与 `<stem>` 配对规则见 [REPORT_FORMAT.md](REPORT_FORMAT.md) §7。
 
 图表由**浏览器**在任务结束时渲染后 POST 到 `/api/tasks/{id}/archive/artifact` —— 服务端**故意不引入绘图库**(ECharts 只存在于页面里)。代价:结束时浏览器没开就没有 `chart.png`,由 `summary.json` 如实反映。
+**这条"服务端无绘图库"从 v2.14.0 起指的是 server.py**:perf_monitor 收尾时会调 `tools/ntc_convert.py`,而那个**独立工具**用 matplotlib 画温度曲线(缺 matplotlib 时只出 CSV 并打一行 `[warn]`,绝不静默跳过)。图经归档白名单进 `archive/`,与浏览器那张 `chart.png` 是两回事、两条路径。
 
 ### 4.4 中断 / 硬停
 - **中断**:`POST /api/stop/{id}` → 子进程发 CTRL_BREAK(Windows)→ 脚本 `SIGBREAK→KeyboardInterrupt` → 打印已完成汇总 → **报告与 HTML 照常写出**(2026-09-16 起中断不再跳过报告,报告里注明本次被中断)→ 退出 → 状态 `interrupted`。**刻意不杀采集** —— 停机/收尾日志最有价值,由 `_stream_logs` 在真正 EOF 时统一收。
