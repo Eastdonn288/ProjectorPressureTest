@@ -2273,7 +2273,10 @@
   // {"fields": [...]}. The platform renders a modal from this schema and
   // stores the values per (device, script) in state.deviceParams (persisted
   // like sequences, strictly independent per pair).
-  let _paramsSchemaCache = {};   // { [scriptName]: fields[] }
+  // The whole response is cached, not just its fields: a script may also declare
+  // a top-level `hint` (static precondition text, see D-70), and dropping it here
+  // is exactly how that text would silently stop being shown.
+  let _paramsSchemaCache = {};   // { [scriptName]: { fields[], hint } }
   let _paramsCtx = null;         // { device, script }
   let _paramsFields = [];
 
@@ -2281,9 +2284,9 @@
     if (_paramsSchemaCache[name]) return _paramsSchemaCache[name];
     try {
       const r = await api(`/api/scripts/${encodeURIComponent(name)}/params`);
-      _paramsSchemaCache[name] = r.fields || [];
+      _paramsSchemaCache[name] = { fields: r.fields || [], hint: r.hint || "" };
     } catch (_) {
-      _paramsSchemaCache[name] = [];
+      _paramsSchemaCache[name] = { fields: [], hint: "" };
     }
     return _paramsSchemaCache[name];
   }
@@ -2333,7 +2336,17 @@
 
   async function openParamsModal({ device, script }) {
     _paramsCtx = { device, script };
-    _paramsFields = await loadParamsSchema(script);
+    const schema = await loadParamsSchema(script);
+    _paramsFields = schema.fields;
+    // The hint is set BEFORE the length check, so a script whose whole
+    // self-description is a precondition still shows it rather than being
+    // swallowed by the early return below. textContent, never innerHTML: this
+    // string comes from a script's source file and is not markup (D-70).
+    // (Known limit: the card only opens this modal when the script declares
+    // `--dump-params`, so a hint alone cannot make a paramless script openable.)
+    const hintEl = $("params-hint");
+    hintEl.textContent = schema.hint || "";
+    hintEl.hidden = !schema.hint;
     if (!_paramsFields.length) {
       $("params-status").textContent = "该脚本未声明参数";
       return;

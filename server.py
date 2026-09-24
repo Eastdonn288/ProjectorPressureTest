@@ -117,6 +117,7 @@ ARCHIVE_MODULES = {
     "perf_monitor.py": "perf",
     "battery_inout_stress.py": "battery",
     "bt_reboot_stress.py": "bt",
+    "power_cycle_stress.py": "power",
 }
 ARCHIVE_MODULE_FALLBACK = "other"
 # Artifacts the BROWSER renders and posts back (server has no chart renderer).
@@ -138,6 +139,7 @@ REPORT_WRITING_SCRIPTS = frozenset({
     "battery_inout_stress.py",
     "bt_reboot_stress.py",
     "perf_monitor.py",
+    "power_cycle_stress.py",
     "sensor_reboot_stress.py",
     "wifi_reboot_stress.py",
     "wifi_onoff_stress.py",
@@ -308,7 +310,7 @@ WS_SUBS: dict[int, set[str]] = {}
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="PPTP", version="2.14.0")
+app = FastAPI(title="PPTP", version="2.15.0")
 
 # Disable HTTP caching for static files (dev mode)
 app.add_middleware(NoCacheMiddleware)
@@ -1692,7 +1694,7 @@ class SequenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": "2.14.0", "time": datetime.now().isoformat(timespec="seconds")}
+    return {"ok": True, "version": "2.15.0", "time": datetime.now().isoformat(timespec="seconds")}
 
 
 @app.get("/api/server/status")
@@ -1815,6 +1817,13 @@ async def api_script_params(name: str):
     Scripts that declare params support a `--dump-params` flag which prints
     {"fields": [...]} (list of {name, label, type, default, ...}) and exits.
     Scripts without it return an empty fields list.
+
+    A script may also declare a top-level `hint`: static precondition text to be
+    shown above its params form (see D-70). It is forwarded verbatim and defaults
+    to "" for every script that does not declare one, so the frontend can read
+    `hint` unconditionally. It is deliberately NOT a member of `fields` - it is
+    not a parameter, and it must not appear in the params form or in a report's
+    parameter table.
     """
     script_path = (SCRIPTS_DIR / name).resolve()
     if SCRIPTS_DIR.resolve() not in script_path.parents:
@@ -1828,6 +1837,7 @@ async def api_script_params(name: str):
         return cached
 
     fields: list = []
+    hint: str = ""
     try:
         r = subprocess.run(
             [sys.executable, "-u", str(script_path), "--dump-params"],
@@ -1840,10 +1850,14 @@ async def api_script_params(name: str):
             data = json.loads(out)
             if isinstance(data, dict) and isinstance(data.get("fields"), list):
                 fields = data["fields"]
+                raw_hint = data.get("hint")
+                if isinstance(raw_hint, str):
+                    hint = raw_hint
     except Exception:
         fields = []
+        hint = ""
 
-    result = {"script": name, "fields": fields}
+    result = {"script": name, "fields": fields, "hint": hint}
     _PARAMS_CACHE[key] = result
     return result
 

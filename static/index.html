@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PPTP · 投影仪压测平台</title>
-  <link rel="stylesheet" href="/static/style.css?v=2.14.0" />
-  <script src="/static/vendor/echarts.min.js?v=2.14.0"></script>
+  <link rel="stylesheet" href="/static/style.css?v=2.15.0" />
+  <script src="/static/vendor/echarts.min.js?v=2.15.0"></script>
   <!-- 每次代码更新后 bump ?v= 强制浏览器重新加载,避免缓存问题 -->
 </head>
 <body>
@@ -93,7 +93,7 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=2.14.0"></script>
+  <script src="/static/app.js?v=2.15.0"></script>
 </body>
 
 <!-- ===== Sequence picker modal =====
@@ -143,6 +143,11 @@
     </div>
     <div class="modal-body">
       <div class="seq-target muted" id="params-target">未选脚本</div>
+      <!-- 脚本自述的前置条件(hint):静态、只在主动打开本弹窗时出现一次。
+           由 openParamsModal 填充;没有 hint 的脚本保持 hidden。
+           位置在 #params-form 之外 —— 表单是可滚动容器,放进去会被滚走。
+           样式复用 .seq-warn,style.css 零改动。见 docs/DECISIONS.md D-70。 -->
+      <div class="seq-warn" id="params-hint" hidden></div>
       <div class="params-form" id="params-form">加载中…</div>
     </div>
     <div class="modal-footer">

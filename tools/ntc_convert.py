@@ -35,7 +35,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-TOOL_VERSION = "1.3.0"
+TOOL_VERSION = "1.3.1"
 # The profile this tool ships with, named after the project it was written for
 # (9660 / P53 / 2G, renamed from `default` on 2026-09-21). It is NOT a fallback:
 # which profile a run uses is decided by resolve_profile_name() below, which
@@ -85,7 +85,9 @@ CH_LABEL = {"lcd": "LCD 节点", "led": "LED 节点"}
 #    hold IS piecewise constant, so a step is its own shape. A slanted line between
 #    two points 30 s apart asserts a temperature at every instant in between, and
 #    nothing measured those instants. The fresh readings get a dot each, so the
-#    real sample rate is visible instead of inferred from the slope.
+#    real sample rate is visible instead of inferred from the slope - for as long
+#    as the dots can be told apart at all, which is what DOT_MIN_GAP_PX decides.
+#    Past that they are not drawn, and the subtitle says so.
 #
 # 2. The palette. Not a taste decision - both pairs below were run through the
 #    categorical validator (lightness band, chroma floor, CVD separation,
@@ -105,6 +107,31 @@ CHART_THEMES = {
 }
 CHART_FIGSIZE = (11.0, 4.6)
 CHART_DPI = 150
+# The layout lives here rather than inline in the subplots_adjust / margins calls
+# because the dot rule below is stated in DEVICE PIXELS - the units the reader's
+# eye works in - and this makes that arithmetic reproducible without a renderer
+# (and therefore assertable in the selftest).
+CHART_ADJUST = {"left": 0.075, "right": 0.965, "top": 0.82, "bottom": 0.30}
+CHART_MARGIN_X = 0.02
+CHART_MARGIN_Y = 0.10
+MARKER_PT = 8.0
+MARKER_EDGE_PT = 2.0
+# A dot claims "a reading happened here". It can only make that claim while the
+# eye can tell it from its neighbour, which needs the mark's own diameter PLUS
+# the ring that separates it. The ring is painted in the surface colour, so the
+# moment the dots collide it stops separating them and starts erasing them AND
+# whatever they are drawn on top of - the staircase.
+#
+# This is not a hypothetical: a 14.5 h run at one reading per 30 s is 1737 dots
+# on a ~1468 px plot area, i.e. 0.81 px apart, ~26x too dense. Measured on the
+# PNG (series-coloured pixels inside the axes): 11930 with the dots off, 1974
+# with them on. The curve was the thing that disappeared.
+#
+# So past this gap the dots are not drawn - not drawn smaller, not thinned out.
+# A shrunken dot is not the mark a shorter run taught the reader, and at this
+# density it is sub-pixel anyway. Nothing is lost: the per-tick readings are all
+# in the CSV, and the reading period is still in the subtitle.
+DOT_MIN_GAP_PX = (MARKER_PT + MARKER_EDGE_PT) * CHART_DPI / 72.0
 
 
 class ProfileError(Exception):
@@ -654,22 +681,72 @@ def last_drawn(ys):
     return out
 
 
+def _gaps(xs):
+    """Gaps between consecutive readings of one channel, ascending; positive ones.
+
+    A repeated timestamp (or a step backwards, from a clock that moved) is not a
+    period and is dropped rather than allowed to drag the median down.
+    """
+    return sorted(b - a for a, b in zip(xs, xs[1:]) if b > a)
+
+
+def _median(asc):
+    """Median of an ASCENDING list; None when there is nothing to take it of."""
+    n = len(asc)
+    if not n:
+        return None
+    return asc[n // 2] if n % 2 else (asc[n // 2 - 1] + asc[n // 2]) / 2.0
+
+
 def fresh_resolution(dots):
     """Median gap between consecutive true readings, in seconds; None if unknown.
 
     Median, not mean or minimum: a fresh tick that failed to read leaves a double
     gap, and that is the very thing a mean would spread over every other gap. The
     median reports the instrument's real period and ignores the hiccups.
+
+    Pooled over both channels, because that is the figure the subtitle reports:
+    the two nodes are read in a single command, so they share one period - and
+    pooling means the number survives one channel dropping out mid-run.
     """
     gaps = []
     for ch in CHANNELS:
-        xs = dots[ch][0]
-        gaps.extend(b - a for a, b in zip(xs, xs[1:]) if b > a)
-    if not gaps:
-        return None
+        gaps.extend(_gaps(dots[ch][0]))
     gaps.sort()
-    n = len(gaps)
-    return gaps[n // 2] if n % 2 else (gaps[n // 2 - 1] + gaps[n // 2]) / 2.0
+    return _median(gaps)
+
+
+def axes_width_px():
+    """The plot area's width in device pixels. Fixed layout, no renderer needed."""
+    return (CHART_FIGSIZE[0] * CHART_DPI
+            * (CHART_ADJUST["right"] - CHART_ADJUST["left"]))
+
+
+def px_per_second(lines, drawn):
+    """How much horizontal screen one second of the run gets, in device pixels.
+
+    From the DATA and the layout constants, NOT from `ax.get_xlim()`: the axes has
+    no data limits until something has been plotted, and this has to be answered
+    before the dots are drawn. The final x range is the data's span widened by the
+    x margins, which is exactly what ax.margins(x=...) will produce later.
+    """
+    xs = lines[drawn[0]][0] if drawn else []
+    if not xs:
+        return 0.0
+    span = max(xs) - min(xs)
+    if span <= 0:
+        return 0.0
+    return axes_width_px() / (span * (1.0 + 2.0 * CHART_MARGIN_X))
+
+
+def dots_legible(dots, ch, px_per_s):
+    """Can this channel's dots be told apart on screen?
+
+    Pure, so the selftest can pin the rule without a plotting library. One reading
+    (or none) has nothing to collide with, so it keeps its dot.
+    """
+    gap = _median(_gaps(dots[ch][0]))
+    return gap is None or gap * px_per_s >= DOT_MIN_GAP_PX
 
 
 def _mmss(sec):
@@ -682,8 +759,14 @@ def _mmss(sec):
     return "%d:%02d" % (m, s)
 
 
-def _describe_run(samples, profile, dots, summary):
-    """The subtitle: what the picture is OF, and how coarse it is."""
+def _describe_run(samples, profile, dots, summary, dotless=()):
+    """The subtitle: what the picture is OF, and how coarse it is.
+
+    `dotless` names the channels whose dots were too dense to draw. Without it the
+    picture would be silent about the marks a shorter run shows and this one does
+    not, and the reader would be left inferring a sampling period from their
+    absence.
+    """
     bits = []
     res = fresh_resolution(dots)
     for ch in CHANNELS:
@@ -697,6 +780,10 @@ def _describe_run(samples, profile, dots, summary):
         body += " · 只有一个读数,看不出趋势"
     if bad:
         body += " · %d 个读数被判为无效" % bad
+    if dotless:
+        who = ("" if len(dotless) == len(CHANNELS)
+               else "、".join(CH_LABEL[ch] for ch in dotless) + " 的")
+        body += " · %s采样点密过屏幕像素,未画点" % who
     return body
 
 
@@ -734,13 +821,21 @@ def render_chart(path, samples, profile, rows, summary, theme="light"):
         ax.step(xs, ys, where="post", color=pal[ch], linewidth=2,
                 solid_joinstyle="round", solid_capstyle="round", zorder=3,
                 label=CH_LABEL[ch])
+    # Decided before a single dot is drawn, and the line is already down: forcing
+    # the dots on for a run this dense is what erased it.
+    pps = px_per_second(lines, drawn)
+    dotless = [ch for ch in drawn if not dots_legible(dots, ch, pps)]
     for ch in drawn:
+        if ch in dotless:
+            continue
         fx, fy = dots[ch]
-        # r >= 4 with a 2px ring in the surface colour, so a dot stays legible
-        # where it lands on the line or on the other series.
-        ax.plot(fx, fy, "o", markersize=8, linestyle="none", zorder=4,
+        # r >= 4 with a ring in the surface colour, so a dot stays legible where
+        # it lands on the line or on the other series. dots_legible() has already
+        # established that there is room for the ring to do that job - where there
+        # is not, the ring is a brush.
+        ax.plot(fx, fy, "o", markersize=MARKER_PT, linestyle="none", zorder=4,
                 markerfacecolor=pal[ch], markeredgecolor=pal["surface"],
-                markeredgewidth=2)
+                markeredgewidth=MARKER_EDGE_PT)
 
     # Direct-label the endpoint only - one number per series. A value on every
     # point is chaos, and the axis plus the CSV already carry the rest.
@@ -761,7 +856,7 @@ def render_chart(path, samples, profile, rows, summary, theme="light"):
     # Matplotlib's default 5% margin is measured against the data RANGE, so a run
     # whose two nodes sit far apart leaves the hotter one's endpoint dots almost
     # touching the title. This is visual only - no value is clipped either way.
-    ax.margins(y=0.10, x=0.02)
+    ax.margins(y=CHART_MARGIN_Y, x=CHART_MARGIN_X)
     ax.grid(axis="y", color=pal["grid"], linewidth=1, zorder=0)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
@@ -776,7 +871,7 @@ def render_chart(path, samples, profile, rows, summary, theme="light"):
     device = samples.preamble_value("device") or Path(samples.path).stem
     ax.set_title("NTC 节点温度 · %s" % device, loc="left", pad=24,
                  color=pal["ink"], fontsize=13)
-    ax.text(0, 1.02, _describe_run(samples, profile, dots, summary),
+    ax.text(0, 1.02, _describe_run(samples, profile, dots, summary, dotless),
             transform=ax.transAxes, ha="left", va="bottom",
             color=pal["ink2"], fontsize=9)
     ax.set_xlabel("运行时长", color=pal["ink2"], fontsize=10, labelpad=8)
@@ -788,7 +883,7 @@ def render_chart(path, samples, profile, rows, summary, theme="light"):
               frameon=False, fontsize=9, labelcolor=pal["ink2"],
               handlelength=2.0, columnspacing=2.5)
 
-    fig.subplots_adjust(left=0.075, right=0.965, top=0.82, bottom=0.30)
+    fig.subplots_adjust(**CHART_ADJUST)
     fig.savefig(path, facecolor=pal["surface"])
     plt.close(fig)
 
@@ -1247,6 +1342,62 @@ def selftest():
               and CHART_THEMES["dark"]["led"] == "#d95926",
               "changing these means re-running the palette validator")
 
+        # -- the dot rule, which is a claim about the SCREEN -----------------
+        # A dot says "a reading happened here", and it can only say that while the
+        # eye can tell it from its neighbour. Both shapes below are real: the long
+        # one is the archived run the rule was written for (52094 s, 1737
+        # readings, i.e. 0.81 px per dot - the chart came back with the curve
+        # gone), the short one is the 6-row fixture above.
+        def long_rows(n=1737, period=30.0):
+            """A reading every `period` seconds for `n` readings."""
+            out = []
+            for i in range(n):
+                out.append(["%.1f" % (i * period), "699", "419",
+                            "%.2f" % (24.5 + (i % 7) * 0.4),
+                            "%.2f" % (52.0 + (i % 5) * 0.6),
+                            "f", ST_OK, ST_OK])
+            return out
+
+        def long_summary(rs):
+            """What convert_samples() would report for `rs`: every tick a reading."""
+            n = len(rs)
+            return {ch: {"seen": n, "fresh": n, "n": n, "avg": 25.0, "min": 24.0,
+                         "max": 26.0, "bad": 0, "oor": 0} for ch in CHANNELS}
+
+        long_lines, long_dots = chart_series(long_rows())
+        long_pps = px_per_second(long_lines, ["lcd"])
+        check("chart: a 14.5 h run gives each dot well under a pixel, ~26x under "
+              "what a dot plus its ring needs - so they are not drawn",
+              dots_legible(long_dots, "lcd", long_pps) is False,
+              "%.2f px vs %.1f px min" % (30.0 * long_pps, DOT_MIN_GAP_PX))
+        check("chart: the fixture's 2-minute run gives the same 30 s period "
+              "hundreds of pixels, so its dots are drawn",
+              dots_legible(dots, "lcd", px_per_second(lines, ["lcd"])) is True,
+              "%.0f px" % (5.0 * px_per_second(lines, ["lcd"])))
+        check("chart: the rule flips exactly at the threshold - one mark plus its "
+              "ring is drawn, and a hundredth of a pixel less is not",
+              dots_legible({"lcd": ([0.0, DOT_MIN_GAP_PX], [1.0, 2.0]),
+                            "led": ([], [])}, "lcd", 1.0) is True
+              and dots_legible({"lcd": ([0.0, DOT_MIN_GAP_PX - 0.01], [1.0, 2.0]),
+                                "led": ([], [])}, "lcd", 1.0) is False,
+              "%.2f px" % DOT_MIN_GAP_PX)
+        check("chart: a single reading has nothing to collide with, so it keeps "
+              "its dot however long the run around it was",
+              dots_legible({"lcd": ([52094.0], [25.0]), "led": ([], [])},
+                           "lcd", long_pps) is True)
+        check("chart: a repeated timestamp is not a period - it is dropped rather "
+              "than allowed to drag the median down",
+              _gaps([0.0, 30.0, 30.0, 60.0]) == [30.0, 30.0]
+              and _median([]) is None and _median([1.0, 3.0]) == 2.0,
+              str(_gaps([0.0, 30.0, 30.0, 60.0])))
+        check("chart: the subtitle names the dropped dots, so their absence is "
+              "never something the reader has to infer",
+              "未画点" in _describe_run(samp, prof, long_dots,
+                                       long_summary(long_rows()), ["lcd", "led"])
+              and "未画点" not in _describe_run(samp, prof, dots, summary),
+              _describe_run(samp, prof, long_dots, long_summary(long_rows()),
+                            ["lcd", "led"]))
+
         # matplotlib is optional by design - the CSV is the product, the PNG is
         # the second half of it - so a missing matplotlib is SKIPPED, never
         # reported as a pass. A skipped chart assertion must not read as "the
@@ -1267,6 +1418,114 @@ def selftest():
                   "an inverted light one)",
                   png2.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
                   and png2.read_bytes() != blob)
+
+            # -- the same rule, read back off the PNG ------------------------
+            # Optional dep on top of an optional dep: no image reader, no
+            # assertion - SKIP, never a pass.
+            try:
+                from matplotlib import image as mpl_image
+            except ImportError as exc:
+                print("[selftest] SKIP  chart: the dot rule on the PNG (%s)" % exc)
+            else:
+                def series_px(p, ch, theme="light"):
+                    """Series-coloured pixels INSIDE the axes.
+
+                    The legend swatches carry the same colour, so the region is
+                    the point: anything outside the plot area is the legend, the
+                    title or the labels, and none of those are the curve.
+                    """
+                    arr = mpl_image.imread(p)
+                    h, w = arr.shape[0], arr.shape[1]
+                    sub = arr[int((1.0 - CHART_ADJUST["top"]) * h)
+                              :int((1.0 - CHART_ADJUST["bottom"]) * h),
+                              int(CHART_ADJUST["left"] * w)
+                              :int(CHART_ADJUST["right"] * w), :3]
+                    rgb = CHART_THEMES[theme][ch]
+                    tgt = [int(rgb[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+                    return int(((abs(sub[:, :, 0] - tgt[0]) < 0.12)
+                                & (abs(sub[:, :, 1] - tgt[1]) < 0.12)
+                                & (abs(sub[:, :, 2] - tgt[2]) < 0.12)).sum())
+
+                longs = long_rows()
+                png3 = pdir / "chart_long.png"
+                render_chart(png3, samp, prof, longs, long_summary(longs),
+                             theme="light")
+                kept = series_px(png3, "led")
+                check("chart: a 14.5 h run keeps its CURVE - the staircase survives "
+                      "the dot rule", kept > 4000, "%d led px inside the axes" % kept)
+
+                # The bug, reproduced on purpose: forcing those dots back on is
+                # exactly what the old code did, and it is what erased the line.
+                # Without this, "never draw a dot anywhere" would pass every
+                # assertion above it.
+                real_legible = globals()["dots_legible"]
+                globals()["dots_legible"] = lambda *_a, **_k: True
+                try:
+                    png4 = pdir / "chart_long_forced.png"
+                    render_chart(png4, samp, prof, longs, long_summary(longs),
+                                 theme="light")
+                finally:
+                    globals()["dots_legible"] = real_legible
+                erased = series_px(png4, "led")
+                check("chart: forcing the dots back on erases that curve - the exact "
+                      "damage the rule prevents, at 1737 dots over 0.81 px each",
+                      erased < kept / 2.0,
+                      "%d px with the dots forced on, %d without" % (erased, kept))
+
+                # ...and the other direction, so the rule cannot degenerate into
+                # "never draw dots" unnoticed: a short run must keep them.
+                globals()["dots_legible"] = lambda *_a, **_k: False
+                try:
+                    png5 = pdir / "chart_short_dotless.png"
+                    render_chart(png5, samp, prof, rows, summary, theme="light")
+                finally:
+                    globals()["dots_legible"] = real_legible
+                check("chart: a short run really is drawn WITH its dots - dropping "
+                      "them changes the picture",
+                      series_px(png, "lcd") > series_px(png5, "lcd"),
+                      "%d px vs %d px without them"
+                      % (series_px(png, "lcd"), series_px(png5, "lcd")))
+
+                # The threshold is derived from MARKER_PT, so MARKER_PT has to BE
+                # the size the marker is drawn at - otherwise the rule is a number
+                # rather than a statement about the picture. One reading: the line
+                # is then a single horizontal run, so the series colour's vertical
+                # extent inside the axes IS the mark.
+                def marker_px(p, ch, theme="light"):
+                    arr = mpl_image.imread(p)
+                    h, w = arr.shape[0], arr.shape[1]
+                    sub = arr[int((1.0 - CHART_ADJUST["top"]) * h)
+                              :int((1.0 - CHART_ADJUST["bottom"]) * h),
+                              int(CHART_ADJUST["left"] * w)
+                              :int(CHART_ADJUST["right"] * w), :3]
+                    rgb = CHART_THEMES[theme][ch]
+                    tgt = [int(rgb[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+                    mask = ((abs(sub[:, :, 0] - tgt[0]) < 0.12)
+                            & (abs(sub[:, :, 1] - tgt[1]) < 0.12)
+                            & (abs(sub[:, :, 2] - tgt[2]) < 0.12))
+                    rows_any = mask.any(axis=1)
+                    idx = [i for i, v in enumerate(rows_any) if v]
+                    return (idx[-1] - idx[0] + 1) if idx else 0
+
+                one = [["0.0", "699", "419", "25.00", "52.00", "f", ST_OK, ST_OK]]
+                png6 = pdir / "chart_one.png"
+                render_chart(png6, samp, prof, one,
+                             {ch: {"seen": 1, "fresh": 1, "n": 1, "avg": 25.0,
+                                   "min": 25.0, "max": 25.0, "bad": 0, "oor": 0}
+                              for ch in CHANNELS}, theme="light")
+                drawn = marker_px(png6, "lcd")
+                # The stroke straddles the marker boundary, so half a ringwidth is
+                # painted INWARD (the visible face is MARKER_PT - MARKER_EDGE_PT)
+                # and half OUTWARD (which is what DOT_MIN_GAP_PX is: the space the
+                # mark occupies, and therefore what a neighbour may not overlap).
+                # Both come off the same two constants, so measuring the face pins
+                # them both. Antialiasing puts a pixel either side of this, hence
+                # the slack.
+                want = (MARKER_PT - MARKER_EDGE_PT) * CHART_DPI / 72.0
+                check("chart: the mark the threshold is derived from is the mark that "
+                      "gets drawn", abs(drawn - want) < 3.0,
+                      "drawn %.0f px, (MARKER_PT-MARKER_EDGE_PT) = %.1f pt = %.1f px"
+                      % (drawn, MARKER_PT - MARKER_EDGE_PT, want))
 
     print("")
     if fails:

@@ -35,6 +35,12 @@ Data sources (probed on the real MT9676 device, 2026-08-25 / 2026-09-14):
   gpu     : /sys/kernel/debug/mali0/dvfs_utilization + gpu_clock, ONE `su 0 cat` of
             both files (two separate su calls cost an extra ~122 ms/tick).
             REQUIRES root; degrades to disabled if unreadable.
+  ntc     : the two iio ADC nodes (/sys/bus/iio/devices/iio:device0/
+            in_voltage{3,2}_raw), ONE `su 0 cat` of both. REQUIRES root: the
+            mode is 0644 root:root, but this board is SELinux Enforcing and
+            the `shell` domain is denied them - so a bare `cat` writes
+            `Permission denied` to STDERR and NOTHING to stdout. Degrades to
+            disabled if unreadable.
   fg      : `dumpsys window | grep -m1 mFocusedApp` -> package, then `pidof <pkg>`
             -> pid(s), then /proc/<pid>/stat utime+stime -> CPU%. NOT `top` (581 ms
             per read on this board, and its instantaneous %CPU is not repeatable:
@@ -98,7 +104,7 @@ if hasattr(signal, "SIGBREAK"):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.4.1"
 
 # ---------------------------------------------------------------------------
 # Frozen schema (order is load-bearing; do not sort or reorder)
@@ -199,7 +205,17 @@ NTC_LCD_PATH = "/sys/bus/iio/devices/iio:device0/in_voltage3_raw"
 NTC_LED_PATH = "/sys/bus/iio/devices/iio:device0/in_voltage2_raw"
 NTC_CHANNELS = ("lcd", "led")
 NTC_GUARD_S = 2                # `timeout -k 1 2` around the device-side read
-NTC_CMD = f"timeout -k 1 {NTC_GUARD_S} cat {NTC_LCD_PATH} {NTC_LED_PATH}"
+# Read through `su 0`, exactly like the Mali counters below, and NOT because
+# of the permission bits: both nodes are mode 0644 root:root. This board runs
+# SELinux Enforcing and the `shell` domain is denied `sysfs`, so a bare `cat`
+# writes `Permission denied` to STDERR and NOTHING to stdout - which is why
+# the console used to show an empty row and a bare FAIL. `su` itself prints
+# nothing here (checked), so the framed tick command stays clean.
+# The guard stays at NTC_GUARD_S rather than following the device guard the
+# way the Mali read does: `su 0` measured +60.6 ms over a bare `cat` (139.5 ->
+# 200.1 ms median), which does not move the bound this guard exists to set -
+# the timeout only ever bites on a wedged driver.
+NTC_CMD = f"timeout -k 1 {NTC_GUARD_S} su 0 cat {NTC_LCD_PATH} {NTC_LED_PATH}"
 NTC_SOURCE = "iio in_voltage3/2_raw"
 # The ADC -> Celsius conversion is NOT implemented HERE, and that is a
 # permanent split rather than a placeholder. The constants it needs - divider
@@ -3067,10 +3083,29 @@ def build_report(ev_dict: dict, verdict: dict, cfg: dict, sources: dict,
 # Probe modes
 # ---------------------------------------------------------------------------
 def _probe_raw(serial: str, name: str, cmd: str) -> str:
-    _rc, out, _err = adb_shell(serial, cmd, 15.0)
+    """Print this probe's first stdout line - and SAY WHY when there is none.
+
+    The reason can only come from stderr. A denied sysfs read is SILENT on
+    stdout: `cat` writes `Permission denied` to fd 2 and exits 1, so a probe
+    that keeps only stdout prints `(empty)` and a bare FAIL, and the reader has
+    nothing to act on. That is precisely how the NTC nodes stayed unreadable
+    with a clean-looking console.
+
+    stderr is consulted ONLY when stdout is empty, so a working channel keeps
+    its one-line summary and this cannot become noise. Forced to ASCII because
+    a device that localises its own messages would otherwise abort the print on
+    a GBK console (D-07).
+    """
+    _rc, out, err = adb_shell(serial, cmd, 15.0)
     out = out.replace("\r", "")
-    first = out.strip().splitlines()[0].strip()[:70] if out.strip() else "(empty)"
-    print(f"[probe] {name:<10} : {first}")
+    if out.strip():
+        print(f"[probe] {name:<10} : {out.strip().splitlines()[0].strip()[:70]}")
+    else:
+        why = (err or "").replace("\r", "").strip().splitlines()
+        reason = why[0].strip()[:80] if why else ""
+        reason = reason.encode("ascii", "replace").decode("ascii")
+        print(f"[probe] {name:<10} : (empty) - "
+              + (reason or "no output and no error - rc=%s" % _rc))
     return out
 
 
@@ -3155,7 +3190,12 @@ def run_probe(serial: str) -> int:
     for ch, path in zip(NTC_CHANNELS, (NTC_LCD_PATH, NTC_LED_PATH)):
         print(f"[probe] {'ntc ' + ch:<13}: {path}")
     scale = os.path.dirname(NTC_LCD_PATH) + "/in_voltage_scale"
-    _probe_raw(serial, "ntc scale", f"cat {scale}")
+    # Same identity as the value read above: on an Enforcing board a bare
+    # `cat` is DENIED here, and the stderr echo would then say "Permission
+    # denied" - which reads as "the file exists, you lack the rights" and
+    # flatly contradicts the conclusion printed on the next line. As root
+    # the answer is the true one: this attribute is absent.
+    _probe_raw(serial, "ntc scale", f"su 0 cat {scale}")
     print("[probe] ntc          : the ADC -> Celsius factor is NOT on this "
           "device; the formula must come from the user")
     raw_ascii = (ntxt or "").strip().replace("\n", " ")
@@ -4454,6 +4494,55 @@ def run_selftest() -> int:
                                       NTC_PROFILE_DEFAULT + ".ini")),
           os.path.join(NTC_PROFILE_DIR, NTC_PROFILE_DEFAULT + ".ini"))
 
+    # --- the NTC read goes through su 0, and an empty probe now says why -----
+    check("ntc-read: both nodes are read through `su 0` - SELinux denies the "
+          "shell domain, so a bare `cat` gives EMPTY stdout and the failure is "
+          "invisible",
+          "su 0 cat" in NTC_CMD
+          and NTC_CMD.index(NTC_LCD_PATH) < NTC_CMD.index(NTC_LED_PATH),
+          NTC_CMD)
+
+    def _probe_with(out, err):
+        """Run the real _probe_raw against a stubbed adb_shell."""
+        real = globals()["adb_shell"]
+        globals()["adb_shell"] = lambda *_a, **_k: (0, out, err)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                got = _probe_raw("FAKE", "ntc", NTC_CMD)
+        finally:
+            globals()["adb_shell"] = real
+        return got, buf.getvalue()
+
+    _got_ok, _line_ok = _probe_with("662\n371\n", "")
+    check("ntc-read: a readable channel still prints exactly ONE line - the "
+          "first value",
+          _got_ok.replace("\r", "") == "662\n371\n"
+          and _line_ok.count("\n") == 1 and "662" in _line_ok
+          and "(empty)" not in _line_ok,
+          repr(_line_ok))
+
+    _got_bad, _line_bad = _probe_with("", "cat: /x: Permission denied\n")
+    check("ntc-read: an EMPTY stdout reports the reason from stderr instead of "
+          "a bare (empty) - this is the line whose absence hid the bug",
+          _line_bad.count("\n") == 1
+          and "(empty)" in _line_bad
+          and "Permission denied" in _line_bad,
+          repr(_line_bad))
+
+    _got_non, _line_non = _probe_with("", "\u00e9chec\n")
+    check("ntc-read: a non-ASCII reason cannot abort the print on a GBK "
+          "console (D-07)",
+          all(ord(c) < 128 for c in _line_non) and "chec" in _line_non,
+          repr(_line_non))
+
+    _got_none, _line_none = _probe_with("", "")
+    check("ntc-read: a silent failure with no stderr at all still prints one "
+          "line rather than nothing",
+          _line_none.count("\n") == 1 and "(empty)" in _line_none
+          and "rc=0" in _line_none,
+          repr(_line_none))
+
     print(f"\n[selftest] {len(fails)} failure(s)")
     for f in fails:
         print(f"  - {f}")
@@ -4627,9 +4716,14 @@ class Monitor:
         data to report one unreadable temperature. Wrapped, the worst case is one
         partial tick.
 
-        No `su`: measured as plain shell on the reference device, where both nodes
-        are world-readable. That also means this can never be the thing that fails
-        on a board where root is unavailable.
+        `su 0`, like the Mali counters. The old note here said "no `su`, measured
+        as plain shell on the reference device, where both nodes are
+        world-readable" - the mode is indeed 0644, but that measurement was
+        taken on a unit whose adbd was root at the time, and generalising from
+        it is what let this fail with nothing on screen. Under Enforcing the
+        `shell` domain is denied `sysfs` and a bare `cat` yields empty stdout.
+        A board without root now loses NTC rather than keeping it; that is the
+        deliberate trade, the same one the GPU tier already makes.
         """
         _rc, out, _err = adb_shell(self.serial, NTC_CMD, self._pc_budget_s())
         return parse_ntc(out) is not None

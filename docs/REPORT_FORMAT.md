@@ -258,6 +258,27 @@ doc["hide_keys"] = ["password"]      # wifi_switch_stress 的写法
 - 所以**引擎的 import 不能有副作用**。`_pptp_report` 是 import-pure 的(只定义常量与函数),
   接入时把 `import _pptp_report` 放在文件头不会拖慢或污染 `--dump-params`。
 
+### 顶层还可以多一个 `hint`(v2.15.0,D-70)
+
+```python
+print(json.dumps({"fields": PARAMS, "hint": PARAMS_HINT}))
+```
+
+`hint` 是**脚本自述的一条静态前置条件**,渲染在参数弹窗**顶部**(不是日志、不是状态条)。
+**向后兼容是硬要求**:没声明 `hint` 的脚本,服务端给 `""`,前端 `r.hint || ""` 兜得住 ——
+所以 `{"fields": [...]}` 这个旧形状**永远合法**,不必改任何一个已有脚本。
+
+三条边界:
+
+- **它不是参数。** 不进 `fields`、不进参数表单、不进本文件的参数表(参数表遍历的是 `params_schema`)、
+  不进 localStorage。加进 `fields` 会污染上面那张表。
+- **它只有 `str` 会被转发**,别的类型或缺失一律当 `""`,不报错、不校验、不白名单。
+- **`json.dumps` 默认 `ensure_ascii=True`** ⇒ 中文被转义,这行 stdout **仍是纯 ASCII**(D-07 不破)。
+  源码里 hint 与 `label` 一样是字面中文。
+
+> **已知边界**:参数弹窗只由脚本卡片那个入口打开,而那个入口要求脚本声明了 `--dump-params` ——
+> 所以**没有参数的脚本即使有 hint 也显示不出来**。它是"带参数的脚本附带说明",不是公告牌。
+
 ---
 
 ## 7. 文件命名与归档 —— 新增脚本必须守的约定
@@ -457,6 +478,16 @@ SCRIPT_VERSION = "1.0.0"
 9. 在 `server.py` 的 `ARCHIVE_MODULES` 登记模块名(未登记落 `other/`)
 10. 若脚本从「不写报告」变成「写报告」,在 `REPORT_WRITING_SCRIPTS` 加上它(**别漏**,漏了硬杀时静默丢报告)
 11. 过一遍 §8 的自查清单,再跑一遍 §11 的验证
+12. (可选)有**运行前**才成立的前提要说 → 顶层多打一个 `hint`(§6);**`fields` 形状一个字都不用改**
+
+### 已接入的脚本(v2.15.0 时点)
+
+**写报告的 9 个**:`wifi_onoff_stress` / `wifi_reboot_stress` / `wifi_switch_stress` /
+`sensor_reboot_stress` / `app_launch_stress`(**一次多份报告**) / `perf_monitor` /
+`battery_inout_stress` / `bt_reboot_stress` / `power_cycle_stress`(**v2.15.0 新增,归档模块 `power`**)。
+
+**不写报告的第 10 个**:`ir_runner`(**有意**,见 §12)。另有共享件 `_pptp_report.py`(报告引擎)
+与 `ir_runner.py`(被 `perf_monitor` / `power_cycle_stress` 线程内 import)不是压测脚本本身。
 
 ---
 

@@ -1,5 +1,268 @@
 # 更新日志 (Changelog)
 
+## v2.15.0 — 2026-09-23 (硬开关机压测:嗅探继电器断上电 / 脚本可自述 `hint` 前置提醒)
+
+> 平台 `2.14.2 → 2.15.0`(`server.py` 的 `version=` + healthz + `static/index.html` 的 `?v=` ×3)。
+> 新增 `scripts/power_cycle_stress.py`(**第 10 个压测脚本**,`SCRIPT_VERSION = "1.0.0"`)。
+> 平台侧**只多转发一个键**,没有任何已有行为被改。`ir_runner.py` / `_pptp_report.py` / `style.css` **零改动**。
+
+用户原话:
+
+> 硬开关机压测 / 我将使用继电器并将其周期设置为 10mins on 和 30s off / 并且我将会将机器的上电模式改为上电自动开机 …
+> 可以不要做得很复杂,无需像 perf_monitor 一样监控各种数据,只需要做无法开机超时判定 … 基本上能做好自动识别断电和上电就行
+> 但是需要在脚本页面显示"需将设备上电方式改为 Direct"作为提醒,这是流程能跑起来的前提
+
+以及两处**中途追加、改变了设计**的要求:
+
+> 而且后续的继电器的节奏是不固定的,所以要脚本做主动嗅探
+
+> 以往的 ini 都是默认循环,这次这个需要做成单次截断的那种而不是一直循环调用 ini
+
+### 这件事和别的脚本根本不同:重心第一次挪到了脚本之外
+
+前 9 个脚本都是**自己**发起 `adb reboot`(或自己断电),所以它们天然知道时间起点。这一个的电源在**一只外部
+继电器**手里,按它自己的定时器走 —— 脚本既不知道它什么时候断,也**不控制**它。于是:
+
+**循环节奏从「配置」变成「观测量」。** 这是本次唯一真正的设计判断。脚本 `WAIT_OFF → WAIT_BACK → WAIT_BOOT →
+POST_BOOT` 主动嗅探:设备离开 adb 记一次,回到 adb 记一次,`sys.boot_completed == "1"` 记一次。测到的
+断电时长 / 开机耗时**只进报告**,`PARAMS` 里**没有** `on_sec` / `off_sec` —— 加了就等于把「节奏不固定」
+这句话作废(用户明确说了后续节奏不固定)。
+
+### 两个超时分工明确,都不拿 10min/30s 做比较
+
+| 超时 | 覆盖 | 默认 | 触发后果 |
+|---|---|---|---|
+| `off_watchdog_sec` | 离开 adb → 回到 adb | 1800 s | 看门狗,**不是**节奏断言;该轮 FAIL 并**结束整轮跑** |
+| `boot_timeout_sec` | 已在 adb → `boot_completed == "1"` | 120 s | **这才是判定**;该轮 FAIL,**继续下一轮** |
+
+第二个才是"能不能开机"的判据 —— 设备出现在 adb 里就意味着**电已经通了**,这一段慢不慢确实归脚本判。
+
+### 判定 = 只有开机结果;**WiFi 只记录,永不判定**
+
+用户裁决原话是「超时=FAIL;WiFi 只记录」。报告里有 WiFi 那一列与逐轮明细,但它**不参与 PASS/FAIL**。
+`--selftest` 里有一条断言**直接钉这条**(构造"每轮都开成了但 WiFi 一次都没连上" ⇒ 必须 `OK`)。
+判定的**充要条件**是:存在开机超时 or 看门狗触发。
+
+### IR 是**单次截断**,不是循环(与 `perf_monitor` 相反)
+
+用户追加要求。实现上 `import ir_runner` **在线程内、主线程同步执行**,每步取一份 **`count=1` 的副本**
+(所以 `run_step` 末尾那句 `if n < step.count: sleep` 不触发,节奏归调用方),**`run_loop` 永不参与** ——
+它的唯一出口是本线程的 `KeyboardInterrupt`,Windows 永远不会送来。IR 失败**只进报告,永不改变判定**(D-43)。
+这样也把 D-43 ④「只有 perf_monitor 需要」那句话修订掉了(原文保留 + 推翻标记,见 DECISIONS D-43/D-71)。
+
+### 脚本可自述一条 `hint` 前置条件(D-70)
+
+`--dump-params` 现在可以多打印一个顶层键 `hint`,服务端**原样转发**(缺省 `""`,所有脚本统一多这一个键),
+前端把它渲染在参数弹窗**顶部**、**`#params-form` 之外**(表单可滚动,放进去会被滚走),**复用 `.seq-warn`
+样式**(`style.css` 零改动)、用 `textContent`。本脚本的 hint 就是那句:
+
+> 需将设备上电方式改为 Direct(上电自动开机),否则断电后不会自动开机,本流程跑不起来。本脚本只观察外部
+> 继电器造成的断电/上电,不控制电源。
+
+它**不是** D-09 / D-36 禁掉的运行时状态提醒(那类东西讲的是"现在离线了"),也**不是** D-47 禁掉的前端硬编码
+参数表单(`app.js` / `index.html` 里不出现任何脚本名、不出现那句中文)。`json.dumps` 默认
+`ensure_ascii=True` ⇒ 这行 stdout **仍是纯 ASCII**,D-07 不破。
+
+### 无设备下能证伪的部分
+
+- `scripts/power_cycle_stress.py --selftest` —— **27 条断言全绿**:`adb devices` 解析(正常 / `offline` /
+  `unauthorized` / 空 / **读失败**五种)、ini 下拉项扫描(跳过 `_` 开头 / 不递归 / 目录缺失回落)、
+  观测时长的 `n/a` 语义、判定聚合(**含"WiFi 全断但开机全过 ⇒ 仍 OK"那条**)、`parse_wifi`、params 契约。
+- **模拟继电器台架**(`E:/tmp/sim_relay.py`,不提交)—— 用 monkeypatch 的 adb 探针驱动**真实的 `main()`**
+  跑完 4 个场景(2 个健康轮含"起跑即断电"、开机超时、看门狗、心跳),**39 条断言全绿、退出码 0**,
+  并且验证了报告 JSON + HTML 落盘、stdout 的 `html = …` / `report : …` 顺序(**镜像了
+  `server._sniff_report_path` 的嗅探规则**)。
+- **反身验证**:把"WiFi 未连接也算 FAIL"临时改进去 ⇒ 恰好那一条断言变红、`all_passed: False, exit_code: 1`
+  ⇒ 改回。不能失败的断言不算测试。
+
+### 这条台架在写的过程中抓出来的真缺陷(**不是**沙盒噪声,是实打实的)
+
+1. **设备一直在线时脚本一行都不打印。** 我原先在 `WAIT_OFF` 里每次读到设备在线就重置心跳计时器 ——
+   结果"设备还开着"这个**最常见**的起始状态下,用户分不清脚本是在工作还是卡死了。改成心跳按整个
+   `WAIT_OFF` 计时。
+2. **三处 stdout 中文**(D-07):`power mode = Direct(上电自动开机)`、WiFi 汇总、以及 `span()` 的兜底
+   用了破折号 `—`。分别改成只输出 ID `Direct`、单独的 ASCII 汇总、兜底 `n/a`(报告侧仍传 `—`)。
+
+### 改了什么(逐处)
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/power_cycle_stress.py` | **新建**,~985 行 |
+| `server.py` | `ARCHIVE_MODULES` 加 `"power_cycle_stress.py": "power"`;`REPORT_WRITING_SCRIPTS` 加同名;`/api/scripts/{name}/params` 多转发 `hint`;版本 `2.14.2 → 2.15.0` ×2。**E-SafeNet 壳文件,用 Python 脚本改(断言 + `py_compile`),不用 Edit** |
+| `static/app.js` | `loadParamsSchema` 改为**缓存整个响应**(以前只留 `r.fields` —— 那正是 hint 会静默消失的地方);`openParamsModal` 填充 `#params-hint` |
+| `static/index.html` | `#modal-params` 里 `#params-target` 与 `#params-form` 之间加 `#params-hint`;`?v=` ×3 |
+| `static/style.css` | **零改动**(复用 `.seq-warn`) |
+| `scripts/_pptp_report.py` / `scripts/ir_runner.py` | **零改动** |
+| `README.md` / `docs/*` / `TODO.md` | 脚本清单 + 归档模块 `power/` + D-70/D-71 + PITFALLS #57–#59 |
+
+### 两个默认值在本版本内改过一次(用户 2026-09-23 定)
+
+`v2.15.0` **尚未提交**,所以这两个默认值是**就地改的**,没有单独 bump 版本:
+
+| 参数 | 原默认 | 现默认 | 为什么 |
+|---|---|---|---|
+| `iterations` | `100` | **`1000`** | 按 10 min ON / 30 s OFF 算 ≈ **7 天**。原来是照"一晚"估的;实际一轮 ≈ 10.5 分钟,100 轮只够十几个小时 |
+| `post_boot_wait_sec` | `70` | **`25`** | 用户实测开机流程不需要等 70 秒 |
+
+`boot_timeout_sec`(120)/ `off_watchdog_sec`(1800)/ `poll_interval_sec`(2)/ `ir_sequence`(空)**不动**。
+docstring 里那条 CLI 示例的 `post_boot_wait_sec` 跟着改成 25。
+
+### 我**明确无法验证**的(没硬件就是没硬件)
+
+整个嗅探循环对**真实继电器**的行为、adb 重新枚举、真实的 `sys.boot_completed` 时序、以及 `run_step` 的
+**真机**派发 —— **一律没验过**。上面两条断言套件是**无硬件下能证伪的全部**;别把"全绿"读成"真机上跑通了"。
+真机短跑建议先 `iterations=2`,确认整条链路通了再上默认的 1000 轮。
+
+---
+
+## v2.14.2 — 2026-09-22 (修 NTC 温度曲线的线被采样点抹掉 / `tools` 1.3.1)
+
+> 本次 bump **两个**版本号:平台 `2.14.1 → 2.14.2`(`server.py` 的 `version=` + healthz +
+> `static/index.html` 的 `?v=` ×3)、`tools/ntc_convert.py` 的 `TOOL_VERSION` **1.3.0 → 1.3.1**。
+> `perf_monitor.py` **未改动**。平台侧**零逻辑改动** —— 只跟版本号(v2.14.1 动的那个平台版本号,
+> 是为了让浏览器不再拿旧的 `app.js`;这次同理,`tools` 是独立 CLI,但归档链路由平台串起来)。
+
+用户原话:
+
+> ntc 制图有问题,csv 的数据是 ok 的,但是生成出来的图片曲线完全丢失了,节点都糊在一起,
+
+**用户裁决**:三个选项里选了**「不打点了」** —— 点密到分不开时**整个不画采样点**,副标题注明。
+
+### 根因是**剂量**,不是数据
+
+先按用户的前提独立核对了 CSV:**完全正常**。26047 行、`t_sec` 单调无重复(0.0→52094.0,dt 2.0)、
+**零空单元格**、LCD 24.48–34.61、LED 51.68–64.13、`ntc_st` = `h:24310 / f:1737`。
+再看交给 matplotlib 的东西:`len(xs)=26047`、`len(fx)=1737`、`xs` 单调、`nan=0`、`fx` 去重后恰好 1737 ——
+**全部正确**,画完之后 `ax.get_xlim()` / `get_ydata()` 也逐项核对过。所以问题不在"喂进去什么"。
+
+那一次是 **14.5 小时 / 1737 个真实读数**(52094 s,30 秒一个),绘图区宽 1468 px
+→ **一个点摊到 0.81 px**。而每个点都带一圈 `markeredgewidth=2` pt(**4.17 px**)的
+`markeredgecolor=surface` 底色描边 —— 那是 dataviz 规范要求的("重叠标记加 2px 底色环,
+压在线上也看得清")。**但那条规范只在标记分得开的时候成立**:0.81 px 间距下相邻标记完全重叠,
+那圈描边就从"分隔"变成**橡皮擦** —— 它把底下的**台阶线**(`zorder=3`)连同左右邻居的点面整片涂掉。
+
+**实测**(按系列色统计绘图区内的像素,LED 通道):
+
+| 画法 | 轴内彩色像素 |
+|---|---|
+| 只有台阶线 | 11930 |
+| 只有点(ms=8,底色描边 2pt) | 1845 |
+| **线 + 点(改动前)** | **1974** |
+| 线 + 点(去掉描边) | 39704 |
+| 线 + 点(每 40 个取一个,32 px 间距) | 11729 |
+
+用户那句「曲线完全丢失了,节点都糊在一起」,一个字都不差。
+
+### 改了什么
+
+`tools/ntc_convert.py` 一条**纯函数、可测**的规则:一个点的**外沿**直径 = `MARKER_PT + MARKER_EDGE_PT`
+= 10 pt = **20.83 px**(描边骑在标记边界上,向内吃 `mew/2`、向外占 `mew/2`,所以外沿直径正好是两者之和;
+而**可见点面**是 `MARKER_PT - MARKER_EDGE_PT` = 6 pt)。该通道真实读数的**中位**间隔 × px/s ≥ 该阈值 → 画;
+否则**整个不画**。`px_per_second()` 从**数据跨度 + 版面常数**算,**不读** `ax.get_xlim()` —— 画点发生在
+任何 artist 之前,那时坐标轴还没有数据范围,读到的是默认的 `(0,1)`。**逐通道**判定:一稀一密时稀的照旧有点。
+
+副标题必须说:不打点的通道进 `_describe_run()` 的 `dotless`,副标题追写「采样点密过屏幕像素,未画点」。
+**点的消失不许成为需要读者自己推断的静默变更。**
+
+### 这件事为什么旧断言全绿
+
+坏的是**光栅化那一步**。数据对、artist 对、坐标轴范围对 —— 所以"断言数据 / 断言形状"的测试**发现不了**。
+新增的断言只能**读回 PNG 数像素**。
+
+### 新增断言 · 反身验证
+
+`--selftest` **75 → 85 条 PASS,0 failure**(75 那条基线是用改动前的备份实跑出来的,不是估的)。
+10 条新断言里 6 条是纯函数(14.5 h 的形状、2 分钟短跑的形状、阈值边界翻转、单个读数、重复时间戳不算周期、
+副标题那句),4 条**读回 PNG 数像素**:「14.5 h 的跑曲线还在」(38388 px)、「**把点强行打开,曲线就塌了**」
+(227 px,169 倍 —— 这一条就是 bug 本身)、「短跑确实带着点画」(少了点图会变)、
+「阈值所依据的那个点径就是真正画出来的点径」。
+
+反身验证:7 个变体逐个注入,**每一个都恰好让对应的断言变红**(含"永不画点"这种听起来安全的方向)。
+
+### 如实记下的代价
+
+30 秒档下约 **40 分钟以上**的跑,图上就只有台阶线、看不到采样点了。读数、状态、温度在 `*.temps.csv` 里
+**一个不少**,副标题仍然报**中位**采样周期(`每 30.0 秒一个真实读数`);丢的只是"哪一拍是真实读数"
+这个视觉提示 —— 而它在 0.81 px 的密度下本来也不可读。**短跑一个点没少。**
+
+### 没动的东西
+
+阶梯线、逐通道断线、配色、副标题的密度措辞、单轴、`--force` / `--profile` / `# params=` 表头 —— 全不变。
+D-63 原文保留,只在其上加了一条 `⚠ 2026-09-22` 的推翻标记,新增 **D-69** 记录本次裁决(见
+[docs/DECISIONS.md](docs/DECISIONS.md))。踩坑记录见 [docs/PITFALLS.md](docs/PITFALLS.md) #56。
+
+**归档里那张坏图没有动。**`archive/` 是永久保留的,要重出得用户点头(见 [TODO.md](TODO.md))。
+
+## v2.14.1 — 2026-09-21 (修 NTC 读不到值:改走 `su 0` / 并让探针失败时说出原因)
+
+> 本次 bump **两个**版本号:平台 `2.14.0 → 2.14.1`(`server.py` 的 `version=` + healthz +
+> `static/index.html` 的 `?v=` ×3)、`perf_monitor.py` 的 `SCRIPT_VERSION` **1.4.0 → 1.4.1**。
+> `tools/ntc_convert.py` **未改动**。平台侧**零逻辑改动** —— 只跟版本号,与 v2.11.2 同例。
+
+用户原话:
+
+> 有 bug
+> 现在这个设备我能 cat /sys/bus/iio/devices/iio:device0/in_voltage3_raw 出来
+> 但是跑脚本显示 NTC off,读不到 adc 值,没任何打印
+
+**用户裁决**:**「直接写死 `su 0`」**。
+
+### 两个原因缺一不可
+
+1. **裸 `cat` 读不到。** 两个节点的权限位是 `-rw-r--r-- root root`(所以"world-readable"这句**对权限位**没说错),
+   但本板 **SELinux Enforcing**、节点标签 `u:object_r:sysfs:s0`,`adb shell` 落在 `u:r:shell:s0` —— **该域被拒绝**;
+   `su 0`(`u:r:su:s0`)可以。
+   **旧结论的来路**:v2.13.0 实测"裸 `cat` 可用"时,那台设备的 `adbd` 正好是 root,`adb shell` 直接落 root 域。
+   **它量的是当时的会话状态,不是设备属性** —— 设备一重启 `adbd` 回到 `shell`,NTC 就静默失效了,
+   而**权限位一个字节都没变**(所以照着权限位核对,只会得出"那一定是别处坏了")。
+   旁证:2026-09-20 19:03 的归档里 `ntc_st` 是 `f:1, h:11`(真读到了),09-21 上午同一条命令变 `Permission denied`、`ntc_st` 全是 `d`。
+2. **失败被丢掉了。** `_probe_raw()` 只取 stdout。被拒绝时 `cat` 把 `Permission denied` 写进 **stderr**、
+   stdout **零字节** —— 于是探针打印一行空的 `(empty)` 和一个裸 FAIL,**日志里没有任何东西指出是权限问题**。
+   读者看到的第一反应会是"这设备没有这个节点",而不是"这条命令权限不够"。
+
+### 改了什么
+
+- `NTC_CMD` 与 GPU 那条路对齐:`timeout -k 1 2 su 0 cat <LCD> <LED>`。**`NTC_GUARD_S` 不跟着设备 guard 走**
+  (GPU 那条跟)—— 这个 guard 只在驱动卡死时才会咬到,+60.6 ms 远不触及它。
+- `_probe_raw()` 在 **stdout 为空**时才把 **stderr 的第一行**打出来,一行、**纯 ASCII**(D-07):
+  `[probe] ntc : (empty) - cat: ... Permission denied`;stderr 也空时打 `no output and no error - rc=N`。
+  **只在为空时看** ⇒ 正常的通道仍只有一行摘要,不会变吵。
+- 文件头的数据源清单补上 `ntc` 一行(此前**根本没有这一行**);`_probe_ntc()` 里那段
+  "No `su`: measured as plain shell on the reference device, where both nodes are world-readable" 是**错的**,改掉。
+- **顺带修掉同一形状的第二处**:`--probe` 里那句"记下我们找过 `in_voltage_scale`"的诊断读也是裸 `cat`。
+  真机实测:改完之后它印出的**新 stderr 行**是 `Permission denied`,而**紧跟其后的结论行**写着
+  "the ADC -> Celsius factor is NOT on this device" —— 一句话在说"文件在、你没权限",下一句在说"文件不存在",
+  **自相矛盾**,而且前者是假的(以 root 读,真实答案是 `Invalid argument`/EINVAL,与文档一致)。
+  一并改成 `su 0 cat`,现在两行说的是同一件事。
+
+### 代价(明写)
+
+- **`su 0` 单次读中位数 139.5 → 200.1 ms(+60.6 ms/拍)**;NTC 在 SLOW 档(一拍一次)⇒ T=2.0 约 **+0.10 pp** 占空比。
+  **复合命令里的那一档增量没有重量** —— 已记进 [TODO.md](TODO.md) §6.23,理由见 PITFALLS #53。
+- **设备不能 root 就丢 NTC**(降级关闭,与 GPU 同一处理)。旧行为是"名义免 root、实际读不到",
+  新行为是"要 root、但真的读得到"。
+
+### 验证
+
+- `python -m py_compile` 全绿;`perf_monitor.py --selftest` **228 项 0 failure**(新增 **5** 条 `ntc-read:` 断言);
+  `--dump-params` 纯 ASCII、`ntc_profile` 在列;`tools/ntc_convert.py --selftest` 全绿(工具**未改动**)。
+- **反身验证**(在内存里改源码、不碰真文件):分别去掉 `su 0`、去掉 stderr 回显、去掉 ASCII 强制 —— 
+  **三个变异各自精确打红对应的那一条断言**,基线全绿。
+- **真机 `--probe`**:`[probe] ntc : 664`、`ntc parse : OK (lcd=664, led=354) unit=raw_adc - NOT celsius`
+  (改前这一行是空的);`ntc scale` 那行从 `Permission denied` 变成 **`Invalid argument`**。
+- **真机走平台跑一次**(75 s,临时起在 :8011;用户 :8000 未动):`RESULT : OK`、`GATES : all pass`、
+  `SCOPE all 5 monitor(s) enabled`;NTC 判定行 **`n=3 seen=3/3`**(改前是 `no ntc observation`);
+  `[ntc]` 四行齐全(profile / source / wrote / chart);归档目录里 `.samples.temps.csv`(2.1 KB,含
+  `28.19 / 58.93 °C`)与 `.samples.temps.png`(**57 KB,PNG magic 正确**)**都在**,
+  且 `reports/stress-test/perf/` 里**零残留**(证明是搬走不是复制);stdout 纯 ASCII,最后一行仍是 `.json` 报告路径。
+
+### 文档同步
+
+`README.md`(两处"免 root,world-readable" → **需 root** + 一段 ⚠ 说明;代价数字)、
+[docs/PERF_MONITOR_V2.md](docs/PERF_MONITOR_V2.md)(新增 **§12.11.6** 记这次的两个原因与取舍;§12.11.2 / §12.11.3 / §12.1 的旧表述加推翻标记)、
+[docs/PITFALLS.md](docs/PITFALLS.md)(新增 **#55**:一次"实测可用"如果量的是**会话状态**而不是**设备属性**,它会在别人手里失效)、
+[docs/DECISIONS.md](docs/DECISIONS.md)(新增 **D-68**)、[TODO.md](TODO.md) §6.22 **结案** + 新增 §6.23。
+
 ## v2.14.0 — 2026-09-21 (perf 跑完自动出摄氏度 + 温度曲线并进归档 / NTC profile 按项目命名)
 
 > 本次 bump **三个**版本号:平台 `2.13.1 → 2.14.0`(`server.py` 的 `version=` + healthz +

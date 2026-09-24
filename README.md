@@ -34,9 +34,9 @@
 
 - 设备列表(自动显示当前 ADB 设备,3 秒刷新)· 脚本列表(把 .py 丢进 scripts/,前端自动出现)· 实时日志(每台设备的 stdout 实时推送到浏览器)
 - 任务控制:运行 / 中断 / 硬停 / 重置(硬停立即把任务记为终态 `interrupted` 并归档,**那台设备马上可以起新任务**);每个任务**服务端自动**采 stdout + logcat(+ 可选串口),跑完自动归档
-- **九个压测脚本,每个一节**(见下文):WiFi 三件套(wifi_onoff / wifi_reboot / wifi_switch)、蓝牙音箱回连(bt_reboot_stress)、传感器回连(sensor_reboot_stress)、APP 冷热启动(app_launch_stress)、性能监控实时曲线(perf_monitor)、电池充放电实时曲线(battery_inout_stress)、红外序列(ir_runner)。每个脚本都用 `PARAMS` 自描述可配置项(前端自动弹配置窗口),跑完都出一份中文 HTML 报告
+- **十个压测脚本,每个一节**(见下文):WiFi 三件套(wifi_onoff / wifi_reboot / wifi_switch)、蓝牙音箱回连(bt_reboot_stress)、传感器回连(sensor_reboot_stress)、APP 冷热启动(app_launch_stress)、性能监控实时曲线(perf_monitor)、电池充放电实时曲线(battery_inout_stress)、硬开关机(power_cycle_stress)、红外序列(ir_runner)。每个脚本都用 `PARAMS` 自描述可配置项(前端自动弹配置窗口 —— 脚本还可以自述一条 `hint` 前置提醒,显示在弹窗顶部),跑完都出一份中文 HTML 报告
 
-后端 + 前端 + 脚本合计约 **9800 行代码**(server.py 2528 + app.js 2317 + style.css 872 + index.html 155 + ir_runner.py 617 + wifi_* 854 + sensor_reboot_stress.py 521 + app_launch_stress.py 599 + perf_monitor.py 513 + battery_inout_stress.py 601 + bt_reboot_stress.py 225)。
+后端 + 前端 + 脚本合计 **17872 行代码**(server.py 2672 + app.js 2526 + style.css 885 + index.html 160 + 压测脚本 10392 + ir_runner.py 617 + _pptp_report.py 620)。脚本侧逐个:perf_monitor 5699 + power_cycle_stress 1178 + battery_inout_stress 697 + app_launch_stress 683 + sensor_reboot_stress 622 + wifi_onoff 521 + bt_reboot_stress 346 + wifi_reboot 329 + wifi_switch 317。**这些数字会漂** —— 每次大改顺手刷新,别当契约。
 
 ---
 
@@ -413,9 +413,11 @@ PARAMS = [
 - **GPU%** `/sys/kernel/debug/mali0/dvfs_utilization` `busy_time/idle_time` 差值(**需 root**,`su 0 <cmd>`);附带 **GPU 频率** `mali0/gpu_clock`
 - **前台 APP CPU%** `dumpsys window` 取包名 → `pidof` 取 pid → `/proc/<pid>/stat` 的 `utime+stime` 差值。**不是 `top`**(本板一次 `top` 581ms,且它报的瞬时 %CPU 不可重复:同一包连读三次是 85.0 / 26.4 / 19.6),**也不是 `dumpsys cpuinfo`**(本机是 5 分钟滑动平均)
 - **WiFi 链路** `cmd wifi status`(**免 root**,实测 98–172 ms / 约 2.4 KB)。读的是射频开关 + 关联状态 + **有没有 IP**,所以能抓到「**已关联但没 IP**」这个视频平台最容易报 connection error 的瞬时态(`/sys/class/net/wlan0/operstate` 只看链路层,**看不见它**,故不用)。命令包了 `timeout -k 1 2` —— 不包的话一次卡死会拖掉**整拍所有指标**。
-- **LCD / LED 节点温度** 直接读两个 sysfs 原始计数(`/sys/bus/iio/devices/iio:device0/in_voltage3_raw` = LCD、`in_voltage2_raw` = LED,**免 root**,world-readable)。**这两个数是 ADC 计数,不是摄氏度** —— 报告里如实标 `unit=raw_adc`,要摄氏度请跑 [tools/ntc_convert.py](tools/ntc_convert.py)(见下节)。同样包 `timeout -k 1 2`。
+- **LCD / LED 节点温度** 直接读两个 sysfs 原始计数(`/sys/bus/iio/devices/iio:device0/in_voltage3_raw` = LCD、`in_voltage2_raw` = LED,**需 root**,`su 0 cat` 一次读完两个)。**这两个数是 ADC 计数,不是摄氏度** —— 报告里如实标 `unit=raw_adc`,要摄氏度请跑 [tools/ntc_convert.py](tools/ntc_convert.py)(见下节)。同样包 `timeout -k 1 2`。
 
-**采集本身不能拖累设备**:按代价分三层读数 —— FAST 每拍读 `/proc/stat` / 进程数 / `/proc/uptime`,MED 周期 5s 读 `/proc/meminfo` 与 GPU 计数器,SLOW 周期 30s 读 `dumpsys window` + `pidof` + `/proc/<pid>/stat` + `cmd wifi status` + 两个 NTC sysfs 原始计数;而且**一拍只起一个 adb 进程**(十个 section 拼进同一条复合命令,用随机 nonce 做帧标记)。T=2s 全开真机实跑占空比 **10.07%**(同一配置的空载合成预测 9.71%);新增的 NTC 这一路在复合命令里净增 **+51.5 ~ +86.4 ms/拍**(空载;它单独一次 `cat` 只净增 31.4 ms —— 段进复合命令后 shell 启动开销会重叠,所以两个数不相等),T=2.0 折合 **+0.29 pp**。**这些数不是常数**:同一台设备同一天的 `FULL` 中位数就在 314 ~ 429 ms 之间漂,能比较的只有同一次测量内相邻两行的差值。**在合成负载下(4 核压到 ~98% 忙)整体 `FULL` 会翻倍到 877 ms**(T=2.0 占空比 9.48% → 19.01%),但**"整体翻倍"不等于"每一项都翻倍"**:NTC 自己的净增几乎不动(+73.0 → +66.4 ms),翻倍主要来自 WiFi(+68.6 → +213.3 ms)。所以**别拿不同时间量到的两个绝对值作比较** —— 理由与规矩见 [docs/PITFALLS.md](docs/PITFALLS.md) #53。
+> **⚠ 这两个节点看着"人人可读",实际上读不到(v2.14.1 修的坑)。** 它们的权限位确实是 `-rw-r--r-- root root`,但本板 SELinux 是 **Enforcing**,标签是 `u:object_r:sysfs:s0`,而 `adb shell` 落在 `shell` 域 —— 该域**被拒绝**。表现极具误导性:`cat` 把 `Permission denied` 写进 **stderr**、**stdout 一个字节都没有**,于是日志里只看到一行空的 NTC 读数和一个 FAIL,**没有任何原因**。v2.14.0 及以前这里走的是裸 `cat`,等于在 Enforcing 的设备上 NTC 永远读不到。现在与 GPU 那条路一样走 `su 0`;**设备必须能 root,否则这一路会降级关闭**(和 GPU 同样处理)。`--probe` 的 NTC 行现在会在 stdout 为空时**把 stderr 里的原因打出来**。
+
+**采集本身不能拖累设备**:按代价分三层读数 —— FAST 每拍读 `/proc/stat` / 进程数 / `/proc/uptime`,MED 周期 5s 读 `/proc/meminfo` 与 GPU 计数器,SLOW 周期 30s 读 `dumpsys window` + `pidof` + `/proc/<pid>/stat` + `cmd wifi status` + 两个 NTC sysfs 原始计数;而且**一拍只起一个 adb 进程**(十个 section 拼进同一条复合命令,用随机 nonce 做帧标记)。T=2s 全开真机实跑占空比 **10.07%**(同一配置的空载合成预测 9.71%);新增的 NTC 这一路在复合命令里净增 **+51.5 ~ +86.4 ms/拍**(空载;它单独一次 `cat` 只净增 31.4 ms —— 段进复合命令后 shell 启动开销会重叠,所以两个数不相等),T=2.0 折合 **+0.29 pp**。**v2.14.1 起 NTC 改走 `su 0`**,单次读的中位数从 139.5 ms 涨到 **200.1 ms(+60.6 ms/拍)**,上面的折合占空比要按这个量级上调(T=2.0 约 **+0.10 pp**)。**这些数不是常数**:同一台设备同一天的 `FULL` 中位数就在 314 ~ 429 ms 之间漂,能比较的只有同一次测量内相邻两行的差值。**在合成负载下(4 核压到 ~98% 忙)整体 `FULL` 会翻倍到 877 ms**(T=2.0 占空比 9.48% → 19.01%),但**"整体翻倍"不等于"每一项都翻倍"**:NTC 自己的净增几乎不动(+73.0 → +66.4 ms),翻倍主要来自 WiFi(+68.6 → +213.3 ms)。所以**别拿不同时间量到的两个绝对值作比较** —— 理由与规矩见 [docs/PITFALLS.md](docs/PITFALLS.md) #53。
 
 ### WiFi 链路监控(v2.12.0)
 
@@ -438,11 +440,11 @@ WiFi 只落在 SLOW 拍上,间隔 **P = 30 秒**。不确定度是 **±P 而不�
 
 命令形如 `timeout -k 1 2 cmd wifi status`,读到 6 种状态之一:`ok` 已连接 / `noip` 已关联但没 IP / `noassoc` 未关联 / `off` 射频已关 / `unknown` 读到了但无法归类(**按"断"算**,宁可多报一次,也好过把变了格式的固件当成健康链路)。连续 3 个到期拍读不到就停发这一路(报告里显示 `-`),每 300 秒重探一次。
 
-### NTC 节点温度监控(v2.13.0;v2.14.0 起跑完自动换算并出图)
+### NTC 节点温度监控(v2.13.0;v2.14.0 起跑完自动换算并出图;v2.14.1 修读不到值;v2.14.2 起长跑不再打采样点)
 
 **要解决的问题**:长跑压测里,最先出问题的物理量通常是**温度**,而之前九个指标里没有一个能反映 LCD / LED 节点有多热。
 
-读的是两个 sysfs 原始计数(**免 root**,world-readable):
+读的是两个 sysfs 原始计数(**需 root**,见上方那条 ⚠):
 
 | 通道 | 路径 | 本机实测区间 |
 |---|---|---|
@@ -476,7 +478,7 @@ python tools/ntc_convert.py archive/perf/<时间>/perf_<设备>_<时间>.samples
 
 **所以归档的数据不用重跑就能变成摄氏度**,包括 v2.13.0 之前归档的 —— 只有历史**报告里的判定行**仍然是计数。
 
-**图长这样,两条规矩**:线走**阶梯**(30 秒一格、采集侧保持读数,零阶保持本来就是分段常数 —— 连斜线等于宣称中间那些没测过的时刻的温度),**真实读数各打一个点**;缺读处**线断开**,而且是**逐通道**断。副标题会写明读数密度(`每 30.0 秒一个真实读数 · N 个读数`,周期从数据里算),所以**跑太短就没有曲线可画** —— 24 秒只有 1 个真实读数(一条平线),**要一条像样的曲线单次跑 10 分钟以上**。
+**图长这样,两条规矩**:线走**阶梯**(30 秒一格、采集侧保持读数,零阶保持本来就是分段常数 —— 连斜线等于宣称中间那些没测过的时刻的温度),**真实读数各打一个点**,不过**跑得够长时点会挤到比像素还密**(14.5 小时 / 1737 个读数摊在 1468 px 的绘图区上,一个点只有 **0.81 px**),那时**整个不打点**、副标题写明「采样点密过屏幕像素,未画点」—— 因为那种密度下点的描边会把线自己抹掉(见 [docs/DECISIONS.md](docs/DECISIONS.md) D-69);缺读处**线断开**,而且是**逐通道**断。副标题会写明读数密度(`每 30.0 秒一个真实读数 · N 个读数`,周期从数据里算),所以**跑太短就没有曲线可画** —— 24 秒只有 1 个真实读数(一条平线),**要一条像样的曲线单次跑 10 分钟以上**。
 
 **它什么都不会做 —— 这是有意的**:
 
@@ -599,6 +601,43 @@ NTC    : TEMP lcd=avg664.2/max665.0 n=5 led=avg377.8/max383.0 n=5 seen=5/5 unit=
 
 ---
 
+## 硬开关机压测脚本(power_cycle_stress)
+
+> ⚠ **前提:设备上电方式必须先改成 `Direct(上电自动开机)`。** 不满足的话脚本不会报错,它只会**一直等**一个永远不来的开机,整夜白跑。参数弹窗顶部常驻这条提醒。
+
+**这是本平台唯一一个"电源不归脚本管"的脚本。** 电由**外部继电器**按它自己的定时器通断(典型 10 min ON / 30 s OFF),脚本既不控制它、也**不知道**它什么时候断 —— 所以它只能**主动嗅探**:盯着设备离开 `adb devices`,再盯着它回来,然后等 `sys.boot_completed=1`,最后等 `post_boot_wait_sec` 秒、读一次 WiFi、跑一遍红外序列。
+
+**它测的是"上电自动开机"这条链路的稀发故障**(偶尔开不了机)。这种故障靠人工开关机撞不出来,必须整夜跑。
+
+| 可配参数 | 说明 | 默认 |
+|---|---|---|
+| `iterations` | 循环轮数(一轮 ≈ 一次断电→开机→开机后动作) | `1000`(按 10 min ON / 30 s OFF 算 ≈ **7 天**) |
+| `post_boot_wait_sec` | 开机后等多久再执行动作 / 读 WiFi(秒) | `25` |
+| `ir_sequence` | **开机后执行的 IR 序列**(下拉框,运行时枚举 `ir_sequences/*.ini`;`(不发送按键)` = 不做动作) | `(不发送按键)` |
+| `boot_timeout_sec` | 已在 adb 里到 `boot_completed=1` 的**判定**超时(秒) | `120` |
+| `off_watchdog_sec` | 设备消失后**等它回来**的看门狗(秒) | `1800` |
+| `poll_interval_sec` | 嗅探间隔(秒)—— **它同时就是测量分辨率** | `2` |
+
+**循环节奏是"观测量",不是"配置值"。** 继电器后续节奏不固定,所以参数里**没有** `on_sec` / `off_sec`,脚本也**不拿**任何预期去比对;它把**测到的**断电时长 / 开机耗时写进报告,并标注 ±1 个嗅探间隔的测量误差。
+
+**判定只有一条**:存在**开机超时**或**看门狗触发** ⇒ `FAIL`,否则 `OK`。
+
+- `boot_timeout_sec` 触发 ⇒ 该轮 FAIL,**继续下一轮**(失败累积成比率,不中断)。
+- `off_watchdog_sec` 触发 ⇒ 该轮 FAIL 并**结束整轮跑** —— 再等下去每轮都会同样失败,继续跑没有信息量。
+- **`off_watchdog_sec` 只是看门狗,不是节奏断言**:只在继电器被拔 / USB 掉了 / 设备彻底砖了时兜底。
+
+**WiFi 只记录,永不判定。** 每轮开机后读一次状态进报告(明写"开机后 WiFi":`已连接` / `未连接(off/noassoc/noip)`),但**它不参与 PASS/FAIL** —— 判定只看开机成没成。
+
+**红外序列是单次截断,不是循环。** 每轮开机后**只跑一遍**指定序列(与 `perf_monitor` 的 keepalive 循环相反)。**脚本无法知道序列到底有没有让 YouTube 播起来** —— 它只能报"发了多少次键、派发是否失败";IR 失败也**不改变**判定,只进报告。
+
+> **`KEYCODE_*` 长按在本机静默失效**:`KEYCODE_*` 键只支持 `Short`,`KEY_*` 键长按才有效。详见 [ir_sequences/KEY_REFERENCE.md](ir_sequences/KEY_REFERENCE.md)。
+
+**报告**:`power_<设备>_<时间>.json` + 同 stem 中文 HTML,归档到 `archive/power/<时间>_power_cycle_stress_<设备>/`(原始位置 `reports/stress-test/power/`,已 gitignore)。逐轮明细表列出**每轮的断电时长 / 开机耗时 / WiFi / 按键 / 结果**。
+
+**不会做的事(有意)**:不控制电源 / 不 import 别的脚本 / 不在设备离线时弹任何提醒 —— 设备每轮消失是**被测对象本身**,不是故障(前端已有"临时离线"合成卡)。
+
+---
+
 ## 状态持久化(localStorage)
 
 平台会把以下用户选择存到浏览器 localStorage,F5 刷新后保留:
@@ -622,12 +661,12 @@ ProjectorPressureTest/
 ├── README.md / CLAUDE.md / CHANGELOG.md / TODO.md
 ├── docs/                  # 文档集(清单见上文"文档地图")
 ├── static/                # index.html + app.js + style.css + vendor/echarts.min.js(ECharts 5.5.1 本地化)
-├── scripts/               # 压测脚本 9 个(每个一节,见下文)
+├── scripts/               # 压测脚本 10 个(每个一节,见下文;+ 共享件 _pptp_report.py / ir_runner.py)
 ├── ir_sequences/          # IR 序列 .ini(1.ini = 默认序列 KEY_VCR + KEYCODE_HDMI)+ KEY_REFERENCE.md(按键速查三张表)
-├── reports/               # 脚本写报告的原始位置(脚本契约,gitignore),按模块 stress-test/{wifi,sensor,app-launch,perf,battery}/
+├── reports/               # 脚本写报告的原始位置(脚本契约,gitignore),按模块 stress-test/{wifi,sensor,app-launch,perf,battery,power}/
 ├── logs/                  # 运行期临时工作区(内容会被搬进 archive/)+ 服务日志 server.out.log / server.err.log
 └── archive/               # ★ 任务存档,永久保留,按模块分类:archive/<模块>/<时间>_<脚本>_<设备>/
-                           #   模块 ∈ wifi / perf / battery / sensor / app-launch / ir / bt / other
+                           #   模块 ∈ wifi / perf / battery / power / sensor / app-launch / ir / bt / other
 ```
 
 > **用户只需要看 `archive/`。** `logs/` 与 `reports/` 都不能删:`logs/` 是运行期工作区 + 服务自身日志;

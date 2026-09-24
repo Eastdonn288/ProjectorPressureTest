@@ -32,9 +32,11 @@
         │ subprocess.Popen(["python","-u","scripts/x.py","--device",serial,"--params",json])
         │ list-arg(shell=False)→ Windows cmd.exe 不吞 ;/|/>;另:asyncio 子进程(logcat)+ 守护线程(串口)
         ▼
-[scripts/*.py]  9 个:ir_runner / wifi_onoff / wifi_reboot / wifi_switch / sensor_reboot /
-  app_launch / perf_monitor / battery_inout_stress / bt_reboot_stress
+[scripts/*.py]  10 个:ir_runner / wifi_onoff / wifi_reboot / wifi_switch / sensor_reboot /
+  app_launch / perf_monitor / battery_inout_stress / bt_reboot_stress / power_cycle_stress
   —— 契约见 §5,独立可 CLI 跑,平台侧零注册(v2.6.0 起零改动)
+  # 例外:v2.15.0 起 /api/scripts/{name}/params 多转发一个脚本自述的 hint(D-70);
+  #       power_cycle_stress 也是第二个线程内 import ir_runner 的脚本(D-43 ④ 已修订)
 ```
 
 ---
@@ -121,7 +123,7 @@
                                                               ↑ 浏览器 POST chart.png
 ```
 
-`<模块>` 由 `ARCHIVE_MODULES` 显式映射得出(脚本名 → `wifi`/`perf`/`battery`/`sensor`/`app-launch`/`ir`/`bt`,未登记落 `other`),与 `reports/stress-test/<模块>/` 对齐。采集上限可用环境变量抬高:`PPTP_LOGCAT_MAX_MB`(默认 1024)、`PPTP_SERIAL_MAX_MB`(默认 512)。
+`<模块>` 由 `ARCHIVE_MODULES` 显式映射得出(脚本名 → `wifi`/`perf`/`battery`/`power`/`sensor`/`app-launch`/`ir`/`bt`,未登记落 `other`),与 `reports/stress-test/<模块>/` 对齐。采集上限可用环境变量抬高:`PPTP_LOGCAT_MAX_MB`(默认 1024)、`PPTP_SERIAL_MAX_MB`(默认 512)。
 
 **可调常量**(全在 `server.py` 顶部,改行为先 grep 这些名字):`DEVICE_WATCH_INTERVAL_SEC`(5s)/ `ADB_RECONNECT_MIN_INTERVAL_SEC`(20s)—— 设备看门狗的两拍,见 [PITFALLS.md](PITFALLS.md) #31;`LOGCAT_ENABLED`(总开关,置 False 即整体不采 logcat);`LOG_SUFFIX`(三种日志后缀 `.log` / `.logcat.log` / `.serial.log`);`SERIAL_OPEN_TIMEOUT`(3s)/ `SERIAL_RECONNECT_DELAY_SEC`(2s)/ `SERIAL_MAX_RESTARTS`(60);`ARCHIVE_DIR`(`archive/`)。
 
@@ -200,6 +202,7 @@
 | `perf_monitor.py` | CPU/GPU/内存% + 前台APP CPU%(PERF| 流 → 前端图表);跑完出 `report.json` + 中文 HTML(**保留自己的渲染器**,4 个区块比通用引擎丰富;参数表走共享引擎) | interval/duration/watch_pkg |
 | `battery_inout_stress.py` | 电池充/放电压测(电量/温度/电压,串口开 health 轮询,100% 稳定或关机自动停) | mode/serial_port/interval/temp_warn/full_hold |
 | `bt_reboot_stress.py` | 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询音箱回连,判定=适配器开 + A2DP CONNECTED) | iterations/wait_sec/bt_reconnect_timeout/back_online_timeout |
+| `power_cycle_stress.py` | **硬开关机压测(v2.15.0)** —— 全仓唯一"**电源不归脚本管**"的脚本:电由**外部继电器**按自己的定时器通断,脚本**只嗅探不控制**(盯设备离开/回到 `adb devices` → 等 `boot_completed` → 等 `post_boot_wait_sec` → 读一次 WiFi → **单次**跑一遍 IR 序列)。判定只有一条:开机超时 or 看门狗触发 ⇒ FAIL;**WiFi 只记录不判定**。**循环节奏是观测量不是断言**(故无 on/off 参数) | iterations/post_boot_wait_sec/ir_sequence/boot_timeout_sec/off_watchdog_sec/poll_interval_sec |
 
 ---
 
@@ -241,8 +244,11 @@ E:\ProjectorPressureTest\
 │   ├── perf_monitor.py             # 性能监控 v2(三层分级采样 + nonce 帧 + 证据累积 + 收尾判定块);
 │   │                               #   PERF| 流 → 前端图表;归档 report.json + samples.csv + events.csv
 │   ├── battery_inout_stress.py     # 电池充/放电压测(电量/温度/电压,串口开 health 轮询;全英文 ASCII)
-│   └── bt_reboot_stress.py         # 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询回连;
-│                                   #   判定 = 适配器开 + A2DP CONNECTED)
+│   ├── bt_reboot_stress.py         # 重启 + 蓝牙音箱 A2DP 回连压测(reboot → 上线 → 轮询回连;
+│   │                               #   判定 = 适配器开 + A2DP CONNECTED)
+│   └── power_cycle_stress.py       # 硬开关机压测(v2.15.0):外部继电器自主通断,脚本只嗅探
+│                                   #   (WAIT_OFF → WAIT_BACK → WAIT_BOOT → POST_BOOT);
+│                                   #   IR 单次截断(主线程内 import ir_runner,不用 run_loop)
 ├── ir_sequences\                   # 用户可编辑的 .ini 序列文件 + 按键速查
 │   ├── *.ini                       # 序列文件(如 1.ini / idle_keepalive.ini)
 │   └── KEY_REFERENCE.md            # 按键速查:KEY_* / KEYCODE_* 名 ↔ 键码
@@ -260,7 +266,7 @@ E:\ProjectorPressureTest\
 │       stem   = <task_id>_<yyyyMMdd-HHmmss>_<script-stem>_<device>
 │       source = stdout | logcat | serial
 ├── archive\                        # ★ 永久保留,按模块分类。gitignore
-│   └── <模块>\{wifi,perf,battery,sensor,app-launch,ir,bt,other}\
+│   └── <模块>\{wifi,perf,battery,power,sensor,app-launch,ir,bt,other}\
 │       └── <yyyyMMdd-HHmmss>_<script-stem>_<device>\
 │           ├── stdout.log / logcat.log / serial.log   — 从 logs/ 移入
 │           ├── report.json         — 脚本自己写的那份的副本(主报告改名,多份时 report-2.json…)
@@ -320,3 +326,8 @@ E:\ProjectorPressureTest\
 - ❌ **序列模态里的 step 编辑**(code / kind / delay / count 行)—— 之前做过,已废弃
 - ❌ **"在设备上运行"式的多设备同时启动 UI 流程** —— 每台设备各自手动跑
 - ❌ **"上次已保存的序列"自动 fallback 选择**
+- ❌ **任何电源 / 继电器控制**(v2.15.0 起明确记在这里)—— `power_cycle_stress.py` **观测**外部继电器造成的断电与上电,**不发任何控制命令**,也没有 `on_sec` / `off_sec` 这类参数;继电器是自主硬件,脚本连它什么时候动作都不知道(D-71)
+- ❌ **`adb wait-for-device` / `adb get-state` 轮询** —— 嗅探统一走 `adb devices` 解析(一次调用看全部设备,且能区分「不在表里」与「卡在 offline」)
+- ❌ **在设备离线时给任何 UI 提醒** —— 压测里设备每轮消失是**正常状态**(D-08/D-09/D-36);前端已有「临时离线」合成卡,不重复实现
+- ❌ **脚本自定义的顶层元数据键(除 `hint` 外)** —— `--dump-params` 的契约只有 `fields` + 可选的顶层 `hint`(D-70);服务端不校验也不白名单,别指望再加第三个键会被前端认领
+- ❌ **离线状态的「恢复」逻辑** —— 断电本来就是被测对象,没有"重连"这回事
